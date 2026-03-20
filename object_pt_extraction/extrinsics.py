@@ -18,9 +18,25 @@ TRANSLATION_UNIT_SCALE = {
 class CameraExtrinsic:
     camera_id: int
     reference_camera_id: int
-    rotation_ref_to_cam: np.ndarray
-    translation_ref_to_cam: np.ndarray
+    rotation_cam_to_ref: np.ndarray
+    translation_cam_to_ref: np.ndarray
     source_path: str
+
+    @property
+    def rotation_ref_to_cam(self):
+        rotation_ref_to_cam, _ = invert_extrinsic(
+            self.rotation_cam_to_ref,
+            self.translation_cam_to_ref,
+        )
+        return rotation_ref_to_cam
+
+    @property
+    def translation_ref_to_cam(self):
+        _, translation_ref_to_cam = invert_extrinsic(
+            self.rotation_cam_to_ref,
+            self.translation_cam_to_ref,
+        )
+        return translation_ref_to_cam
 
     @property
     def rotation_world_to_cam(self):
@@ -76,28 +92,28 @@ def _read_rotation_translation_text(file_path):
     return np.asarray(rotation, dtype=np.float32), np.asarray(translation, dtype=np.float32).reshape(3)
 
 
-def load_camera_extrinsic(camera_id, savefolder="camera_parameters", translation_unit="mm"):
-    # 이 저장소의 rot_trans_c*.dat는 camera0 reference frame을 기준으로 저장된다.
-    # 즉, rot_trans_c1.dat는 camera0 -> camera1 변환이다.
+def load_camera_extrinsic(camera_id, savefolder="camera_parameters", translation_unit="m"):
+    # 현재 calibration 파일은 camera -> camera0(reference) 형태의 [R|t]를 저장한다고 가정한다.
+    # 즉, rot_trans_c1.dat는 camera1 -> camera0 변환이다.
     file_path = Path(savefolder) / f"rot_trans_c{camera_id}.dat"
-    rotation_ref_to_cam, translation_ref_to_cam = _read_rotation_translation_text(file_path)
+    rotation_cam_to_ref, translation_cam_to_ref = _read_rotation_translation_text(file_path)
     translation_scale = _resolve_translation_scale(translation_unit)
     return CameraExtrinsic(
         camera_id=int(camera_id),
         reference_camera_id=0,
-        rotation_ref_to_cam=rotation_ref_to_cam,
-        translation_ref_to_cam=translation_ref_to_cam * translation_scale,
+        rotation_cam_to_ref=rotation_cam_to_ref,
+        translation_cam_to_ref=translation_cam_to_ref * translation_scale,
         source_path=str(file_path),
     )
 
 
-def invert_extrinsic(rotation_ref_to_cam, translation_ref_to_cam):
-    # reference(camera0) -> camera 변환을 camera -> reference(camera0)로 뒤집는다.
-    rotation_ref_to_cam = np.asarray(rotation_ref_to_cam, dtype=np.float32).reshape(3, 3)
-    translation_ref_to_cam = np.asarray(translation_ref_to_cam, dtype=np.float32).reshape(3)
-    rotation_cam_to_ref = rotation_ref_to_cam.T
-    translation_cam_to_ref = -rotation_cam_to_ref @ translation_ref_to_cam
-    return rotation_cam_to_ref.astype(np.float32), translation_cam_to_ref.astype(np.float32)
+def invert_extrinsic(rotation_cam_to_ref, translation_cam_to_ref):
+    # camera -> reference(camera0) 변환을 reference(camera0) -> camera 변환으로 뒤집는다.
+    rotation_cam_to_ref = np.asarray(rotation_cam_to_ref, dtype=np.float32).reshape(3, 3)
+    translation_cam_to_ref = np.asarray(translation_cam_to_ref, dtype=np.float32).reshape(3)
+    rotation_ref_to_cam = rotation_cam_to_ref.T
+    translation_ref_to_cam = -rotation_ref_to_cam @ translation_cam_to_ref
+    return rotation_ref_to_cam.astype(np.float32), translation_ref_to_cam.astype(np.float32)
 
 
 def transform_points(points_xyz, rotation, translation):
@@ -111,26 +127,16 @@ def transform_points(points_xyz, rotation, translation):
     return transformed_points.astype(np.float32)
 
 
-def convert_reference_to_camera(points_ref, rotation_ref_to_cam, translation_ref_to_cam):
+def convert_reference_to_camera(points_ref, rotation_cam_to_ref, translation_cam_to_ref):
+    rotation_ref_to_cam, translation_ref_to_cam = invert_extrinsic(
+        rotation_cam_to_ref,
+        translation_cam_to_ref,
+    )
     return transform_points(points_ref, rotation_ref_to_cam, translation_ref_to_cam)
 
 
-def convert_camera_to_reference(points_cam, rotation_ref_to_cam, translation_ref_to_cam):
-    rotation_cam_to_ref, translation_cam_to_ref = invert_extrinsic(
-        rotation_ref_to_cam,
-        translation_ref_to_cam,
-    )
+def convert_camera_to_reference(points_cam, rotation_cam_to_ref, translation_cam_to_ref):
     return transform_points(points_cam, rotation_cam_to_ref, translation_cam_to_ref)
-
-
-def convert_world_to_cam(points_world, rotation_world_to_cam, translation_world_to_cam):
-    # 하위 호환 alias. 이 저장소에서는 world == camera0 reference frame.
-    return convert_reference_to_camera(points_world, rotation_world_to_cam, translation_world_to_cam)
-
-
-def convert_cam_to_world(points_cam, rotation_world_to_cam, translation_world_to_cam):
-    # 하위 호환 alias. 이 저장소에서는 world == camera0 reference frame.
-    return convert_camera_to_reference(points_cam, rotation_world_to_cam, translation_world_to_cam)
 
 
 def convert_points_between_cameras(
@@ -144,25 +150,25 @@ def convert_points_between_cameras(
 
     points_ref = convert_camera_to_reference(
         points_xyz,
-        source_extrinsic.rotation_ref_to_cam,
-        source_extrinsic.translation_ref_to_cam,
+        source_extrinsic.rotation_cam_to_ref,
+        source_extrinsic.translation_cam_to_ref,
     )
     return convert_reference_to_camera(
         points_ref,
-        target_extrinsic.rotation_ref_to_cam,
-        target_extrinsic.translation_ref_to_cam,
+        target_extrinsic.rotation_cam_to_ref,
+        target_extrinsic.translation_cam_to_ref,
     )
 
 
-def convert_cam1_to_cam0(points_xyz_cam1, extrinsic_cam1=None, extrinsic_cam0=None, savefolder="camera_parameters", translation_unit="mm"):
+def convert_cam1_to_cam0(points_xyz_cam1, extrinsic_cam1=None, extrinsic_cam0=None, savefolder="camera_parameters", translation_unit="m"):
     if extrinsic_cam1 is None:
         extrinsic_cam1 = load_camera_extrinsic(1, savefolder=savefolder, translation_unit=translation_unit)
     if extrinsic_cam0 is None:
-        # camera0는 reference frame이므로 c1 -> c0 변환은 c1 extrinsic을 역변환하면 된다.
+        # camera0는 reference frame이므로 c1 -> c0 변환은 c1 extrinsic을 그대로 적용하면 된다.
         return convert_camera_to_reference(
             points_xyz_cam1,
-            extrinsic_cam1.rotation_ref_to_cam,
-            extrinsic_cam1.translation_ref_to_cam,
+            extrinsic_cam1.rotation_cam_to_ref,
+            extrinsic_cam1.translation_cam_to_ref,
         )
 
     return convert_points_between_cameras(

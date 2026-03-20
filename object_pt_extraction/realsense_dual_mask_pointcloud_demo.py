@@ -53,7 +53,7 @@ def parse_args():
     parser.add_argument(
         "--translation-unit",
         choices=["mm", "m"],
-        default="mm",
+        default="m",
         help="Translation unit stored in the extrinsic files.",
     )
     parser.add_argument("--anchor-index", type=int, default=0, help="Anchor camera index for nearest-timestamp pairing.")
