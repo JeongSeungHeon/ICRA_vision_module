@@ -1,0 +1,19 @@
+# Core numerical / visualization
+numpy==1.24.4
+matplotlib==3.7.5
+scipy==1.10.1
+PyYAML==6.0.3
+
+# Vision / hand pose
+opencv-python==4.13.0.92
+mediapipe==0.10.8
+pyrealsense2==2.55.1.6486
+
+# Object detection / segmentation
+torch==2.4.1
+torchvision==0.19.1
+ultralytics==8.4.23
+clip @ git+https://github.com/ultralytics/CLIP.git@88ade288431a46233f1556d1e141901b3ef0a36b
+
+# Point-cloud visualization
+open3d==0.19.0
