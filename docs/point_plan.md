@@ -167,7 +167,8 @@
 - 후처리:
   - voxel downsample
   - statistical outlier removal 또는 radius outlier removal
-- point 수와 bbox 크기를 로그로 남긴다.
+  - point 수, centroid, bbox extent 로그화
+- raw aligned cloud와 filtered merged cloud를 분리해서 비교한다.
 
 ### 대상 파일
 - 신규 파일 후보: `pointcloud_merge.py`
@@ -176,6 +177,26 @@
 ### 완료 기준
 - merged cloud가 시각적으로 단일 object shape를 유지한다.
 - 중복 점과 노이즈가 어느 정도 억제된다.
+- raw -> voxel -> filtered 단계별 점 개수 변화를 확인할 수 있다.
+
+## Step 9A. 정렬 후 경계 노이즈 억제
+### 작업
+- 정렬은 맞지만 edge noise가 남는 경우를 위한 후속 정제를 추가한다.
+- 우선순위:
+  - mask erosion 또는 largest connected component
+  - depth edge 주변 median/patch 기반 depth 샘플링
+  - reprojection overlay 기준으로 튀는 점 진단
+  - reflective surface / occlusion mismatch 사례 수집
+- 정렬 문제와 depth-mask 경계 노이즈를 구분해서 디버깅한다.
+
+### 대상 파일
+- `depth_lifter.py`
+- `pointcloud_utils.py`
+- `realsense_dual_mask_pointcloud_demo.py`
+
+### 완료 기준
+- 컵, 병 같은 작은 물체에서 테두리 바깥으로 튀는 점이 이전보다 줄어든다.
+- extrinsic 오차와 depth/mask 경계 노이즈를 별도로 판단할 수 있다.
 
 ## Step 10. 저장 포맷과 디버그 산출물 정리
 ### 작업

@@ -14,6 +14,7 @@ from object_pt_extraction.extrinsics import convert_points_between_cameras, load
 from object_pt_extraction.pointcloud_utils import (
     build_point_cloud_from_instances,
     colorize_selected_mask,
+    merge_point_clouds,
     render_projected_point_cloud_overlay,
     render_depth,
     render_mask_preview,
@@ -31,57 +32,68 @@ from object_pt_extraction.segmentation_engine import (
 def parse_args():
     # 듀얼 RealSense 입력, YOLOE 추론, extrinsic 정렬 설정을 한 번에 받는다.
     parser = argparse.ArgumentParser(
-        description="Run dual RealSense local point-cloud generation with nearest-timestamp pairing."
+        description='Run dual RealSense local point-cloud generation with nearest-timestamp pairing.'
     )
-    parser.add_argument("--model", default="yoloe-26m-seg.pt", help="Model name or local weights path.")
+    parser.add_argument('--model', default='yoloe-26m-seg.pt', help='Model name or local weights path.')
     parser.add_argument(
-        "--prompt",
-        nargs="*",
+        '--prompt',
+        nargs='*',
         default=None,
-        help="Text prompt classes for YOLOE, e.g. --prompt bottle or --prompt person,bus",
+        help='Text prompt classes for YOLOE, e.g. --prompt bottle or --prompt person,bus',
     )
-    parser.add_argument("--serials", nargs="*", default=None, help="Two RealSense serials. Defaults to the first two detected devices.")
+    parser.add_argument('--serials', nargs='*', default=None, help='Two RealSense serials. Defaults to the first two detected devices.')
     parser.add_argument(
-        "--camera-ids",
+        '--camera-ids',
         nargs=2,
         type=int,
         default=[0, 1],
-        help="Calibration camera ids that correspond to the two serials in order.",
+        help='Calibration camera ids that correspond to the two serials in order.',
     )
-    parser.add_argument("--target-camera-id", type=int, default=0, help="Target calibration camera id used for aligned preview.")
-    parser.add_argument("--extrinsics-dir", default="camera_parameters", help="Directory containing rot_trans_c*.dat files.")
+    parser.add_argument('--target-camera-id', type=int, default=0, help='Target calibration camera id used for aligned preview.')
+    parser.add_argument('--extrinsics-dir', default='camera_parameters', help='Directory containing rot_trans_c*.dat files.')
     parser.add_argument(
-        "--translation-unit",
-        choices=["mm", "m"],
-        default="m",
-        help="Translation unit stored in the extrinsic files.",
+        '--translation-unit',
+        choices=['mm', 'm'],
+        default='m',
+        help='Translation unit stored in the extrinsic files.',
     )
-    parser.add_argument("--anchor-index", type=int, default=0, help="Anchor camera index for nearest-timestamp pairing.")
-    parser.add_argument("--width", type=int, default=640, help="Color/depth stream width.")
-    parser.add_argument("--height", type=int, default=480, help="Color/depth stream height.")
-    parser.add_argument("--fps", type=int, default=30, help="RealSense stream FPS.")
-    parser.add_argument("--imgsz", type=int, default=640, help="Inference image size.")
-    parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold.")
-    parser.add_argument("--iou", type=float, default=0.45, help="NMS IoU threshold.")
-    parser.add_argument("--max-det", type=int, default=100, help="Maximum detections per frame.")
-    parser.add_argument("--device", default=None, help="Ultralytics device string, e.g. cpu, 0.")
-    parser.add_argument("--classes", nargs="*", type=int, default=None, help="Optional class id filter.")
+    parser.add_argument('--anchor-index', type=int, default=0, help='Anchor camera index for nearest-timestamp pairing.')
+    parser.add_argument('--width', type=int, default=640, help='Color/depth stream width.')
+    parser.add_argument('--height', type=int, default=480, help='Color/depth stream height.')
+    parser.add_argument('--fps', type=int, default=30, help='RealSense stream FPS.')
+    parser.add_argument('--imgsz', type=int, default=640, help='Inference image size.')
+    parser.add_argument('--conf', type=float, default=0.25, help='Confidence threshold.')
+    parser.add_argument('--iou', type=float, default=0.45, help='NMS IoU threshold.')
+    parser.add_argument('--max-det', type=int, default=100, help='Maximum detections per frame.')
+    parser.add_argument('--device', default=None, help='Ultralytics device string, e.g. cpu, 0.')
+    parser.add_argument('--classes', nargs='*', type=int, default=None, help='Optional class id filter.')
     parser.add_argument(
-        "--select-mode",
-        choices=["all_instances", "highest_score", "class_filter"],
-        default="highest_score",
-        help="Instance selection policy for downstream point-cloud generation.",
+        '--select-mode',
+        choices=['all_instances', 'highest_score', 'class_filter'],
+        default='highest_score',
+        help='Instance selection policy for downstream point-cloud generation.',
     )
-    parser.add_argument("--select-class", nargs="*", default=None, help="Optional class-name filter applied before point-cloud generation.")
-    parser.add_argument("--half", action="store_true", help="Enable FP16 inference on supported devices.")
-    parser.add_argument("--stride", type=int, default=2, help="Sample every Nth mask pixel before deprojection.")
-    parser.add_argument("--max-points", type=int, default=20000, help="Maximum number of point-cloud samples.")
-    parser.add_argument("--min-depth-m", type=float, default=0.1, help="Minimum valid depth for point cloud generation.")
-    parser.add_argument("--max-depth-m", type=float, default=1.5, help="Maximum valid depth for point cloud generation.")
-    parser.add_argument("--show-depth", action="store_true", help="Show separate depth windows for both cameras.")
-    parser.add_argument("--show-mask", action="store_true", help="Show separate binary mask windows for both cameras.")
-    parser.add_argument("--save-dir", default="outputs/dual_pointcloud_demo", help="Directory used when saving paired snapshots with the `s` key.")
-    parser.add_argument("--save-every", type=int, default=0, help="Automatically save every N paired frames. Use 0 to disable auto-save.")
+    parser.add_argument('--select-class', nargs='*', default=None, help='Optional class-name filter applied before point-cloud generation.')
+    parser.add_argument('--half', action='store_true', help='Enable FP16 inference on supported devices.')
+    parser.add_argument('--stride', type=int, default=2, help='Sample every Nth mask pixel before deprojection.')
+    parser.add_argument('--max-points', type=int, default=20000, help='Maximum number of point-cloud samples.')
+    parser.add_argument('--min-depth-m', type=float, default=0.1, help='Minimum valid depth for point cloud generation.')
+    parser.add_argument('--max-depth-m', type=float, default=1.5, help='Maximum valid depth for point cloud generation.')
+    parser.add_argument('--merge-voxel-size-m', type=float, default=0.003, help='Voxel size in meters used before merged outlier removal.')
+    parser.add_argument(
+        '--merge-outlier-method',
+        choices=['none', 'statistical', 'radius'],
+        default='statistical',
+        help='Outlier removal method used on the merged cloud.',
+    )
+    parser.add_argument('--merge-nb-neighbors', type=int, default=20, help='Neighbor count for statistical outlier removal.')
+    parser.add_argument('--merge-std-ratio', type=float, default=1.5, help='Std ratio for statistical outlier removal.')
+    parser.add_argument('--merge-radius-m', type=float, default=0.01, help='Radius in meters for radius outlier removal.')
+    parser.add_argument('--merge-min-neighbors', type=int, default=8, help='Minimum neighbors for radius outlier removal.')
+    parser.add_argument('--show-depth', action='store_true', help='Show separate depth windows for both cameras.')
+    parser.add_argument('--show-mask', action='store_true', help='Show separate binary mask windows for both cameras.')
+    parser.add_argument('--save-dir', default='outputs/dual_pointcloud_demo', help='Directory used when saving paired snapshots with the `s` key.')
+    parser.add_argument('--save-every', type=int, default=0, help='Automatically save every N paired frames. Use 0 to disable auto-save.')
     return parser.parse_args()
 
 
@@ -109,11 +121,11 @@ def _overlay_camera_status(frame, serial, timestamp_ms, infer_ms, summary, point
     # 각 카메라 창 위에 serial, timestamp, 추론 시간, local cloud 점 개수를 표시한다.
     lines = [
         camera_label,
-        f"serial: {serial}",
-        f"timestamp: {timestamp_ms:.1f} ms",
-        f"infer: {infer_ms:.1f} ms",
+        f'serial: {serial}',
+        f'timestamp: {timestamp_ms:.1f} ms',
+        f'infer: {infer_ms:.1f} ms',
         summary,
-        f"local points: {point_count}",
+        f'local points: {point_count}',
     ]
     for line_index, text in enumerate(lines):
         origin = (12, 28 + line_index * 24)
@@ -121,19 +133,44 @@ def _overlay_camera_status(frame, serial, timestamp_ms, infer_ms, summary, point
         cv.putText(frame, text, origin, cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
 
 
-def _overlay_pair_status(frame, model_label, fps, timestamp_delta_ms, save_dir):
+def _format_extent(extent_xyz):
+    extent_xyz = np.asarray(extent_xyz, dtype=np.float32).reshape(3)
+    return f'x={extent_xyz[0]:.3f} y={extent_xyz[1]:.3f} z={extent_xyz[2]:.3f} m'
+
+
+def _overlay_pair_status(frame, model_label, fps, timestamp_delta_ms, save_dir, merge_stats):
     # 두 카메라 pair 수준의 상태값은 합쳐진 상단 preview에 따로 표기한다.
+    raw_count = merge_stats['raw_summary']['point_count']
+    voxel_count = merge_stats['voxel_summary']['point_count']
+    filtered_count = merge_stats['filtered_summary']['point_count']
+    extent_line = _format_extent(merge_stats['filtered_summary']['extent_xyz'])
     lines = [
-        f"model: {model_label}",
-        f"pair delta: {timestamp_delta_ms:+.1f} ms",
-        f"loop fps: {fps:.1f}",
-        f"s: save paired snapshot -> {save_dir}",
-        "ESC / q: quit",
+        f'model: {model_label}',
+        f'pair delta: {timestamp_delta_ms:+.1f} ms',
+        f'loop fps: {fps:.1f}',
+        f'merged points: {raw_count} -> {voxel_count} -> {filtered_count}',
+        f'merged extent: {extent_line}',
+        f's: save paired snapshot -> {save_dir}',
+        'ESC / q: quit',
     ]
     for line_index, text in enumerate(lines):
         origin = (12, 28 + line_index * 26)
         cv.putText(frame, text, origin, cv.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 3, cv.LINE_AA)
         cv.putText(frame, text, origin, cv.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1, cv.LINE_AA)
+
+
+def _overlay_merged_status(frame, target_camera_id, merge_stats):
+    lines = [
+        f'merged cloud in cam{target_camera_id}',
+        f"voxel: {merge_stats['voxel_size_m']:.4f} m",
+        f"outlier: {merge_stats['outlier_method']}",
+        f"points: {merge_stats['filtered_summary']['point_count']}",
+        f"extent: {_format_extent(merge_stats['filtered_summary']['extent_xyz'])}",
+    ]
+    for line_index, text in enumerate(lines):
+        origin = (12, 28 + line_index * 24)
+        cv.putText(frame, text, origin, cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv.LINE_AA)
+        cv.putText(frame, text, origin, cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
 
 
 def _process_camera_frame(frame_bundle, segmentation_engine, args, calibration_camera_id):
@@ -159,30 +196,23 @@ def _process_camera_frame(frame_bundle, segmentation_engine, args, calibration_c
     summary = format_instance_summary(selected_instances)
     pointcloud_preview = render_point_cloud_preview(points_xyz, colors_rgb)
     return {
-        "frame_bundle": frame_bundle,
-        "calibration_camera_id": int(calibration_camera_id),
-        "segmentation_result": segmentation_result,
-        "selected_instances": selected_instances,
-        "combined_mask": combined_mask,
-        "points_xyz": points_xyz,
-        "colors_rgb": colors_rgb,
-        "annotated": annotated,
-        "summary": summary,
-        "pointcloud_preview": pointcloud_preview,
+        'frame_bundle': frame_bundle,
+        'calibration_camera_id': int(calibration_camera_id),
+        'segmentation_result': segmentation_result,
+        'selected_instances': selected_instances,
+        'combined_mask': combined_mask,
+        'points_xyz': points_xyz,
+        'colors_rgb': colors_rgb,
+        'annotated': annotated,
+        'summary': summary,
+        'pointcloud_preview': pointcloud_preview,
     }
-
-
-def _uniform_colors(point_count, rgb_color):
-    # 정렬 preview에서는 원본 RGB 대신 카메라별 고정색으로 겹침 정도를 쉽게 본다.
-    if point_count <= 0:
-        return np.empty((0, 3), dtype=np.uint8)
-    return np.tile(np.asarray(rgb_color, dtype=np.uint8).reshape(1, 3), (point_count, 1))
 
 
 def _build_serial_to_camera_id(serials, camera_ids):
     # 실제 연결된 serial 순서를 calibration의 c0/c1 id와 매핑한다.
     if len(serials) != len(camera_ids):
-        raise ValueError("serials and camera_ids must have the same length")
+        raise ValueError('serials and camera_ids must have the same length')
     return {serial: int(camera_id) for serial, camera_id in zip(serials, camera_ids)}
 
 
@@ -191,21 +221,21 @@ def _align_processed_frames(processed_frames, extrinsics_by_camera_id, target_ca
     # target camera 자체는 그대로 두고, 나머지 카메라 cloud만 extrinsic으로 변환한다.
     aligned_frames = []
     for processed_frame in processed_frames:
-        calibration_camera_id = processed_frame["calibration_camera_id"]
+        calibration_camera_id = processed_frame['calibration_camera_id']
         source_extrinsic = extrinsics_by_camera_id[calibration_camera_id]
         target_extrinsic = extrinsics_by_camera_id[target_camera_id]
 
         if calibration_camera_id == target_camera_id:
-            transformed_points = np.asarray(processed_frame["points_xyz"], dtype=np.float32)
+            transformed_points = np.asarray(processed_frame['points_xyz'], dtype=np.float32)
         else:
             transformed_points = convert_points_between_cameras(
-                processed_frame["points_xyz"],
+                processed_frame['points_xyz'],
                 source_extrinsic=source_extrinsic,
                 target_extrinsic=target_extrinsic,
             )
 
         aligned_frame = dict(processed_frame)
-        aligned_frame["aligned_points_xyz"] = transformed_points.astype(np.float32)
+        aligned_frame['aligned_points_xyz'] = transformed_points.astype(np.float32)
         aligned_frames.append(aligned_frame)
     return aligned_frames
 
@@ -214,12 +244,12 @@ def _make_alignment_preview(aligned_frames, target_camera_id):
     # 정렬된 cloud를 target camera 실제 이미지 평면으로 다시 투영해서 겹침 정도를 본다.
     target_frame = None
     for aligned_frame in aligned_frames:
-        if aligned_frame["calibration_camera_id"] == target_camera_id:
+        if aligned_frame['calibration_camera_id'] == target_camera_id:
             target_frame = aligned_frame
             break
 
     if target_frame is None:
-        raise RuntimeError(f"Target camera id {target_camera_id} is missing from aligned_frames")
+        raise RuntimeError(f'Target camera id {target_camera_id} is missing from aligned_frames')
 
     projection_colors_bgr = [
         (80, 80, 255),
@@ -230,9 +260,9 @@ def _make_alignment_preview(aligned_frames, target_camera_id):
         f"cam{aligned_frames[1]['calibration_camera_id']} -> cam{target_camera_id}",
     ]
     return render_projected_point_cloud_overlay(
-        base_frame_bgr=target_frame["annotated"],
-        point_clouds=[aligned_frames[0]["aligned_points_xyz"], aligned_frames[1]["aligned_points_xyz"]],
-        intrinsics=target_frame["frame_bundle"].intrinsics,
+        base_frame_bgr=target_frame['annotated'],
+        point_clouds=[aligned_frames[0]['aligned_points_xyz'], aligned_frames[1]['aligned_points_xyz']],
+        intrinsics=target_frame['frame_bundle'].intrinsics,
         point_colors_bgr=projection_colors_bgr,
         labels=labels,
         point_radius=1,
@@ -240,43 +270,84 @@ def _make_alignment_preview(aligned_frames, target_camera_id):
     )
 
 
-def _save_dual_snapshot(save_dir, pair_index, processed_frames, aligned_frames, timestamp_delta_ms, target_camera_id):
+def _make_merged_overlay(aligned_frames, target_camera_id, merged_points_xyz):
+    target_frame = None
+    for aligned_frame in aligned_frames:
+        if aligned_frame['calibration_camera_id'] == target_camera_id:
+            target_frame = aligned_frame
+            break
+
+    if target_frame is None:
+        raise RuntimeError(f'Target camera id {target_camera_id} is missing from aligned_frames')
+
+    return render_projected_point_cloud_overlay(
+        base_frame_bgr=target_frame['annotated'],
+        point_clouds=[merged_points_xyz],
+        intrinsics=target_frame['frame_bundle'].intrinsics,
+        point_colors_bgr=[(0, 220, 0)],
+        labels=[f'merged -> cam{target_camera_id}'],
+        point_radius=1,
+        overlay_alpha=0.82,
+    )
+
+
+def _save_dual_snapshot(
+    save_dir,
+    pair_index,
+    processed_frames,
+    aligned_frames,
+    merged_points_xyz,
+    merged_colors_rgb,
+    merged_overlay,
+    timestamp_delta_ms,
+    target_camera_id,
+):
     # 디버깅을 위해 local cloud와 target camera 기준 transformed cloud를 모두 저장한다.
     output_dir = Path(save_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    pair_prefix = f"pair_{pair_index:06d}_dt_{int(round(timestamp_delta_ms)):+d}ms"
+    pair_prefix = f'pair_{pair_index:06d}_dt_{int(round(timestamp_delta_ms)):+d}ms'
 
     for camera_index, processed_frame in enumerate(processed_frames):
-        frame_bundle = processed_frame["frame_bundle"]
-        serial_label = frame_bundle.serial or f"cam{camera_index}"
+        frame_bundle = processed_frame['frame_bundle']
+        serial_label = frame_bundle.serial or f'cam{camera_index}'
         timestamp_label = int(round(frame_bundle.timestamp_ms))
-        base_name = f"{pair_prefix}_{serial_label}_{timestamp_label}"
+        base_name = f'{pair_prefix}_{serial_label}_{timestamp_label}'
         save_pointcloud_snapshot(
             save_dir=save_dir,
             base_name=base_name,
-            color_overlay=processed_frame["annotated"],
-            combined_mask=processed_frame["combined_mask"],
-            points_xyz=processed_frame["points_xyz"],
-            colors_rgb=processed_frame["colors_rgb"],
+            color_overlay=processed_frame['annotated'],
+            combined_mask=processed_frame['combined_mask'],
+            points_xyz=processed_frame['points_xyz'],
+            colors_rgb=processed_frame['colors_rgb'],
         )
 
     for aligned_frame in aligned_frames:
-        calibration_camera_id = aligned_frame["calibration_camera_id"]
+        calibration_camera_id = aligned_frame['calibration_camera_id']
         if calibration_camera_id == target_camera_id:
             continue
 
-        frame_bundle = aligned_frame["frame_bundle"]
-        serial_label = frame_bundle.serial or f"cam{calibration_camera_id}"
+        frame_bundle = aligned_frame['frame_bundle']
+        serial_label = frame_bundle.serial or f'cam{calibration_camera_id}'
         timestamp_label = int(round(frame_bundle.timestamp_ms))
-        base_name = f"{pair_prefix}_{serial_label}_{timestamp_label}_in_cam{target_camera_id}"
+        base_name = f'{pair_prefix}_{serial_label}_{timestamp_label}_in_cam{target_camera_id}'
         save_pointcloud_snapshot(
             save_dir=save_dir,
             base_name=base_name,
-            color_overlay=aligned_frame["annotated"],
-            combined_mask=aligned_frame["combined_mask"],
-            points_xyz=aligned_frame["aligned_points_xyz"],
-            colors_rgb=aligned_frame["colors_rgb"],
+            color_overlay=aligned_frame['annotated'],
+            combined_mask=aligned_frame['combined_mask'],
+            points_xyz=aligned_frame['aligned_points_xyz'],
+            colors_rgb=aligned_frame['colors_rgb'],
         )
+
+    merged_mask = np.zeros(merged_overlay.shape[:2], dtype=bool)
+    save_pointcloud_snapshot(
+        save_dir=save_dir,
+        base_name=f'{pair_prefix}_merged_in_cam{target_camera_id}',
+        color_overlay=merged_overlay,
+        combined_mask=merged_mask,
+        points_xyz=merged_points_xyz,
+        colors_rgb=merged_colors_rgb,
+    )
 
 
 def main():
@@ -314,7 +385,7 @@ def main():
         for camera_id in args.camera_ids
     }
     if args.target_camera_id not in extrinsics_by_camera_id:
-        raise ValueError("target_camera_id must be included in --camera-ids")
+        raise ValueError('target_camera_id must be included in --camera-ids')
 
     pair_index = 0
     smoothed_fps = 0.0
@@ -347,21 +418,38 @@ def main():
                 target_camera_id=args.target_camera_id,
             )
 
+            aligned_points = [aligned_frame['aligned_points_xyz'] for aligned_frame in aligned_frames]
+            aligned_colors = [aligned_frame['colors_rgb'] for aligned_frame in aligned_frames]
+            merged_points_xyz, merged_colors_rgb, merge_stats = merge_point_clouds(
+                aligned_points,
+                aligned_colors,
+                voxel_size_m=args.merge_voxel_size_m,
+                outlier_method=args.merge_outlier_method,
+                nb_neighbors=args.merge_nb_neighbors,
+                std_ratio=args.merge_std_ratio,
+                radius_m=args.merge_radius_m,
+                min_neighbors=args.merge_min_neighbors,
+            )
+
             for camera_index, processed_frame in enumerate(processed_frames):
                 _overlay_camera_status(
-                    processed_frame["annotated"],
-                    serial=processed_frame["frame_bundle"].serial,
-                    timestamp_ms=processed_frame["frame_bundle"].timestamp_ms,
-                    infer_ms=processed_frame["segmentation_result"].infer_ms,
-                    summary=processed_frame["summary"],
-                    point_count=len(processed_frame["points_xyz"]),
-                    camera_label=f"cam{camera_index} local cloud",
+                    processed_frame['annotated'],
+                    serial=processed_frame['frame_bundle'].serial,
+                    timestamp_ms=processed_frame['frame_bundle'].timestamp_ms,
+                    infer_ms=processed_frame['segmentation_result'].infer_ms,
+                    summary=processed_frame['summary'],
+                    point_count=len(processed_frame['points_xyz']),
+                    camera_label=f'cam{camera_index} local cloud',
                 )
 
-            color_preview = _stack_previews([processed_anchor["annotated"], processed_paired["annotated"]])
-            pointcloud_preview = _stack_previews([processed_anchor["pointcloud_preview"], processed_paired["pointcloud_preview"]])
+            color_preview = _stack_previews([processed_anchor['annotated'], processed_paired['annotated']])
+            pointcloud_preview = _stack_previews([processed_anchor['pointcloud_preview'], processed_paired['pointcloud_preview']])
             # 이 창은 두 cloud가 같은 target camera frame에 들어왔을 때 얼마나 겹치는지 보는 용도다.
             aligned_preview = _make_alignment_preview(aligned_frames, target_camera_id=args.target_camera_id)
+            merged_preview = render_point_cloud_preview(merged_points_xyz, merged_colors_rgb)
+            merged_overlay = _make_merged_overlay(aligned_frames, args.target_camera_id, merged_points_xyz)
+            _overlay_merged_status(merged_preview, args.target_camera_id, merge_stats)
+            _overlay_merged_status(merged_overlay, args.target_camera_id, merge_stats)
 
             now = time.perf_counter()
             instant_fps = 1.0 / max(now - last_loop_time, 1e-6)
@@ -374,48 +462,54 @@ def main():
                 fps=smoothed_fps,
                 timestamp_delta_ms=paired_frames.timestamp_delta_ms,
                 save_dir=args.save_dir,
+                merge_stats=merge_stats,
             )
 
-            cv.imshow("dual_realsense_masks", color_preview)
-            cv.imshow("dual_realsense_local_pointclouds", pointcloud_preview)
-            cv.imshow(f"dual_realsense_aligned_cam{args.target_camera_id}", aligned_preview)
+            cv.imshow('dual_realsense_masks', color_preview)
+            cv.imshow('dual_realsense_local_pointclouds', pointcloud_preview)
+            cv.imshow(f'dual_realsense_aligned_cam{args.target_camera_id}', aligned_preview)
+            cv.imshow(f'dual_realsense_merged_cam{args.target_camera_id}', merged_overlay)
+            cv.imshow('dual_realsense_merged_pointcloud', merged_preview)
 
             if args.show_depth:
                 cv.imshow(
                     f"depth_{processed_anchor['frame_bundle'].serial}",
-                    render_depth(processed_anchor["frame_bundle"].depth_image_m, args.max_depth_m),
+                    render_depth(processed_anchor['frame_bundle'].depth_image_m, args.max_depth_m),
                 )
                 cv.imshow(
                     f"depth_{processed_paired['frame_bundle'].serial}",
-                    render_depth(processed_paired["frame_bundle"].depth_image_m, args.max_depth_m),
+                    render_depth(processed_paired['frame_bundle'].depth_image_m, args.max_depth_m),
                 )
             if args.show_mask:
                 cv.imshow(
                     f"mask_{processed_anchor['frame_bundle'].serial}",
-                    render_mask_preview(processed_anchor["combined_mask"]),
+                    render_mask_preview(processed_anchor['combined_mask']),
                 )
                 cv.imshow(
                     f"mask_{processed_paired['frame_bundle'].serial}",
-                    render_mask_preview(processed_paired["combined_mask"]),
+                    render_mask_preview(processed_paired['combined_mask']),
                 )
 
             should_auto_save = args.save_every > 0 and pair_index % args.save_every == 0
             key = cv.waitKey(1) & 0xFF
-            if key == ord("s") or should_auto_save:
+            if key == ord('s') or should_auto_save:
                 _save_dual_snapshot(
                     args.save_dir,
                     pair_index,
                     processed_frames,
                     aligned_frames,
+                    merged_points_xyz,
+                    merged_colors_rgb,
+                    merged_overlay,
                     paired_frames.timestamp_delta_ms,
                     target_camera_id=args.target_camera_id,
                 )
-            if key in (27, ord("q")):
+            if key in (27, ord('q')):
                 break
     finally:
         camera_manager.stop()
         cv.destroyAllWindows()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
