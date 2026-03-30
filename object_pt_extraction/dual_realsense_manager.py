@@ -13,7 +13,7 @@ class PairedFrameBundle:
 
 
 class DualRealSenseManager:
-    def __init__(self, serials=None, width=640, height=480, fps=30, anchor_index=0):
+    def __init__(self, serials=None, width=640, height=480, fps=30, anchor_index=0, depth_filters_by_serial=None):
         available_serials = list(serials or [])
         if not available_serials:
             available_serials = list_realsense_serials()
@@ -28,8 +28,15 @@ class DualRealSenseManager:
         self.anchor_index = int(anchor_index)
         self.anchor_serial = self.serials[self.anchor_index]
         self.paired_serial = self.serials[1 - self.anchor_index]
+        depth_filters_by_serial = dict(depth_filters_by_serial or {})
         self.cameras = {
-            serial: RealSenseCamera(serial=serial, width=width, height=height, fps=fps)
+            serial: RealSenseCamera(
+                serial=serial,
+                width=width,
+                height=height,
+                fps=fps,
+                depth_filters=depth_filters_by_serial.get(serial),
+            )
             for serial in self.serials
         }
         self._paired_latest_frame = None

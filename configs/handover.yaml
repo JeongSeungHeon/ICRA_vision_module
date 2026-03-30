@@ -1,0 +1,260 @@
+system:
+  name: dual_camera_receive_and_place
+  use_ros: false
+  sensor_fps: 30
+  task_manager_hz: 20
+  robot_control_hz: 125
+  runner_heartbeat_sec: 1.0
+  runner_loop_sleep_sec: 0.0
+
+frames:
+  base_frame: ur_base
+  tool_frame: tool0
+  height_axis:
+    name: z
+    positive_direction: up
+    description: upward/downward direction used for lift detection and hand-clearance checks
+
+cameras:
+  cam0:
+    enabled: true
+    role: right_hand_camera
+    serial: null
+    width: 640
+    height: 480
+    fps: 30
+    depth_filters:
+      spatial:
+        enabled: false
+        magnitude: 2
+        smooth_alpha: 0.5
+        smooth_delta: 20
+      temporal:
+        enabled: false
+        smooth_alpha: 0.4
+        smooth_delta: 20
+      hole_filling:
+        enabled: false
+        mode: 1
+    intrinsics_file: python_stereo_camera_calibrate/camera_parameters/camera0_intrinsics.dat
+    extrinsics_file: camera_parameters/c0_to_robot.pckl
+    extrinsics_format: pickle_cam0_to_robot
+  cam1:
+    enabled: true
+    role: left_hand_camera
+    serial: null
+    width: 640
+    height: 480
+    fps: 30
+    depth_filters:
+      spatial:
+        enabled: true
+        magnitude: 2
+        smooth_alpha: 0.5
+        smooth_delta: 20
+      temporal:
+        enabled: true
+        smooth_alpha: 0.2
+        smooth_delta: 20
+      hole_filling:
+        enabled: false
+        mode: 1
+    intrinsics_file: python_stereo_camera_calibrate/camera_parameters/camera1_intrinsics.dat
+    extrinsics_file: camera_parameters/rot_trans_c1.dat
+    extrinsics_format: dat_cam1_to_cam0
+
+calibration:
+  chain:
+    cam0_to_robot_base:
+      file: camera_parameters/c0_to_robot.pckl
+      format: pickle_cam0_to_robot
+      description: transform from cam0 coordinates into the robot base frame
+    cam1_to_cam0:
+      file: camera_parameters/rot_trans_c1.dat
+      format: dat_cam1_to_cam0
+      translation_unit: m
+      description: transform from cam1 coordinates into the cam0 frame
+  composition:
+    derived_transform_name: T_base_cam1
+    expression: T_base_cam1 = T_base_cam0 @ T_cam0_cam1
+    note: cam1 points are first transformed into cam0, then from cam0 into robot base
+
+perception:
+  synchronization:
+    max_pair_time_delta_sec: 0.03
+    stale_timeout_sec: 0.30
+  object:
+    target_label: cup, wine_glass
+    confidence_threshold: 0.50
+    segmentation:
+      model_name: yoloe-26x-seg.pt
+      prompt_classes: [cup, wine_glass]
+      imgsz: 640
+      conf: 0.25
+      iou: 0.45
+      max_det: 100
+      device: null
+      classes: null
+      half: false
+      retina_masks: true
+      selection_mode: highest_score
+      selection_class_names: [cup, wine_glass]
+    point_cloud:
+      stride: 2
+      max_points: 20000
+      min_depth_m: 0.10
+      max_depth_m: 1.50
+      per_camera_voxel_size_m: 0.005
+      outlier_method: statistical
+      outlier_nb_neighbors: 20
+      outlier_std_ratio: 2.0
+      outlier_radius_m: 0.01
+      outlier_min_neighbors: 8
+      min_points_per_camera: 300
+    merged_voxel_size_m: 0.006
+  hand:
+    target_fps: 30
+    detector:
+      min_detection_confidence: 0.5
+      min_tracking_confidence: 0.5
+      max_num_hands: 1
+    depth_lifting:
+      patch_radius: 2
+      min_depth_m: 0.10
+      max_depth_m: 1.20
+      min_valid_keypoints: 4
+    smoothing_window_frames: 5
+    velocity_alpha: 0.5
+    min_pose_quality: 0.25
+    handedness_selection:
+      right_hand_camera: 0
+      left_hand_camera: 1
+      hysteresis_frames: 5
+      dropout_hold_frames: 12
+      confidence_drop_margin: 0.15
+  fusion:
+    object_centroid_alpha: 0.35
+    hand_center_alpha: 0.35
+    hand_normal_alpha: 0.50
+    max_position_jump_m: 0.20
+    stable_frames_required: 5
+  activation:
+    hand_approach_distance_threshold_m: 0.15
+    stable_frames_required: 5
+    lift_detection:
+      enabled: true
+      threshold_m: 0.05
+      axis_name: z
+      require_hand_approach_first: true
+
+grasp:
+  fixed_orientation_format: rpy
+  fixed_orientation_base: [1.591, -0.017, 1.561]   # EEF RPY (rad) — locked throughout task
+  candidate_search_radius_from_centroid_m: 0.07
+  min_hand_height_clearance_m: 0.05
+  no_candidate_action: hold
+
+# Home pose: the robot moves here at start-up and after each task cycle.
+# Position in metres (robot base frame, project coordinates).
+# Orientation reuses grasp.fixed_orientation_base (same RPY).
+home_pose:
+  enabled: true
+  position_m: [0.478, 0.102, 0.478]   # x=478mm, y=102mm, z=478mm
+  move_speed_mps: 0.05                 # slow, safe home motion
+  move_acceleration: 0.10
+
+placement:
+  use_initial_object_centroid: true
+  release_height_offset_m: 0.0
+  position_tolerance_m: 0.01
+
+task_manager:
+  approach_grasp_timeout_sec: 10.0
+  receive_close_dwell_sec: 0.40
+  verify_grasp_timeout_sec: 3.0     # force 센서 안정화 여유 시간 확보
+  move_to_place_timeout_sec: 10.0
+  release_dwell_sec: 0.60
+  retreat_distance_m: 0.08
+  retreat_timeout_sec: 5.0
+  missing_grasp_target_timeout_sec: 2.00
+  verify_grasp_force_only_fallback: true  # force 검증 실패 시 dwell 후 진행
+  fail_safe_auto_recover_sec: 5.0   # FAIL_SAFE 진입 후 5s 경과 시 IDLE 자동복구
+
+robot:
+  control_mode: live_follow_servo
+  live_follow:
+    enabled: true
+    control_hz: 30.0
+    min_valid_count: 3
+    target_timeout_sec: 0.5
+    follow_z: true
+    approach_axis: x
+    approach_offset_m: -0.08
+    max_xy_speed_mps: 0.08
+    max_z_speed_mps: 0.08
+    max_xy_step_m: 0.0027
+    max_z_step_m: 0.0027
+    workspace_clamp_enabled: true
+    hold_last_target_until_timeout: true
+
+  rtde:
+    robot_ip: 192.168.56.101
+    dashboard_port: 29999
+    control_hz: 125
+    watchdog_timeout_sec: 0.50
+    use_mock_fallback: true
+    force_mock: false
+    move_asynchronous: true
+    move_acceleration: 0.20
+    servo_velocity: 0.05
+    servo_acceleration: 0.20
+    servo_lookahead_time: 0.10
+    servo_gain: 300
+    stop_acceleration: 1.0
+  # 로봇 동작 속도 조절
+  motion:
+    approach_speed_mps: 0.10
+    retreat_speed_mps: 0.18
+    max_translation_step_m: 0.05
+  gripper:
+    control_mode: socket             # Use UR Robotiq daemon on port 63352 by default
+    open_command: open
+    close_command: close
+    socket_port: 63352
+    socket_timeout_sec: 2.0
+    socket_settle_time: 0.15
+    activate_on_connect: true
+    open_speed: 255
+    open_force: 255
+    close_speed: 255
+    close_force: 255
+    position_complete_threshold: 100
+    debug: true
+    output_domain: tool              # Fallback only when control_mode is not socket
+    open_digital_output: 1
+    close_digital_output: 0
+    output_high_when_active: true
+  grasp_verification:
+    method: rtde_force_current
+    use_tcp_force: true
+    use_joint_current: true
+    min_tcp_force_norm_n: 8.0
+    min_mean_joint_current_a: 0.15
+    verification_window_sec: 0.20
+    require_both_signals: false
+  frame_mapping:
+    enabled: true
+    position_signs: [-1.0, -1.0, 1.0]
+
+safety:
+  max_robot_speed_mps: 0.25
+  stale_perception_timeout_sec: 1.00   # 0.30 → 1.0 (camera ts와 wall clock 오프셋 허용)
+  min_merged_object_confidence: 0.50
+  fail_safe_action: hold              # stop → hold (회복 가능성 유지)
+  workspace_bounds_m:
+    x: [-0.60, 0.80]
+    y: [-0.30, 0.80]
+    z: [0.00, 0.80]
+  stop_on_stale_perception: false     # runner에서 wall clock timestamp로 통일 후 활성화 가능
+  stop_on_invalid_calibration: true
+  stop_on_missing_grasp_target: true

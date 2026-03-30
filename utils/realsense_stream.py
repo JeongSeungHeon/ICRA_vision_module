@@ -29,7 +29,7 @@ def list_realsense_serials():
 
 
 class RealSenseCamera:
-    def __init__(self, serial=None, width=640, height=480, fps=30):
+    def __init__(self, serial=None, width=640, height=480, fps=30, depth_filters=None):
         _require_realsense()
 
         self.serial = serial
@@ -38,6 +38,7 @@ class RealSenseCamera:
         self.fps = fps
         self.pipeline = rs.pipeline()
         self.config = rs.config()
+        self.depth_filters_config = dict(depth_filters or {})
 
         if self.serial:
             self.config.enable_device(self.serial)
@@ -47,6 +48,9 @@ class RealSenseCamera:
 
         self.profile = self.pipeline.start(self.config)
         self.align = rs.align(rs.stream.color)
+        self._spatial_filter = self._build_spatial_filter()
+        self._temporal_filter = self._build_temporal_filter()
+        self._hole_filling_filter = self._build_hole_filling_filter()
 
         device = self.profile.get_device()
         self.serial = device.get_info(rs.camera_info.serial_number)
@@ -63,11 +67,54 @@ class RealSenseCamera:
             "cy": intrinsics.ppy,
         }
 
+    def _build_spatial_filter(self):
+        cfg = self.depth_filters_config.get("spatial", {})
+        if not cfg.get("enabled", False):
+            return None
+        filter_obj = rs.spatial_filter()
+        if "magnitude" in cfg:
+            filter_obj.set_option(rs.option.filter_magnitude, float(cfg["magnitude"]))
+        if "smooth_alpha" in cfg:
+            filter_obj.set_option(rs.option.filter_smooth_alpha, float(cfg["smooth_alpha"]))
+        if "smooth_delta" in cfg:
+            filter_obj.set_option(rs.option.filter_smooth_delta, float(cfg["smooth_delta"]))
+        return filter_obj
+
+    def _build_temporal_filter(self):
+        cfg = self.depth_filters_config.get("temporal", {})
+        if not cfg.get("enabled", False):
+            return None
+        filter_obj = rs.temporal_filter()
+        if "smooth_alpha" in cfg:
+            filter_obj.set_option(rs.option.filter_smooth_alpha, float(cfg["smooth_alpha"]))
+        if "smooth_delta" in cfg:
+            filter_obj.set_option(rs.option.filter_smooth_delta, float(cfg["smooth_delta"]))
+        return filter_obj
+
+    def _build_hole_filling_filter(self):
+        cfg = self.depth_filters_config.get("hole_filling", {})
+        if not cfg.get("enabled", False):
+            return None
+        filter_obj = rs.hole_filling_filter()
+        if "mode" in cfg:
+            filter_obj.set_option(rs.option.holes_fill, float(cfg["mode"]))
+        return filter_obj
+
+    def _apply_depth_filters(self, depth_frame):
+        filtered = depth_frame
+        if self._spatial_filter is not None:
+            filtered = self._spatial_filter.process(filtered)
+        if self._temporal_filter is not None:
+            filtered = self._temporal_filter.process(filtered)
+        if self._hole_filling_filter is not None:
+            filtered = self._hole_filling_filter.process(filtered)
+        return filtered
+
     def read(self):
         frames = self.pipeline.wait_for_frames()
         aligned_frames = self.align.process(frames)
         color_frame = aligned_frames.get_color_frame()
-        depth_frame = aligned_frames.get_depth_frame()
+        depth_frame = self._apply_depth_filters(aligned_frames.get_depth_frame())
 
         if not color_frame or not depth_frame:
             raise RuntimeError(f"Failed to read aligned frames from RealSense {self.serial}.")

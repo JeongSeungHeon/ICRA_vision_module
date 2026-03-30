@@ -17,3 +17,4 @@ clip @ git+https://github.com/ultralytics/CLIP.git@88ade288431a46233f1556d1e1419
 
 # Point-cloud visualization
 open3d==0.19.0
+ur-rtde==1.6.3

@@ -20,6 +20,7 @@ from object_pt_extraction.pointcloud_utils import (
     render_mask_preview,
     render_point_cloud_preview,
     save_pointcloud_snapshot,
+    write_ascii_ply,
 )
 from object_pt_extraction.segmentation_engine import (
     SegmentationEngine,
@@ -136,6 +137,28 @@ def _overlay_camera_status(frame, serial, timestamp_ms, infer_ms, summary, point
 def _format_extent(extent_xyz):
     extent_xyz = np.asarray(extent_xyz, dtype=np.float32).reshape(3)
     return f'x={extent_xyz[0]:.3f} y={extent_xyz[1]:.3f} z={extent_xyz[2]:.3f} m'
+
+
+def _make_source_colored_clouds(aligned_frames):
+    # 출처 카메라를 저장된 .ply에서도 바로 구분할 수 있게 camera id 기준 고정 색상을 입힌다.
+    source_palette_rgb = (
+        np.array((255, 96, 96), dtype=np.uint8),
+        np.array((64, 200, 255), dtype=np.uint8),
+    )
+    camera_ids = sorted({int(aligned_frame['calibration_camera_id']) for aligned_frame in aligned_frames})
+    color_by_camera_id = {
+        camera_id: source_palette_rgb[index % len(source_palette_rgb)]
+        for index, camera_id in enumerate(camera_ids)
+    }
+    point_clouds = []
+    colors_rgb_list = []
+    for aligned_frame in aligned_frames:
+        points_xyz = np.asarray(aligned_frame['aligned_points_xyz'], dtype=np.float32).reshape((-1, 3))
+        source_color_rgb = color_by_camera_id[int(aligned_frame['calibration_camera_id'])]
+        colors_rgb = np.repeat(source_color_rgb[None, :], len(points_xyz), axis=0)
+        point_clouds.append(points_xyz)
+        colors_rgb_list.append(colors_rgb)
+    return point_clouds, colors_rgb_list
 
 
 def _overlay_pair_status(frame, model_label, fps, timestamp_delta_ms, save_dir, merge_stats):
@@ -301,6 +324,7 @@ def _save_dual_snapshot(
     merged_overlay,
     timestamp_delta_ms,
     target_camera_id,
+    merge_kwargs,
 ):
     # 디버깅을 위해 local cloud와 target camera 기준 transformed cloud를 모두 저장한다.
     output_dir = Path(save_dir)
@@ -347,6 +371,18 @@ def _save_dual_snapshot(
         combined_mask=merged_mask,
         points_xyz=merged_points_xyz,
         colors_rgb=merged_colors_rgb,
+    )
+
+    source_colored_points, source_colored_rgb = _make_source_colored_clouds(aligned_frames)
+    merged_by_camera_points_xyz, merged_by_camera_colors_rgb, _ = merge_point_clouds(
+        source_colored_points,
+        source_colored_rgb,
+        **merge_kwargs,
+    )
+    write_ascii_ply(
+        output_dir / f'{pair_prefix}_merged_by_camera_in_cam{target_camera_id}.ply',
+        merged_by_camera_points_xyz,
+        merged_by_camera_colors_rgb,
     )
 
 
@@ -503,6 +539,14 @@ def main():
                     merged_overlay,
                     paired_frames.timestamp_delta_ms,
                     target_camera_id=args.target_camera_id,
+                    merge_kwargs={
+                        'voxel_size_m': args.merge_voxel_size_m,
+                        'outlier_method': args.merge_outlier_method,
+                        'nb_neighbors': args.merge_nb_neighbors,
+                        'std_ratio': args.merge_std_ratio,
+                        'radius_m': args.merge_radius_m,
+                        'min_neighbors': args.merge_min_neighbors,
+                    },
                 )
             if key in (27, ord('q')):
                 break
