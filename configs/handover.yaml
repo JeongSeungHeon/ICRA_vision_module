@@ -99,6 +99,15 @@ perception:
       retina_masks: true
       selection_mode: highest_score
       selection_class_names: [cup, wine_glass]
+      preprocess:
+        enabled: false
+        contrast_alpha: 1.0
+        brightness_beta: 0.0
+        gamma: 1.0
+        clahe:
+          enabled: false
+          clip_limit: 2.0
+          tile_grid_size: 8
     point_cloud:
       stride: 2
       max_points: 20000

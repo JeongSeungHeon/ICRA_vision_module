@@ -1,12 +1,14 @@
 """Dual-camera grasp-target follow script adapted for UR5 RTDE control."""
 
 import argparse
+import csv
 import sys
 import time
 import pickle
 import threading
 from pathlib import Path
 from collections import deque
+from datetime import datetime
 
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parent))
@@ -162,6 +164,12 @@ def parse_args():
     parser.add_argument("--gripper-close-timeout-s", type=float, default=2.0, help="Timeout for force/current grasp verification.")
     parser.add_argument("--gripper-release-dwell-s", type=float, default=0.5, help="Dwell after opening gripper.")
     parser.add_argument("--follow-handoff-timeout-s", type=float, default=5.0, help="Timeout to wait for the follow thread to release robot control before pregrasp.")
+    parser.add_argument(
+        "--target-log-dir",
+        type=str,
+        default="logs/target_points",
+        help="Directory where per-task target point histories are saved as CSV.",
+    )
     return parser.parse_args()
 
 
@@ -604,6 +612,7 @@ class FollowSharedState:
         self.grasp_closed = False
         self.grasp_offset_xyz_mm = None
         self.task_state = "FOLLOW"
+        self.task_epoch = 0
 
     def set_fixed_pose_from_robot(self, controller):
         state = controller.read_robot_state(now_timestamp=time.time())
@@ -674,6 +683,7 @@ class FollowSharedState:
             self.grasp_closed = False
             self.grasp_offset_xyz_mm = None
             self.task_state = "FOLLOW"
+            self.task_epoch += 1
         self.follow_idle_event.set()
         print(f"[INFO] Follow/task state reset. follow_enabled={self.follow_enabled}")
 
@@ -749,6 +759,8 @@ class FollowSharedState:
                 "object_stopped": self.object_stopped,
                 "pregrasp_started": self.pregrasp_started,
                 "initial_pose_base": None if self.initial_pose_base is None else tuple(self.initial_pose_base),
+                "task_state": self.task_state,
+                "task_epoch": self.task_epoch,
             }
 
     def get_follow_status_text(self):
@@ -767,7 +779,6 @@ class FollowSharedState:
             f"home: {home} | streak: {streak}",
             f"target_mm: {target}",
         ]
-
     def try_lock_home_pose(self, object_xyz_mm, pixel_xy):
         if self.home_object_locked:
             return
@@ -851,6 +862,144 @@ class FollowSharedState:
 
         print(f"[DEBUG] pregrasp check dxy={dxy:.1f}, thresh={xy_thresh_mm}")
         return False
+
+
+class TaskTargetLogger:
+    def __init__(self, shared_state, output_dir, sample_hz):
+        self.shared_state = shared_state
+        self.output_dir = Path(output_dir)
+        self.sample_hz = max(float(sample_hz), 1e-6)
+        self.sample_interval_s = 1.0 / self.sample_hz
+        self.stale_after_s = max(3.0 * self.sample_interval_s, 0.15)
+        self.stop_event = threading.Event()
+        self.thread = None
+
+        self._lock = threading.Lock()
+        self._active = False
+        self._session_epoch = None
+        self._session_index = 0
+        self._sample_index = 0
+        self._session_started_wall_time = None
+        self._session_started_perf = None
+        self._csv_file = None
+        self._csv_writer = None
+        self._csv_path = None
+
+    def start(self):
+        if self.thread is not None:
+            return
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
+        with self._lock:
+            self._finalize_locked("shutdown")
+
+    def abort_session(self, reason="aborted"):
+        with self._lock:
+            self._finalize_locked(reason)
+
+    def _run(self):
+        while not self.stop_event.is_set():
+            sample_perf = time.perf_counter()
+            sample_wall = time.time()
+            snapshot = self.shared_state.get_snapshot()
+            target_xyz_mm, target_age_s = self._extract_target(sample_perf, snapshot)
+
+            with self._lock:
+                if self._active and snapshot["task_epoch"] != self._session_epoch:
+                    self._finalize_locked("reset")
+
+                if (not self._active) and target_xyz_mm is not None:
+                    self._open_locked(snapshot["task_epoch"], sample_wall, sample_perf)
+
+                if self._active:
+                    self._write_row_locked(sample_wall, sample_perf, snapshot, target_xyz_mm, target_age_s)
+                    if snapshot["task_state"] == "DONE":
+                        self._finalize_locked("done")
+
+            self.stop_event.wait(self.sample_interval_s)
+
+    def _extract_target(self, sample_perf, snapshot):
+        target_xyz_mm = snapshot["latest_target_xyz_mm"]
+        target_t = float(snapshot["latest_target_t"])
+        if target_xyz_mm is None or target_t <= 0.0:
+            return None, None
+
+        age_s = max(sample_perf - target_t, 0.0)
+        if age_s > self.stale_after_s:
+            return None, age_s
+        return np.asarray(target_xyz_mm, dtype=np.float32).copy(), age_s
+
+    def _open_locked(self, task_epoch, sample_wall, sample_perf):
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._session_index += 1
+        self._sample_index = 0
+        self._session_epoch = int(task_epoch)
+        self._session_started_wall_time = float(sample_wall)
+        self._session_started_perf = float(sample_perf)
+        timestamp = datetime.fromtimestamp(sample_wall).strftime("%Y%m%d_%H%M%S")
+        self._csv_path = self.output_dir / f"target_points_task{self._session_index:03d}_{timestamp}.csv"
+        self._csv_file = self._csv_path.open("w", newline="", encoding="utf-8")
+        self._csv_writer = csv.writer(self._csv_file)
+        self._csv_writer.writerow(
+            [
+                "sample_index",
+                "wall_time_iso",
+                "elapsed_s",
+                "task_epoch",
+                "task_state",
+                "target_age_s",
+                "target_x_mm",
+                "target_y_mm",
+                "target_z_mm",
+            ]
+        )
+        self._active = True
+        print(f"[INFO] Target point logging started: {self._csv_path}")
+
+    def _write_row_locked(self, sample_wall, sample_perf, snapshot, target_xyz_mm, target_age_s):
+        if self._csv_writer is None:
+            return
+
+        self._sample_index += 1
+        if target_xyz_mm is None:
+            xyz_values = ["NaN", "NaN", "NaN"]
+        else:
+            xyz_values = [f"{float(v):.6f}" for v in target_xyz_mm]
+
+        age_value = "NaN" if target_age_s is None else f"{float(target_age_s):.6f}"
+        elapsed_s = float(sample_perf - self._session_started_perf)
+        self._csv_writer.writerow(
+            [
+                self._sample_index,
+                datetime.fromtimestamp(sample_wall).isoformat(timespec="milliseconds"),
+                f"{elapsed_s:.6f}",
+                snapshot["task_epoch"],
+                snapshot["task_state"],
+                age_value,
+                *xyz_values,
+            ]
+        )
+        self._csv_file.flush()
+
+    def _finalize_locked(self, reason):
+        if not self._active:
+            return
+        csv_path = self._csv_path
+        if self._csv_file is not None:
+            self._csv_file.close()
+        self._active = False
+        self._session_epoch = None
+        self._session_started_wall_time = None
+        self._session_started_perf = None
+        self._csv_file = None
+        self._csv_writer = None
+        self._csv_path = None
+        print(f"[INFO] Target point logging finished ({reason}): {csv_path}")
 
 
 def robot_control_loop(controller, shared_state, args):
@@ -1009,8 +1158,10 @@ def move_robot_to_home_pose(controller, args):
     print("[INFO] HOME pose reached")
 
 
-def reset_system_to_start_state(controller, shared_state, args):
+def reset_system_to_start_state(controller, shared_state, args, target_logger=None):
     print("[INFO] Reset requested: returning to startup state")
+    if target_logger is not None:
+        target_logger.abort_session("reset")
     if controller is None:
         shared_state.reset_for_restart(follow_enabled=False)
         return
@@ -1343,6 +1494,7 @@ def execute_return_and_place(controller, shared_state, args):
 
 def configure_object_worker_from_args(worker, args, prompt_classes):
     effective_prompt_classes = prompt_classes if prompt_classes else list(getattr(worker.segmentation_engine, "prompt_classes", []))
+    preprocess_config = dict(getattr(worker.segmentation_engine, "preprocess_config", {}) or {})
     worker.segmentation_engine = SegmentationEngine(
         model_name=args.model,
         prompt_classes=effective_prompt_classes,
@@ -1354,6 +1506,7 @@ def configure_object_worker_from_args(worker, args, prompt_classes):
         classes=args.classes,
         half=args.half,
         retina_masks=True,
+        preprocess_config=preprocess_config,
     )
     worker.selection_mode = args.select_mode
     if args.select_class is not None:
@@ -1460,6 +1613,29 @@ def choose_point(primary, fallback=None):
     return primary if primary is not None else fallback
 
 
+def _summarize_class_names(class_names):
+    if not class_names:
+        return "-"
+    counts = {}
+    for class_name in class_names:
+        key = str(class_name)
+        counts[key] = counts.get(key, 0) + 1
+    parts = []
+    for key in sorted(counts):
+        count = counts[key]
+        parts.append(f"{key}x{count}" if count > 1 else key)
+    return ",".join(parts)
+
+
+def get_segmentation_class_summary(object_worker):
+    debug = getattr(object_worker, "last_debug", None)
+    if debug is None:
+        return "-", "-"
+    all_summary = _summarize_class_names(getattr(debug, "all_class_names", ()))
+    selected_summary = _summarize_class_names(getattr(debug, "selected_class_names", ()))
+    return all_summary, selected_summary
+
+
 def render_camera_mask_preview(
     snapshot,
     pipeline,
@@ -1505,6 +1681,15 @@ def render_camera_mask_preview(
     title = f"{camera_label} view"
     cv.putText(image_bgr, title, (12, 28), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv.LINE_AA)
     cv.putText(image_bgr, title, (12, 28), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
+    all_summary, selected_summary = get_segmentation_class_summary(object_worker)
+    info_lines = [
+        f"seg all: {all_summary}",
+        f"seg selected: {selected_summary}",
+    ]
+    for line_index, text_line in enumerate(info_lines):
+        origin = (12, 54 + line_index * 22)
+        cv.putText(image_bgr, text_line, origin, cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv.LINE_AA)
+        cv.putText(image_bgr, text_line, origin, cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv.LINE_AA)
     return image_bgr
 
 
@@ -1579,6 +1764,9 @@ def render_cam0_perception_debug(
         f"object={format_vec3(object_point)}",
         f"hand={format_vec3(hand_point)}",
     ]
+    cam0_all_summary, cam0_selected_summary = get_segmentation_class_summary(pipeline["object_worker_cam0"])
+    lines.append(f"cam0 seg all={cam0_all_summary}")
+    lines.append(f"cam0 seg selected={cam0_selected_summary}")
     lines.extend(shared_state.get_follow_status_text())
 
     for line_index, text_line in enumerate(lines):
@@ -1611,6 +1799,8 @@ def main():
 
     controller = None
     shared_state = FollowSharedState(args)
+    target_logger = TaskTargetLogger(shared_state, args.target_log_dir, args.fps)
+    target_logger.start()
     control_thread = None
 
     if args.enable_follow:
@@ -1720,7 +1910,7 @@ def main():
                 shared_state.toggle_follow()
             elif key == ord("r"):
                 try:
-                    reset_system_to_start_state(controller, shared_state, args)
+                    reset_system_to_start_state(controller, shared_state, args, target_logger=target_logger)
                 except Exception as exc:
                     print(f"[WARN] Reset failed: {exc}")
             elif key == ord("s"):
@@ -1733,6 +1923,7 @@ def main():
         shared_state.stop_event.set()
         if control_thread is not None:
             control_thread.join(timeout=1.0)
+        target_logger.stop()
         safe_stop_rtde(controller)
         disconnect_rtde(controller)
         try:

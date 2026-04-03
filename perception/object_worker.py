@@ -29,6 +29,8 @@ class ObjectWorkerDebug:
     camera_id: int
     selected_instance_count: int
     infer_ms: float
+    all_class_names: tuple[str, ...]
+    selected_class_names: tuple[str, ...]
     combined_mask: np.ndarray
     points_camera: np.ndarray
     points_base: np.ndarray
@@ -87,6 +89,7 @@ class ObjectWorker:
             classes=segmentation_cfg.get("classes"),
             half=bool(segmentation_cfg.get("half", False)),
             retina_masks=bool(segmentation_cfg.get("retina_masks", True)),
+            preprocess_config=dict(segmentation_cfg.get("preprocess", {}) or {}),
         )
         transform_chain = load_transform_chain(config_path)
         return cls(
@@ -143,6 +146,8 @@ class ObjectWorker:
             camera_id=self.camera_id,
             selected_instance_count=len(selected_instances),
             infer_ms=float(segmentation_result.infer_ms),
+            all_class_names=tuple(str(instance.class_name) for instance in segmentation_result.instances),
+            selected_class_names=tuple(str(instance.class_name) for instance in selected_instances),
             combined_mask=combined_mask,
             points_camera=np.asarray(points_camera, dtype=np.float32),
             points_base=np.asarray(points_base, dtype=np.float32),

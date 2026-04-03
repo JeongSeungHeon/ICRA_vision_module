@@ -1,0 +1,95 @@
+system:
+  name: zed_single_camera_verification
+  use_ros: false
+  sensor_fps: 30
+  camera_backend: zed
+
+frames:
+  base_frame: cam0
+  tool_frame: tool0
+  height_axis:
+    name: y
+    positive_direction: down
+    description: single-camera verification uses the camera-local vertical axis for hand/object clearance checks
+
+cameras:
+  cam0:
+    enabled: true
+    role: verification_camera
+    backend: zed
+    serial: null
+    resolution: HD720
+    width: 1280
+    height: 720
+    fps: 30
+    depth_mode: NEURAL
+    depth_min_m: 0.10
+    depth_max_m: 1.50
+
+calibration:
+  use_identity_base_frame: true
+  cam0_to_base_file: null
+  cam0_to_base_format: pickle_cam0_to_robot
+  cam0_to_base_translation_unit: m
+
+perception:
+  object:
+    target_label: cup, wine_glass
+    confidence_threshold: 0.30
+    segmentation:
+      model_name: yoloe-26l-seg.pt
+      prompt_classes: [cup, wine_glass]
+      imgsz: 640
+      conf: 0.25
+      iou: 0.45
+      max_det: 100
+      device: null
+      classes: null
+      half: false
+      retina_masks: true
+      selection_mode: highest_score
+      selection_class_names: [cup, wine_glass]
+      preprocess:
+        enabled: true
+        contrast_alpha: 1.20
+        brightness_beta: 0.0
+        gamma: 0.80
+        clahe:
+          enabled: false
+          clip_limit: 2.0
+          tile_grid_size: 8
+    point_cloud:
+      stride: 2
+      max_points: 20000
+      min_depth_m: 0.10
+      max_depth_m: 1.50
+      per_camera_voxel_size_m: 0.005
+      outlier_method: statistical
+      outlier_nb_neighbors: 20
+      outlier_std_ratio: 2.0
+      outlier_radius_m: 0.01
+      outlier_min_neighbors: 8
+      min_points_per_camera: 300
+  hand:
+    detector:
+      min_detection_confidence: 0.5
+      min_tracking_confidence: 0.5
+      max_num_hands: 1
+    depth_lifting:
+      patch_radius: 2
+      min_depth_m: 0.10
+      max_depth_m: 1.20
+      min_valid_keypoints: 4
+    smoothing_window_frames: 5
+    velocity_alpha: 0.5
+    min_pose_quality: 0.25
+
+grasp:
+  fixed_orientation_format: rpy
+  fixed_orientation_base: [0.0, 0.0, 0.0]
+  candidate_search_radius_from_centroid_m: 0.07
+  min_hand_height_clearance_m: 0.05
+  no_candidate_action: hold
+
+debug:
+  depth_visualization_max_m: 1.5

@@ -1,7 +1,10 @@
 from dataclasses import dataclass
 import time
+from typing import Optional
 
 import numpy as np
+
+from utils.image_preprocess import apply_segmentation_preprocess
 
 try:
     from ultralytics import YOLO
@@ -24,6 +27,7 @@ class SegmentationResult:
     raw_result: object
     infer_ms: float
     prompt_classes: list
+    preprocessed_image: Optional[np.ndarray] = None
 
 
 def require_ultralytics():
@@ -123,6 +127,7 @@ class SegmentationEngine:
         classes=None,
         half=False,
         retina_masks=True,
+        preprocess_config=None,
     ):
         require_ultralytics()
 
@@ -136,6 +141,8 @@ class SegmentationEngine:
         self.classes = classes
         self.half = half
         self.retina_masks = retina_masks
+        self.preprocess_config = dict(preprocess_config or {})
+        self.last_preprocessed_frame = None
 
         try:
             self.model = YOLO(model_name)
@@ -148,10 +155,15 @@ class SegmentationEngine:
             # YOLOE는 텍스트 프롬프트를 한 번 설정해두고 이후 프레임들에 재사용한다.
             self.model.set_classes(self.prompt_classes)
 
-    def predict(self, frame_bgr):
+    def predict(self, frame_bgr, preprocess_config=None, store_debug_frame=True):
+        effective_preprocess_config = self.preprocess_config if preprocess_config is None else dict(preprocess_config or {})
+        preprocessed_frame = apply_segmentation_preprocess(frame_bgr, effective_preprocess_config)
+        preprocessed_frame = np.asarray(preprocessed_frame, dtype=np.uint8).copy()
+        if store_debug_frame:
+            self.last_preprocessed_frame = preprocessed_frame.copy()
         infer_start = time.perf_counter()
         raw_result = self.model.predict(
-            source=frame_bgr,
+            source=preprocessed_frame,
             imgsz=self.imgsz,
             conf=self.conf,
             iou=self.iou,
@@ -169,9 +181,9 @@ class SegmentationEngine:
             raw_result=raw_result,
             infer_ms=infer_ms,
             prompt_classes=list(self.prompt_classes),
+            preprocessed_image=preprocessed_frame,
         )
 
     def render(self, segmentation_result):
         # Ultralytics가 제공하는 기본 overlay를 그대로 재사용한다.
         return segmentation_result.raw_result.plot()
-

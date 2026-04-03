@@ -197,3 +197,4 @@ pyrightconfig.json
 *.png
 *.npy
 *.jpg
+*.csv
