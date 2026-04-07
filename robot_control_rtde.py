@@ -6,6 +6,7 @@ import sys
 import time
 import pickle
 import threading
+from dataclasses import replace
 from pathlib import Path
 from collections import deque
 from datetime import datetime
@@ -21,6 +22,12 @@ from calibration.extrinsics import load_transform_chain
 from object_pt_extraction.segmentation_engine import (
     SegmentationEngine,
     parse_prompt_classes,
+)
+from perception.fdct_depth_completion import (
+    FDCTDepthCompleter,
+    FDCTDepthCompletionConfig,
+    format_depth_completion_stats,
+    resolve_checkpoint as resolve_fdct_checkpoint,
 )
 from perception.fusion import PerceptionFusion
 from perception.grasp_target import GraspTargetPlanner
@@ -123,6 +130,40 @@ def parse_args():
     parser.add_argument("--half", action="store_true", help="Enable FP16 inference on supported devices.")
     parser.add_argument("--show-depth", action="store_true", help="Show a second depth preview window.")
     parser.add_argument("--depth-max-m", type=float, default=1.5, help="Upper bound for depth visualization.")
+    parser.add_argument(
+        "--enable-fdct-depth",
+        dest="fdct_depth_enabled",
+        action="store_true",
+        help="Use FDCT completed depth for object point clouds.",
+    )
+    parser.add_argument(
+        "--disable-fdct-depth",
+        dest="fdct_depth_enabled",
+        action="store_false",
+        help="Use raw RealSense depth for object point clouds.",
+    )
+    parser.set_defaults(fdct_depth_enabled=None)
+    parser.add_argument(
+        "--fdct-cameras",
+        choices=["cam0", "cam1", "both", "none"],
+        default=None,
+        help="Camera selection for FDCT object depth completion. Defaults to config.",
+    )
+    parser.add_argument(
+        "--fdct-checkpoint",
+        default=None,
+        help="Path to FDCT checkpoint. Defaults to perception.depth_completion.fdct.checkpoint.",
+    )
+    parser.add_argument(
+        "--fdct-device",
+        default=None,
+        help="Torch device for FDCT: auto, cpu, cuda, cuda:0, etc. Defaults to config.",
+    )
+    parser.add_argument(
+        "--fdct-debug-stats",
+        action="store_true",
+        help="Print FDCT raw/completed depth stats while running.",
+    )
 
     # 3D point options
     parser.add_argument(
@@ -230,6 +271,7 @@ def apply_config_defaults(args, config):
     workspace_cfg = safety_cfg.get("workspace_bounds_m", {})
     cameras_cfg = config.get("cameras", {})
     cam0_cfg = cameras_cfg.get("cam0", {})
+    fdct_cfg = config.get("perception", {}).get("depth_completion", {}).get("fdct", {})
 
     if args.robot_ip is None:
         args.robot_ip = rtde_cfg.get("robot_ip")
@@ -253,6 +295,25 @@ def apply_config_defaults(args, config):
     if args.calib_pkl is None:
         args.calib_pkl = cam0_cfg.get("extrinsics_file", str(DEFAULT_CALIB_PATH))
 
+    if args.fdct_depth_enabled is None:
+        args.fdct_depth_enabled = bool(fdct_cfg.get("enabled", False))
+    if args.fdct_cameras is None:
+        args.fdct_cameras = str(fdct_cfg.get("cameras", "both")).strip().lower()
+    if args.fdct_checkpoint is None:
+        args.fdct_checkpoint = str(fdct_cfg.get("checkpoint", "FDCT/TransCG.tar"))
+    if args.fdct_device is None:
+        args.fdct_device = str(fdct_cfg.get("device", "auto"))
+    args.fdct_net_width = int(fdct_cfg.get("net_width", 320))
+    args.fdct_net_height = int(fdct_cfg.get("net_height", 240))
+    args.fdct_depth_min = float(fdct_cfg.get("depth_min", 0.3))
+    args.fdct_depth_max = float(fdct_cfg.get("depth_max", 1.5))
+    args.fdct_depth_norm = float(fdct_cfg.get("depth_norm", 1.0))
+    args.fdct_depth_coeff = float(fdct_cfg.get("depth_coeff", 10.0))
+    args.fdct_inpaint = bool(fdct_cfg.get("inpaint", True))
+    args.fdct_debug_every = max(1, int(fdct_cfg.get("debug_every", 30)))
+    args.fdct_fallback_to_raw = bool(fdct_cfg.get("fallback_to_raw", True))
+    args.fdct_debug_stats = bool(args.fdct_debug_stats or fdct_cfg.get("debug_stats", False))
+
     return args
 
 
@@ -270,6 +331,95 @@ def render_depth(depth_image_m, max_depth_m):
     clipped = np.clip(depth_image_m, 0.0, max_depth_m)
     scaled = (255.0 * clipped / max_depth_m).astype(np.uint8)
     return cv.applyColorMap(255 - scaled, cv.COLORMAP_TURBO)
+
+
+def parse_fdct_camera_ids(camera_selection):
+    selection = str(camera_selection or "none").strip().lower()
+    if selection == "none":
+        return set()
+    if selection == "cam0":
+        return {0}
+    if selection == "cam1":
+        return {1}
+    if selection == "both":
+        return {0, 1}
+    raise ValueError(f"Unsupported --fdct-cameras value: {camera_selection}")
+
+
+def build_fdct_depth_completer(args):
+    if not args.fdct_depth_enabled or args.fdct_cameras == "none":
+        return None
+
+    checkpoint_path = resolve_fdct_checkpoint(args.fdct_checkpoint)
+    config = FDCTDepthCompletionConfig(
+        checkpoint_path=checkpoint_path,
+        width=int(args.width),
+        height=int(args.height),
+        net_width=int(args.fdct_net_width),
+        net_height=int(args.fdct_net_height),
+        depth_min=float(args.fdct_depth_min),
+        depth_max=float(args.fdct_depth_max),
+        depth_norm=float(args.fdct_depth_norm),
+        depth_coeff=float(args.fdct_depth_coeff),
+        inpaint=bool(args.fdct_inpaint),
+    )
+
+    try:
+        completer = FDCTDepthCompleter(config, device_arg=args.fdct_device)
+    except Exception as exc:
+        print(f"[WARN] FDCT depth completion disabled; failed to initialize: {exc}")
+        return None
+
+    print(
+        "[INFO] FDCT depth completion enabled for "
+        f"{args.fdct_cameras}: checkpoint={checkpoint_path}, device={completer.device}"
+    )
+    return completer
+
+
+def _should_log_fdct_event(pipeline, key, every=30):
+    counts = pipeline.setdefault("fdct_event_counts", {})
+    counts[key] = int(counts.get(key, 0)) + 1
+    return counts[key] <= 3 or counts[key] % max(1, int(every)) == 0
+
+
+def apply_fdct_depth_to_object_frames(snapshot, pipeline, args):
+    completer = pipeline.get("fdct_depth_completer")
+    camera_ids = pipeline.get("fdct_camera_ids", set())
+    if completer is None or not camera_ids:
+        return snapshot.cam0, snapshot.cam1
+
+    object_frames = {0: snapshot.cam0, 1: snapshot.cam1}
+    for camera_id in sorted(camera_ids):
+        frame_bundle = object_frames[camera_id]
+        try:
+            result = completer.complete(frame_bundle.color_image, frame_bundle.depth_image_m)
+        except Exception as exc:
+            if _should_log_fdct_event(pipeline, f"cam{camera_id}:exception", args.fdct_debug_every):
+                print(f"[WARN] cam{camera_id} FDCT failed; using raw depth for object frame: {exc}")
+            if not args.fdct_fallback_to_raw:
+                raise
+            continue
+
+        if result is None:
+            if _should_log_fdct_event(pipeline, f"cam{camera_id}:no_valid_depth", args.fdct_debug_every):
+                print(f"[WARN] cam{camera_id} FDCT skipped; no valid depth after preprocessing.")
+            continue
+
+        object_frames[camera_id] = replace(
+            frame_bundle,
+            depth_image_m=result.completed_depth_m.astype(np.float32, copy=False),
+        )
+        if args.fdct_debug_stats and _should_log_fdct_event(pipeline, f"cam{camera_id}:stats", args.fdct_debug_every):
+            stats = format_depth_completion_stats(
+                frame_bundle.depth_image_m,
+                result.completed_depth_m,
+                args.fdct_depth_min,
+                args.fdct_depth_max,
+            )
+            print(f"[FDCT] cam{camera_id} elapsed={result.elapsed_ms:.1f}ms {stats}")
+
+    return object_frames[0], object_frames[1]
 
 
 def overlay_status(frame, serial, model_name, fps, infer_ms, summary, follow_lines=None):
@@ -1706,6 +1856,8 @@ def build_dual_perception_pipeline(args):
     transform_chain = load_transform_chain(args.config)
     t_cam0_base = np.linalg.inv(transform_chain.t_base_cam0).astype(np.float32)
     t_cam1_base = np.linalg.inv(transform_chain.t_base_cam1).astype(np.float32)
+    fdct_camera_ids = parse_fdct_camera_ids(args.fdct_cameras)
+    fdct_depth_completer = build_fdct_depth_completer(args) if fdct_camera_ids else None
 
     return {
         "sensor_hub": sensor_hub,
@@ -1720,6 +1872,9 @@ def build_dual_perception_pipeline(args):
         "transform_chain": transform_chain,
         "t_cam0_base": t_cam0_base,
         "t_cam1_base": t_cam1_base,
+        "fdct_camera_ids": fdct_camera_ids,
+        "fdct_depth_completer": fdct_depth_completer,
+        "fdct_event_counts": {},
         "prompt_classes": prompt_classes,
     }
 
@@ -1961,6 +2116,8 @@ def main():
     sensor_hub.start()
 
     model_label = args.model if not pipeline["prompt_classes"] else f"{args.model} ({','.join(pipeline['prompt_classes'])})"
+    if pipeline.get("fdct_depth_completer") is not None:
+        model_label = f"{model_label} + FDCT depth({args.fdct_cameras})"
     window_name = "cam0_grasp_target_follow"
     cam1_window_name = "cam1_view"
     depth_window_name = "cam0_depth"
@@ -1991,9 +2148,10 @@ def main():
         while True:
             current_time = time.time()
             snapshot = sensor_hub.read_next_pair()
+            object_frame_cam0, object_frame_cam1 = apply_fdct_depth_to_object_frames(snapshot, pipeline, args)
 
-            object_cam0 = pipeline["object_worker_cam0"].process_frame(snapshot.cam0, frame_id=snapshot.pair_index)
-            object_cam1 = pipeline["object_worker_cam1"].process_frame(snapshot.cam1, frame_id=snapshot.pair_index)
+            object_cam0 = pipeline["object_worker_cam0"].process_frame(object_frame_cam0, frame_id=snapshot.pair_index)
+            object_cam1 = pipeline["object_worker_cam1"].process_frame(object_frame_cam1, frame_id=snapshot.pair_index)
             hand_cam0 = pipeline["hand_worker_cam0"].process_frame(snapshot.cam0, frame_id=snapshot.pair_index)
             hand_cam1 = pipeline["hand_worker_cam1"].process_frame(snapshot.cam1, frame_id=snapshot.pair_index)
             selected_hand = pipeline["hand_selector"].process_states(hand_cam0, hand_cam1)

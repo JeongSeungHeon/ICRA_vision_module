@@ -83,6 +83,22 @@ perception:
   synchronization:
     max_pair_time_delta_sec: 0.03
     stale_timeout_sec: 0.30
+  depth_completion:
+    fdct:
+      enabled: false
+      cameras: both
+      checkpoint: FDCT/TransCG.tar
+      device: auto
+      net_width: 320
+      net_height: 240
+      depth_min: 0.30
+      depth_max: 1.50
+      depth_norm: 1.0
+      depth_coeff: 10.0
+      inpaint: true
+      fallback_to_raw: true
+      debug_stats: false
+      debug_every: 30
   object:
     target_label: cup, wine_glass
     confidence_threshold: 0.50
