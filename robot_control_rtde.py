@@ -28,6 +28,7 @@ from perception.hand_selector import HandSelector
 from perception.hand_worker import HandWorkerCam0, HandWorkerCam1
 from perception.object_merger import ObjectMerger
 from perception.object_worker import ObjectWorkerCam0, ObjectWorkerCam1
+from perception.target_predictor import TargetPredictor
 from robot.rtde_controller import RtdeController
 from system.dual_sensor_hub import DualSensorHub
 from system.shared_state import (
@@ -164,6 +165,49 @@ def parse_args():
     parser.add_argument("--gripper-close-timeout-s", type=float, default=2.0, help="Timeout for force/current grasp verification.")
     parser.add_argument("--gripper-release-dwell-s", type=float, default=0.5, help="Dwell after opening gripper.")
     parser.add_argument("--follow-handoff-timeout-s", type=float, default=5.0, help="Timeout to wait for the follow thread to release robot control before pregrasp.")
+    parser.add_argument(
+        "--enable-target-prediction",
+        dest="enable_target_prediction",
+        action="store_true",
+        help="Use Kalman prediction to bridge short target dropouts during FOLLOW.",
+    )
+    parser.add_argument(
+        "--disable-target-prediction",
+        dest="enable_target_prediction",
+        action="store_false",
+        help="Disable target prediction and fall back to raw target only.",
+    )
+    parser.set_defaults(enable_target_prediction=True)
+    parser.add_argument(
+        "--prediction-max-horizon-s",
+        type=float,
+        default=0.25,
+        help="Maximum dropout duration bridged by predicted targets.",
+    )
+    parser.add_argument(
+        "--prediction-process-noise-mm-s2",
+        type=float,
+        default=800.0,
+        help="Kalman process noise acceleration scale for xy prediction.",
+    )
+    parser.add_argument(
+        "--prediction-measurement-noise-mm",
+        type=float,
+        default=25.0,
+        help="Kalman measurement noise scale for xy updates.",
+    )
+    parser.add_argument(
+        "--prediction-max-xy-speed-mm-s",
+        type=float,
+        default=200.0,
+        help="Maximum xy prediction speed before velocity clipping.",
+    )
+    parser.add_argument(
+        "--prediction-reinit-jump-mm",
+        type=float,
+        default=120.0,
+        help="Reinitialize the Kalman state if a new measurement jumps too far from prediction.",
+    )
     parser.add_argument(
         "--target-log-dir",
         type=str,
@@ -577,12 +621,26 @@ class FollowSharedState:
     def __init__(self, args):
         self.args = args
         self.lock = threading.Lock()
+        self.target_predictor = TargetPredictor(
+            process_noise_mm_s2=args.prediction_process_noise_mm_s2,
+            measurement_noise_mm=args.prediction_measurement_noise_mm,
+            max_velocity_xy_mm_s=args.prediction_max_xy_speed_mm_s,
+            reinit_jump_mm=args.prediction_reinit_jump_mm,
+        )
 
         self.follow_enabled = args.enable_follow
         self.latest_target_xyz_mm = None
         self.latest_grasp_xyz_mm = None
         self.latest_target_t = 0.0
+        self.last_measured_target_xyz_mm = None
+        self.last_measured_target_t = 0.0
         self.valid_detection_streak = 0
+        self.prediction_armed = False
+        self.predicted_target_xyz_mm = None
+        self.predicted_target_t = 0.0
+        self.prediction_age_s = None
+        self.control_target_xyz_mm = None
+        self.target_source = "none"
 
         self.reference_object_xy_mm = None
         self.reference_locked = False
@@ -629,22 +687,44 @@ class FollowSharedState:
             f"rotvec=({pose[3]:.4f}, {pose[4]:.4f}, {pose[5]:.4f})"
         )
 
+    def _reset_prediction_locked(self, *, reset_arm=False):
+        self.target_predictor.reset()
+        self.predicted_target_xyz_mm = None
+        self.predicted_target_t = 0.0
+        self.prediction_age_s = None
+        self.control_target_xyz_mm = None
+        self.target_source = "none"
+        if reset_arm:
+            self.prediction_armed = False
+
+    def set_task_state(self, task_state, *, reset_prediction=False, reset_arm=False):
+        with self.lock:
+            self.task_state = str(task_state)
+            if reset_prediction:
+                self._reset_prediction_locked(reset_arm=reset_arm)
+
     def toggle_follow(self):
         with self.lock:
             self.follow_enabled = not self.follow_enabled
+            self._reset_prediction_locked(reset_arm=True)
             print(f"[INFO] follow_enabled = {self.follow_enabled}")
 
     def stop_follow(self):
         with self.lock:
             self.follow_enabled = False
+            self._reset_prediction_locked(reset_arm=True)
             print("[INFO] Robot follow stopped.")
 
-    def clear_target(self):
+    def clear_target(self, *, reset_prediction=False, reset_arm=False):
         with self.lock:
             self.latest_target_xyz_mm = None
             self.latest_grasp_xyz_mm = None
             self.valid_detection_streak = 0
             self.reference_streak = 0
+            self.control_target_xyz_mm = None
+            self.target_source = "none"
+            if reset_prediction:
+                self._reset_prediction_locked(reset_arm=reset_arm)
 
     def request_follow_pause(self):
         with self.lock:
@@ -662,7 +742,10 @@ class FollowSharedState:
             self.latest_target_xyz_mm = None
             self.latest_grasp_xyz_mm = None
             self.latest_target_t = 0.0
+            self.last_measured_target_xyz_mm = None
+            self.last_measured_target_t = 0.0
             self.valid_detection_streak = 0
+            self.prediction_armed = False
             self.reference_object_xy_mm = None
             self.reference_locked = False
             self.motion_triggered = False
@@ -684,6 +767,7 @@ class FollowSharedState:
             self.grasp_offset_xyz_mm = None
             self.task_state = "FOLLOW"
             self.task_epoch += 1
+            self._reset_prediction_locked(reset_arm=True)
         self.follow_idle_event.set()
         print(f"[INFO] Follow/task state reset. follow_enabled={self.follow_enabled}")
 
@@ -698,7 +782,7 @@ class FollowSharedState:
 
     def update_target(self, grasp_xyz_m, object_xyz_m=None, pixel_xy=None):
         if object_xyz_m is None:
-            self.clear_target()
+            self.clear_target(reset_prediction=True, reset_arm=True)
             return
 
         object_xyz_mm = np.asarray(object_xyz_m, dtype=np.float32)[:3] * 1000.0
@@ -715,6 +799,7 @@ class FollowSharedState:
         self.update_stop_state(object_xyz_mm)
 
         with self.lock:
+            current_perf = time.perf_counter()
             self.latest_object_xyz_mm = object_xyz_mm.copy()
             self.latest_grasp_xyz_mm = None if grasp_xyz_mm is None else grasp_xyz_mm.copy()
 
@@ -727,6 +812,7 @@ class FollowSharedState:
                     print(f"[INFO] Reference object position locked: {self.reference_object_xy_mm}")
                 self.latest_target_xyz_mm = None
                 self.valid_detection_streak = 0
+                self._reset_prediction_locked(reset_arm=True)
                 return
 
             move_dist_mm = float(np.linalg.norm(object_xy_mm - self.reference_object_xy_mm))
@@ -737,20 +823,84 @@ class FollowSharedState:
             if target_xyz_mm is None:
                 self.latest_target_xyz_mm = None
                 self.valid_detection_streak = 0
+                self.control_target_xyz_mm = None
+                self.target_source = "none"
                 return
 
-            self.latest_target_xyz_mm = target_xyz_mm
+            self.latest_target_xyz_mm = target_xyz_mm.copy()
             self.valid_detection_streak += 1
-            self.latest_target_t = time.perf_counter()
+            self.latest_target_t = current_perf
+            self.last_measured_target_xyz_mm = target_xyz_mm.copy()
+            self.last_measured_target_t = current_perf
+            if self.valid_detection_streak >= int(self.args.min_valid_count):
+                self.prediction_armed = True
+            if self.args.enable_target_prediction and self.task_state == "FOLLOW":
+                self.target_predictor.update(target_xyz_mm, current_perf)
 
-    def get_snapshot(self):
+    def _refresh_tracking_targets_locked(self, now_perf):
+        measurement_age_s = None
+        if self.last_measured_target_t > 0.0:
+            measurement_age_s = max(float(now_perf) - float(self.last_measured_target_t), 0.0)
+
+        self.predicted_target_xyz_mm = None
+        self.predicted_target_t = 0.0
+        self.prediction_age_s = None
+        self.control_target_xyz_mm = None
+        self.target_source = "none"
+
+        if self.task_state != "FOLLOW":
+            return measurement_age_s
+
+        if self.args.enable_target_prediction and self.target_predictor.has_state():
+            predicted = self.target_predictor.predict(now_perf)
+            if predicted is not None and predicted.valid:
+                self.predicted_target_xyz_mm = predicted.xyz_mm.copy()
+                self.predicted_target_t = float(now_perf)
+                self.prediction_age_s = float(predicted.prediction_age_s)
+
+        raw_target = None if self.latest_target_xyz_mm is None else self.latest_target_xyz_mm.copy()
+        raw_is_fresh = (
+            raw_target is not None
+            and self.latest_target_t > 0.0
+            and (float(now_perf) - float(self.latest_target_t)) <= float(self.args.target_timeout_s)
+        )
+        if raw_is_fresh:
+            self.control_target_xyz_mm = raw_target
+            self.target_source = "measured"
+            return measurement_age_s
+
+        predicted_is_valid = (
+            self.args.enable_target_prediction
+            and self.prediction_armed
+            and self.predicted_target_xyz_mm is not None
+            and self.prediction_age_s is not None
+            and float(self.prediction_age_s) <= float(self.args.prediction_max_horizon_s)
+        )
+        if predicted_is_valid:
+            self.control_target_xyz_mm = self.predicted_target_xyz_mm.copy()
+            self.target_source = "predicted"
+
+        return measurement_age_s
+
+    def get_snapshot(self, now_perf=None):
         with self.lock:
+            now_perf = time.perf_counter() if now_perf is None else float(now_perf)
+            measurement_age_s = self._refresh_tracking_targets_locked(now_perf)
             return {
                 "follow_enabled": self.follow_enabled,
                 "latest_target_xyz_mm": None if self.latest_target_xyz_mm is None else self.latest_target_xyz_mm.copy(),
                 "latest_grasp_xyz_mm": None if self.latest_grasp_xyz_mm is None else self.latest_grasp_xyz_mm.copy(),
                 "latest_target_t": self.latest_target_t,
+                "last_measured_target_xyz_mm": None if self.last_measured_target_xyz_mm is None else self.last_measured_target_xyz_mm.copy(),
+                "last_measured_target_t": self.last_measured_target_t,
                 "valid_detection_streak": self.valid_detection_streak,
+                "prediction_armed": self.prediction_armed,
+                "predicted_target_xyz_mm": None if self.predicted_target_xyz_mm is None else self.predicted_target_xyz_mm.copy(),
+                "predicted_target_t": self.predicted_target_t,
+                "prediction_age_s": self.prediction_age_s,
+                "control_target_xyz_mm": None if self.control_target_xyz_mm is None else self.control_target_xyz_mm.copy(),
+                "target_source": self.target_source,
+                "measurement_age_s": measurement_age_s,
                 "motion_triggered": self.motion_triggered,
                 "follow_pause_requested": self.follow_pause_requested,
                 "fixed_z_mm": self.fixed_z_mm,
@@ -764,21 +914,27 @@ class FollowSharedState:
             }
 
     def get_follow_status_text(self):
-        with self.lock:
-            mode = "ON" if self.follow_enabled else "OFF"
-            streak = self.valid_detection_streak
-            trig = "ON" if self.motion_triggered else "WAIT"
-            stopped = "YES" if self.object_stopped else "NO"
-            home = "LOCKED" if self.home_object_locked else "SEARCH"
-            target = "NONE" if self.latest_target_xyz_mm is None else (
-                f"[{self.latest_target_xyz_mm[0]:.1f}, {self.latest_target_xyz_mm[1]:.1f}, {self.latest_target_xyz_mm[2]:.1f}]"
-            )
+        snapshot = self.get_snapshot()
+        mode = "ON" if snapshot["follow_enabled"] else "OFF"
+        streak = snapshot["valid_detection_streak"]
+        trig = "ON" if snapshot["motion_triggered"] else "WAIT"
+        stopped = "YES" if snapshot["object_stopped"] else "NO"
+        home = "LOCKED" if self.home_object_locked else "SEARCH"
+        raw_target = "NONE" if snapshot["latest_target_xyz_mm"] is None else (
+            f"[{snapshot['latest_target_xyz_mm'][0]:.1f}, {snapshot['latest_target_xyz_mm'][1]:.1f}, {snapshot['latest_target_xyz_mm'][2]:.1f}]"
+        )
+        control_target = "NONE" if snapshot["control_target_xyz_mm"] is None else (
+            f"[{snapshot['control_target_xyz_mm'][0]:.1f}, {snapshot['control_target_xyz_mm'][1]:.1f}, {snapshot['control_target_xyz_mm'][2]:.1f}]"
+        )
+        prediction_age = "-" if snapshot["prediction_age_s"] is None else f"{snapshot['prediction_age_s']:.3f}s"
 
         return [
             f"follow: {mode} | trigger: {trig} | stopped: {stopped}",
-            f"home: {home} | streak: {streak}",
-            f"target_mm: {target}",
+            f"home: {home} | streak: {streak} | src: {snapshot['target_source']}",
+            f"raw_mm: {raw_target}",
+            f"ctrl_mm: {control_target} | pred_age: {prediction_age}",
         ]
+
     def try_lock_home_pose(self, object_xyz_mm, pixel_xy):
         if self.home_object_locked:
             return
@@ -837,10 +993,10 @@ class FollowSharedState:
             self.object_stopped = False
 
     def should_start_pregrasp(self, controller, xy_thresh_mm=30.0):
-        with self.lock:
-            if not self.object_stopped or self.pregrasp_started:
-                return False
-            target_xyz = None if self.latest_target_xyz_mm is None else self.latest_target_xyz_mm.copy()
+        snapshot = self.get_snapshot()
+        if not snapshot["object_stopped"] or snapshot["pregrasp_started"]:
+            return False
+        target_xyz = snapshot["control_target_xyz_mm"]
 
         if target_xyz is None:
             return False
@@ -857,6 +1013,7 @@ class FollowSharedState:
         if dxy < xy_thresh_mm:
             with self.lock:
                 self.pregrasp_started = True
+                self._reset_prediction_locked(reset_arm=True)
             print(f"[INFO] PREGRASP condition met. dxy={dxy:.1f}")
             return True
 
@@ -870,7 +1027,6 @@ class TaskTargetLogger:
         self.output_dir = Path(output_dir)
         self.sample_hz = max(float(sample_hz), 1e-6)
         self.sample_interval_s = 1.0 / self.sample_hz
-        self.stale_after_s = max(3.0 * self.sample_interval_s, 0.15)
         self.stop_event = threading.Event()
         self.thread = None
 
@@ -884,6 +1040,7 @@ class TaskTargetLogger:
         self._csv_file = None
         self._csv_writer = None
         self._csv_path = None
+        self._completed_epochs = set()
 
     def start(self):
         if self.thread is not None:
@@ -906,33 +1063,27 @@ class TaskTargetLogger:
         while not self.stop_event.is_set():
             sample_perf = time.perf_counter()
             sample_wall = time.time()
-            snapshot = self.shared_state.get_snapshot()
-            target_xyz_mm, target_age_s = self._extract_target(sample_perf, snapshot)
+            snapshot = self.shared_state.get_snapshot(now_perf=sample_perf)
 
             with self._lock:
                 if self._active and snapshot["task_epoch"] != self._session_epoch:
                     self._finalize_locked("reset")
 
-                if (not self._active) and target_xyz_mm is not None:
+                can_open = (
+                    (not self._active)
+                    and snapshot["task_state"] == "FOLLOW"
+                    and snapshot["last_measured_target_t"] > 0.0
+                    and int(snapshot["task_epoch"]) not in self._completed_epochs
+                )
+                if can_open:
                     self._open_locked(snapshot["task_epoch"], sample_wall, sample_perf)
 
                 if self._active:
-                    self._write_row_locked(sample_wall, sample_perf, snapshot, target_xyz_mm, target_age_s)
+                    self._write_row_locked(sample_wall, sample_perf, snapshot)
                     if snapshot["task_state"] == "DONE":
                         self._finalize_locked("done")
 
             self.stop_event.wait(self.sample_interval_s)
-
-    def _extract_target(self, sample_perf, snapshot):
-        target_xyz_mm = snapshot["latest_target_xyz_mm"]
-        target_t = float(snapshot["latest_target_t"])
-        if target_xyz_mm is None or target_t <= 0.0:
-            return None, None
-
-        age_s = max(sample_perf - target_t, 0.0)
-        if age_s > self.stale_after_s:
-            return None, age_s
-        return np.asarray(target_xyz_mm, dtype=np.float32).copy(), age_s
 
     def _open_locked(self, task_epoch, sample_wall, sample_perf):
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -952,26 +1103,31 @@ class TaskTargetLogger:
                 "elapsed_s",
                 "task_epoch",
                 "task_state",
-                "target_age_s",
-                "target_x_mm",
-                "target_y_mm",
-                "target_z_mm",
+                "target_source",
+                "measurement_age_s",
+                "prediction_age_s",
+                "raw_target_x_mm",
+                "raw_target_y_mm",
+                "raw_target_z_mm",
+                "control_target_x_mm",
+                "control_target_y_mm",
+                "control_target_z_mm",
             ]
         )
         self._active = True
         print(f"[INFO] Target point logging started: {self._csv_path}")
 
-    def _write_row_locked(self, sample_wall, sample_perf, snapshot, target_xyz_mm, target_age_s):
+    def _write_row_locked(self, sample_wall, sample_perf, snapshot):
         if self._csv_writer is None:
             return
 
         self._sample_index += 1
-        if target_xyz_mm is None:
-            xyz_values = ["NaN", "NaN", "NaN"]
-        else:
-            xyz_values = [f"{float(v):.6f}" for v in target_xyz_mm]
-
-        age_value = "NaN" if target_age_s is None else f"{float(target_age_s):.6f}"
+        raw_target = snapshot["latest_target_xyz_mm"]
+        control_target = snapshot["control_target_xyz_mm"]
+        raw_values = ["NaN", "NaN", "NaN"] if raw_target is None else [f"{float(v):.6f}" for v in raw_target]
+        control_values = ["NaN", "NaN", "NaN"] if control_target is None else [f"{float(v):.6f}" for v in control_target]
+        measurement_age = "NaN" if snapshot["measurement_age_s"] is None else f"{float(snapshot['measurement_age_s']):.6f}"
+        prediction_age = "NaN" if snapshot["prediction_age_s"] is None else f"{float(snapshot['prediction_age_s']):.6f}"
         elapsed_s = float(sample_perf - self._session_started_perf)
         self._csv_writer.writerow(
             [
@@ -980,8 +1136,11 @@ class TaskTargetLogger:
                 f"{elapsed_s:.6f}",
                 snapshot["task_epoch"],
                 snapshot["task_state"],
-                age_value,
-                *xyz_values,
+                snapshot["target_source"],
+                measurement_age,
+                prediction_age,
+                *raw_values,
+                *control_values,
             ]
         )
         self._csv_file.flush()
@@ -989,6 +1148,7 @@ class TaskTargetLogger:
     def _finalize_locked(self, reason):
         if not self._active:
             return
+        session_epoch = self._session_epoch
         csv_path = self._csv_path
         if self._csv_file is not None:
             self._csv_file.close()
@@ -999,6 +1159,8 @@ class TaskTargetLogger:
         self._csv_file = None
         self._csv_writer = None
         self._csv_path = None
+        if reason == "done" and session_epoch is not None:
+            self._completed_epochs.add(int(session_epoch))
         print(f"[INFO] Target point logging finished ({reason}): {csv_path}")
 
 
@@ -1013,19 +1175,25 @@ def robot_control_loop(controller, shared_state, args):
     while not shared_state.stop_event.is_set():
         start_t = time.time()
         snap = shared_state.get_snapshot()
+        control_target_xyz_mm = snap["control_target_xyz_mm"]
+        target_source = snap["target_source"]
 
         active = True
         if snap["follow_pause_requested"]:
             active = False
         elif not snap["follow_enabled"]:
             active = False
-        elif snap["latest_target_xyz_mm"] is None:
+        elif control_target_xyz_mm is None:
             active = False
-        elif snap["valid_detection_streak"] < args.min_valid_count:
+        elif target_source == "measured" and snap["valid_detection_streak"] < args.min_valid_count and not snap["prediction_armed"]:
+            active = False
+        elif target_source == "predicted" and not snap["prediction_armed"]:
             active = False
         elif not snap["motion_triggered"]:
             active = False
-        elif (time.perf_counter() - snap["latest_target_t"]) > args.target_timeout_s:
+        elif target_source == "predicted" and (
+            snap["prediction_age_s"] is None or float(snap["prediction_age_s"]) > float(args.prediction_max_horizon_s)
+        ):
             active = False
         elif snap["fixed_z_mm"] is None or snap["fixed_orientation_base"] is None:
             active = False
@@ -1042,7 +1210,7 @@ def robot_control_loop(controller, shared_state, args):
 
         shared_state.set_follow_thread_idle(False)
 
-        target_xyz_mm = snap["latest_target_xyz_mm"]
+        target_xyz_mm = control_target_xyz_mm
         fixed_z_mm = snap["fixed_z_mm"]
         fixed_orientation_base = snap["fixed_orientation_base"]
 
@@ -1088,7 +1256,12 @@ def robot_control_loop(controller, shared_state, args):
             was_active = True
             last_sent_pose_mm = pose_mm
             if args.verbose_robot:
-                print(f"[ROBOT] target_mm={target_xyz_mm}, ref_mm={ref_target_xyz_mm}, cmd_m={target_position_base}")
+                print(
+                    f"[ROBOT] source={target_source}, "
+                    f"raw_mm={snap['latest_target_xyz_mm']}, "
+                    f"control_mm={target_xyz_mm}, "
+                    f"ref_mm={ref_target_xyz_mm}, cmd_m={target_position_base}"
+                )
         except Exception as exc:
             print(f"[WARN] servo command failed: {exc}")
 
@@ -1368,7 +1541,7 @@ def save_grasp_offset(controller, shared_state):
     with shared_state.lock:
         shared_state.grasp_offset_xyz_mm = grasp_offset_xyz
         shared_state.grasp_closed = True
-        shared_state.task_state = "GRASPED"
+    shared_state.set_task_state("GRASPED", reset_prediction=True, reset_arm=True)
 
     print(f"[INFO] grasp_offset_xyz_mm saved: {grasp_offset_xyz}")
     return True
@@ -1485,8 +1658,7 @@ def execute_return_and_place(controller, shared_state, args):
             print("[WARN] Return to initial pose timed out.")
             return False
 
-    with shared_state.lock:
-        shared_state.task_state = "DONE"
+    shared_state.set_task_state("DONE", reset_prediction=True, reset_arm=True)
 
     print("[INFO] RETURN + PLACE done")
     return True
@@ -1870,7 +2042,7 @@ def main():
                             save_grasp_offset(controller, shared_state)
                             execute_return_and_place(controller, shared_state, args)
             else:
-                shared_state.clear_target()
+                shared_state.clear_target(reset_prediction=True, reset_arm=True)
 
             now = time.perf_counter()
             instant_fps = 1.0 / max(now - last_loop_time, 1e-6)
