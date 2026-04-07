@@ -78,7 +78,7 @@ EEF_Y_OFFSET_MM = 0.0
 # grasp / place behavior
 PREGRASP_X_OFFSET_MM = -120.0
 HOVER_Z_OFFSET_MM = 30.0
-DESCEND_EXTRA_MM = 5.0
+DESCEND_EXTRA_MM = 0.0
 SAFE_LIFT_EXTRA_MM = 40.0
 BACKOFF_X_MM = 100.0
 GRIPPER_FORCE_STOP_DELTA_N = 10.0
@@ -633,6 +633,37 @@ def mm_to_m_tuple(values):
     return tuple(float(v) for v in vec)
 
 
+def compute_dynamic_eef_target(reference_xyz_mm, eef_xyz_mm):
+    reference_xyz_mm = np.asarray(reference_xyz_mm, dtype=np.float32).reshape(3)
+    eef_xyz_mm = np.asarray(eef_xyz_mm, dtype=np.float32).reshape(3)
+
+    dist_xy = float(np.linalg.norm(reference_xyz_mm[:2] - eef_xyz_mm[:2]))
+    far_offset_x = EEF_X_OFFSET_MM
+    near_offset_x = 0.0
+    near_d = 40.0
+    far_d = abs(float(EEF_X_OFFSET_MM)) + near_d
+
+    if dist_xy >= far_d:
+        offset_x = far_offset_x
+    elif dist_xy <= near_d:
+        offset_x = near_offset_x
+    else:
+        t = (dist_xy - near_d) / max(far_d - near_d, 1e-6)
+        offset_x = t * far_offset_x + (1.0 - t) * near_offset_x
+
+    target_xyz_mm = reference_xyz_mm.copy()
+    target_xyz_mm[0] += offset_x
+    target_xyz_mm[1] += EEF_Y_OFFSET_MM
+    return target_xyz_mm.astype(np.float32), float(offset_x), dist_xy
+
+
+def get_close_range_step_mm(ref_err_xyz, max_step_mm, max_step_z_mm):
+    dist_xy = float(np.linalg.norm(np.asarray(ref_err_xyz, dtype=np.float32)[:2]))
+    if dist_xy < 45.0:
+        return 2.5, 1.2, dist_xy
+    return float(max_step_mm), float(max_step_z_mm), dist_xy
+
+
 def rpy_degrees_to_rotvec(roll_deg, pitch_deg, yaw_deg):
     roll, pitch, yaw = np.deg2rad([roll_deg, pitch_deg, yaw_deg])
     cx, sx = np.cos(roll), np.sin(roll)
@@ -930,7 +961,7 @@ class FollowSharedState:
     def wait_for_follow_idle(self, timeout_s):
         return self.follow_idle_event.wait(timeout=max(float(timeout_s), 0.0))
 
-    def update_target(self, grasp_xyz_m, object_xyz_m=None, pixel_xy=None):
+    def update_target(self, grasp_xyz_m, object_xyz_m=None, pixel_xy=None, eef_xyz_mm=None):
         if object_xyz_m is None:
             self.clear_target(reset_prediction=True, reset_arm=True)
             return
@@ -941,9 +972,20 @@ class FollowSharedState:
         target_xyz_mm = None
         if grasp_xyz_m is not None:
             grasp_xyz_mm = np.asarray(grasp_xyz_m, dtype=np.float32)[:3] * 1000.0
-            target_xyz_mm = grasp_xyz_mm.copy()
-            target_xyz_mm[0] += EEF_X_OFFSET_MM
-            target_xyz_mm[1] += EEF_Y_OFFSET_MM
+            if eef_xyz_mm is None:
+                target_xyz_mm = grasp_xyz_mm.copy()
+                target_xyz_mm[0] += EEF_X_OFFSET_MM
+                target_xyz_mm[1] += EEF_Y_OFFSET_MM
+            else:
+                target_xyz_mm, dynamic_offset_x, dist_xy = compute_dynamic_eef_target(
+                    grasp_xyz_mm,
+                    eef_xyz_mm,
+                )
+                if self.args.verbose_robot:
+                    print(
+                        f"[ROBOT] dynamic_offset_x={dynamic_offset_x:.1f} mm, "
+                        f"eef_grasp_dist_xy={dist_xy:.1f} mm"
+                    )
 
         self.try_lock_home_pose(object_xyz_mm, pixel_xy)
         self.update_stop_state(object_xyz_mm)
@@ -1142,13 +1184,17 @@ class FollowSharedState:
         else:
             self.object_stopped = False
 
-    def should_start_pregrasp(self, controller, xy_thresh_mm=30.0):
+    def should_start_pregrasp(
+        self,
+        controller,
+        x_tol_mm=180.0,
+        y_tol_mm=30.0,
+        z_tol_mm=20.0,
+    ):
         snapshot = self.get_snapshot()
-        if not snapshot["object_stopped"] or snapshot["pregrasp_started"]:
-            return False
-        target_xyz = snapshot["control_target_xyz_mm"]
+        object_xyz = snapshot["latest_object_xyz_mm"]
 
-        if target_xyz is None:
+        if object_xyz is None:
             return False
 
         state = controller.read_robot_state(now_timestamp=time.time())
@@ -1156,19 +1202,25 @@ class FollowSharedState:
         if cur_pose is None:
             return False
 
-        cur_x, cur_y = meters_to_mm(cur_pose[:3])[:2]
-        target_x, target_y = target_xyz[0], target_xyz[1]
-        dxy = float(np.linalg.norm(np.array([cur_x - target_x, cur_y - target_y], dtype=np.float32)))
+        eef_x, eef_y, eef_z = meters_to_mm(cur_pose[:3])
+        obj_x, obj_y, obj_z = object_xyz[:3]
 
-        if dxy < xy_thresh_mm:
-            with self.lock:
-                self.pregrasp_started = True
-                self._reset_prediction_locked(reset_arm=True)
-            print(f"[INFO] PREGRASP condition met. dxy={dxy:.1f}")
-            return True
+        dx = float(obj_x - eef_x)
+        dy = float(obj_y - eef_y)
+        dz = float(obj_z - eef_z)
 
-        print(f"[DEBUG] pregrasp check dxy={dxy:.1f}, thresh={xy_thresh_mm}")
-        return False
+        x_ok = abs(dx) <= x_tol_mm
+        y_ok = abs(dy) <= y_tol_mm
+        z_ok = abs(dz) <= z_tol_mm
+
+        print(
+            f"[DEBUG] final grasp window | "
+            f"|dx|={abs(dx):.1f} <= {x_tol_mm:.1f} -> {x_ok}, "
+            f"|dy|={abs(dy):.1f} <= {y_tol_mm:.1f} -> {y_ok}, "
+            f"|dz|={abs(dz):.1f} <= {z_tol_mm:.1f} -> {z_ok}"
+        )
+
+        return x_ok and y_ok and z_ok
 
 
 class TaskTargetLogger:
@@ -1374,11 +1426,16 @@ def robot_control_loop(controller, shared_state, args):
             print(f"[INFO] ref_target initialized from current EEF xyz: {ref_target_xyz_mm}")
 
         ref_err_xyz = target_xyz_mm - ref_target_xyz_mm
+        max_step_xy, max_step_z, dist_xy = get_close_range_step_mm(
+            ref_err_xyz,
+            max_step_mm,
+            max_step_z_mm,
+        )
         ref_step_xyz = np.zeros(3, dtype=np.float32)
-        ref_step_xyz[0:2] = np.clip(ref_err_xyz[0:2], -max_step_mm, max_step_mm)
+        ref_step_xyz[0:2] = np.clip(ref_err_xyz[0:2], -max_step_xy, max_step_xy)
 
         if args.follow_z:
-            ref_step_xyz[2] = np.clip(ref_err_xyz[2], -max_step_z_mm, max_step_z_mm)
+            ref_step_xyz[2] = np.clip(ref_err_xyz[2], -max_step_z, max_step_z)
         else:
             ref_target_xyz_mm[2] = fixed_z_mm
 
@@ -1410,7 +1467,9 @@ def robot_control_loop(controller, shared_state, args):
                     f"[ROBOT] source={target_source}, "
                     f"raw_mm={snap['latest_target_xyz_mm']}, "
                     f"control_mm={target_xyz_mm}, "
-                    f"ref_mm={ref_target_xyz_mm}, cmd_m={target_position_base}"
+                    f"ref_mm={ref_target_xyz_mm}, "
+                    f"step_xy={max_step_xy:.2f}, step_z={max_step_z:.2f}, "
+                    f"dist_xy={dist_xy:.1f}, cmd_m={target_position_base}"
                 )
         except Exception as exc:
             print(f"[WARN] servo command failed: {exc}")
@@ -1727,7 +1786,7 @@ def execute_return_and_place(controller, shared_state, args):
     hover_z = target_z + HOVER_Z_OFFSET_MM
     hover_x, hover_y, hover_z = clamp_pose_mm(target_x, target_y, hover_z, args)
 
-    place_z = target_z + DESCEND_EXTRA_MM
+    place_z = target_z
     place_x, place_y, place_z = clamp_pose_mm(target_x, target_y, place_z, args)
 
     print(f"[INFO] RETURN hover target: ({hover_x:.1f}, {hover_y:.1f}, {hover_z:.1f})")
@@ -2185,11 +2244,22 @@ def main():
             )
 
             if object_point_base is not None:
-                shared_state.update_target(grasp_point_base, object_point_base, object_pixel)
+                eef_xyz_mm = None
+                if controller is not None:
+                    state = controller.read_robot_state(now_timestamp=time.time())
+                    if state.actual_tcp_pose_base is not None:
+                        eef_xyz_mm = meters_to_mm(state.actual_tcp_pose_base[:3])
+
+                shared_state.update_target(
+                    grasp_point_base,
+                    object_point_base,
+                    object_pixel,
+                    eef_xyz_mm=eef_xyz_mm,
+                )
                 if controller is not None and shared_state.should_start_pregrasp(controller):
-                    print("[INFO] STOPPED + CLOSE_ENOUGH -> PREGRASP transition")
-                    ok = execute_pregrasp_x_only(controller, shared_state, args)
-                    if ok:
+                    print("[INFO] DIRECT GRASP trigger")
+                    shared_state.stop_follow()
+                    if stop_follow_for_handoff(controller, shared_state, args.follow_handoff_timeout_s):
                         grasp_ok = execute_gripper_close(
                             controller,
                             timeout_s=args.gripper_close_timeout_s,

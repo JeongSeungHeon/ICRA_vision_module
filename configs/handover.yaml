@@ -19,7 +19,7 @@ cameras:
   cam0:
     enabled: true
     role: right_hand_camera
-    serial: null
+    serial: "148522072369"
     width: 640
     height: 480
     fps: 30
@@ -42,7 +42,7 @@ cameras:
   cam1:
     enabled: true
     role: left_hand_camera
-    serial: null
+    serial: "327122075999"
     width: 640
     height: 480
     fps: 30
@@ -238,7 +238,7 @@ robot:
     stop_acceleration: 1.0
   # 로봇 동작 속도 조절
   motion:
-    approach_speed_mps: 0.10
+    approach_speed_mps: 0.20
     retreat_speed_mps: 0.18
     max_translation_step_m: 0.05
   gripper:

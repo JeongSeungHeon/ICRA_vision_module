@@ -11,6 +11,7 @@ import numpy as np
 import yaml
 
 DEFAULT_CONFIG_PATH = Path("configs/handover.yaml")
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 @dataclass
@@ -105,7 +106,31 @@ def load_dat_transform(file_path: str | Path, translation_unit: str = "m") -> np
     return _rotation_translation_to_matrix(rotation, translation * float(translation_scale))
 
 
+def _resolve_existing_path(path: str | Path, *, config_path: str | Path | None = None) -> Path:
+    candidate = Path(path).expanduser()
+    if candidate.is_absolute():
+        return candidate
+
+    search_roots = [Path.cwd(), REPO_ROOT]
+    if config_path is not None:
+        config_parent = Path(config_path).expanduser().resolve().parent
+        search_roots.extend([config_parent, config_parent.parent])
+
+    seen_roots: set[Path] = set()
+    for root in search_roots:
+        root = root.resolve()
+        if root in seen_roots:
+            continue
+        seen_roots.add(root)
+        resolved = root / candidate
+        if resolved.exists():
+            return resolved
+
+    return REPO_ROOT / candidate
+
+
 def load_transform_chain(config_path: str | Path = DEFAULT_CONFIG_PATH) -> TransformChain:
+    config_path = _resolve_existing_path(config_path)
     with open(config_path, "r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle) or {}
 
@@ -118,9 +143,12 @@ def load_transform_chain(config_path: str | Path = DEFAULT_CONFIG_PATH) -> Trans
     if not cam1_cfg:
         raise ValueError("Missing calibration.chain.cam1_to_cam0 in config")
 
-    t_base_cam0 = load_pickle_transform(cam0_cfg["file"])
+    cam0_file = _resolve_existing_path(cam0_cfg["file"], config_path=config_path)
+    cam1_file = _resolve_existing_path(cam1_cfg["file"], config_path=config_path)
+
+    t_base_cam0 = load_pickle_transform(cam0_file)
     t_cam0_cam1 = load_dat_transform(
-        cam1_cfg["file"],
+        cam1_file,
         translation_unit=cam1_cfg.get("translation_unit", "m"),
     )
     t_base_cam1 = np.asarray(t_base_cam0 @ t_cam0_cam1, dtype=np.float32)
