@@ -144,7 +144,6 @@ def build_fdct_demo_style_point_cloud(
     points = np.stack((x, y, z), axis=1).astype(np.float32)
 
     colors_rgb = color_bgr[(rows * stride).astype(np.int64), (cols * stride).astype(np.int64), ::-1].copy()
-
     if max_points > 0 and points.shape[0] > max_points:
         selection = np.random.default_rng().choice(points.shape[0], max_points, replace=False)
         points = points[selection]
@@ -170,7 +169,6 @@ def filter_pcd(points: np.ndarray, target_num: int = 3) -> np.ndarray:
 
     print("Running DBSCAN clustering...")
     labels = np.array(pcd.cluster_dbscan(eps=0.02, min_points=10, print_progress=False))
-
     valid_cluster_ids = np.unique(labels[labels >= 0])
     num_clusters = len(valid_cluster_ids)
     print(f"Found {num_clusters} valid clusters.")
@@ -183,7 +181,7 @@ def filter_pcd(points: np.ndarray, target_num: int = 3) -> np.ndarray:
         print(f"Already at {num_clusters} clusters. Removing noise and keeping everything else.")
         keep_ids = valid_cluster_ids
     else:
-        mean_x_values = np.array([np.mean(points[labels == i, 0]) for i in valid_cluster_ids])
+        mean_x_values = np.array([np.mean(points[labels == cluster_id, 0]) for cluster_id in valid_cluster_ids])
         sorted_indices = np.argsort(mean_x_values)
         keep_indices = sorted_indices[-target_num:]
         keep_ids = valid_cluster_ids[keep_indices]
@@ -191,14 +189,12 @@ def filter_pcd(points: np.ndarray, target_num: int = 3) -> np.ndarray:
 
     mask = np.isin(labels, keep_ids)
     final_objects = pcd.select_by_index(np.where(mask)[0])
-
     return np.asarray(final_objects.points)
 
 
 def scale_template(template: o3d.geometry.PointCloud, pcd: o3d.geometry.PointCloud) -> np.ndarray:
     extent_source = template.get_axis_aligned_bounding_box().get_extent()
     extent_target = pcd.get_axis_aligned_bounding_box().get_extent()
-
     if np.any(extent_source <= 1e-9) or np.any(extent_target <= 1e-9):
         print("Skipping template scale: invalid source/target extent.")
         return np.asarray(template.points)
@@ -206,8 +202,7 @@ def scale_template(template: o3d.geometry.PointCloud, pcd: o3d.geometry.PointClo
     scale = extent_target / extent_source
     template_points = np.asarray(template.points)
     centroid = np.mean(template_points, axis=0, keepdims=True)
-    scaled_points = (template_points - centroid) * scale.reshape(1, 3) + centroid
-    return scaled_points
+    return (template_points - centroid) * scale.reshape(1, 3) + centroid
 
 
 def run_open3d_icp(
@@ -337,15 +332,13 @@ def process_camera_frame(
 
     annotated = segmentation_engine.render(segmentation_result)
     annotated = colorize_selected_mask(annotated, combined_mask)
-    summary = format_instance_summary(selected_instances)
-    status = "ok" if valid else "no_object_points"
     preview = overlay_status(
         annotated,
         [
             f"cam{camera_id} serial: {frame_bundle.serial}",
-            summary,
+            format_instance_summary(selected_instances),
             f"seg: {segmentation_result.infer_ms:.1f} ms | fdct: {fdct_result.elapsed_ms:.1f} ms",
-            f"points_base: {len(points_base)} | {status}",
+            f"points_base: {len(points_base)} | {'ok' if valid else 'no_object_points'}",
         ],
     )
     return ProcessedCameraFrame(
@@ -354,7 +347,7 @@ def process_camera_frame(
         points_base=np.asarray(points_base, dtype=np.float32),
         colors_rgb=np.asarray(colors_rgb, dtype=np.uint8),
         preview_bgr=preview,
-        status=status,
+        status="ok" if valid else "no_object_points",
     )
 
 
@@ -376,6 +369,7 @@ def main() -> None:
         sensor_hub.height = HEIGHT
         sensor_hub.fps = FPS
         sensor_hub.start()
+
         depth_completer = create_fdct_depth_completer()
         segmentation_engine = create_segmentation_engine()
         transform_chain = load_transform_chain(CONFIG_PATH)
@@ -407,12 +401,10 @@ def main() -> None:
 
             point_clouds = [frame.points_base for frame in processed_frames if frame.valid and len(frame.points_base) > 0]
             colors_rgb = [frame.colors_rgb for frame in processed_frames if frame.valid and len(frame.points_base) > 0]
-            merged_points = np.empty((0, 3), dtype=np.float32)
-            filtered_points = np.empty((0, 3), dtype=np.float32)
             merge_status = "no valid camera clouds"
 
             if point_clouds:
-                merged_points, merged_colors_rgb, merge_stats = merge_point_clouds(
+                merged_points, _, merge_stats = merge_point_clouds(
                     point_clouds,
                     colors_rgb,
                     voxel_size_m=MERGE_VOXEL_SIZE_M,
@@ -448,8 +440,7 @@ def main() -> None:
                         template_pcd.points = o3d.utility.Vector3dVector(scaled_template)
                         vis.update_geometry(template_pcd)
                         template_scaled = True
-                        ctr = vis.get_view_control()
-                        ctr.set_zoom(0.8)
+                        vis.get_view_control().set_zoom(0.8)
                     else:
                         final_transform = run_open3d_icp(template_pcd, live_pcd)
                         template_pcd.transform(final_transform)
@@ -457,6 +448,7 @@ def main() -> None:
 
             latency = time.time() - start
             fps = 1.0 / latency if latency > 0 else 0.0
+
             cam0_overlay = processed_frames[0].preview_bgr
             if template_scaled:
                 fitted_template_base = transform_points_display_to_base(np.asarray(template_pcd.points))
@@ -470,6 +462,7 @@ def main() -> None:
                     point_radius=1,
                     overlay_alpha=0.95,
                 )
+
             preview = stack_previews([cam0_overlay, processed_frames[1].preview_bgr])
             preview = overlay_status(
                 preview,

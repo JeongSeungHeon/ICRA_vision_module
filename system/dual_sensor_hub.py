@@ -12,7 +12,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import yaml
+try:
+    import yaml
+except Exception:  # pragma: no cover - optional during unit tests
+    yaml = None
 
 from object_pt_extraction.dual_realsense_manager import DualRealSenseManager
 from system.shared_state import SensorState
@@ -63,6 +66,8 @@ class DualSensorHub:
 
     @classmethod
     def from_config(cls, config_path: str | Path = DEFAULT_CONFIG_PATH) -> "DualSensorHub":
+        if yaml is None:
+            raise RuntimeError("PyYAML is required to load DualSensorHub configuration.")
         with open(config_path, "r", encoding="utf-8") as handle:
             config = yaml.safe_load(handle)
 

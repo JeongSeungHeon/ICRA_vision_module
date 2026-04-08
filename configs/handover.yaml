@@ -163,6 +163,38 @@ perception:
     hand_normal_alpha: 0.50
     max_position_jump_m: 0.20
     stable_frames_required: 5
+  pose_tracking:
+    enabled: true
+    anchor_camera: cam0
+    debug_dir: logs/foundationpose_debug
+    surface_sample_count: 1500
+    template_library:
+      cup:
+        template_id: cup_canonical
+        asset_path: shape_fitting/template.npy
+        unit_scale_m: 0.001
+      wine_glass:
+        template_id: wine_glass_canonical
+        asset_path: shape_fitting/template_small.npy
+        unit_scale_m: 0.001
+    scale_estimation:
+      stable_frames: 5
+      min_points: 500
+      percentile_low: 5.0
+      percentile_high: 95.0
+      min_scale: 0.25
+      max_scale: 4.0
+    registration:
+      refine_iter: 5
+    tracking:
+      refine_iter: 2
+    health:
+      mask_iou_threshold: 0.15
+      depth_inlier_threshold: 0.30
+      depth_tolerance_m: 0.03
+    reinit:
+      low_conf_frames: 5
+      min_merged_points: 300
   activation:
     hand_approach_distance_threshold_m: 0.15
     stable_frames_required: 5

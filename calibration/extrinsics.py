@@ -8,7 +8,10 @@ import pickle
 from typing import Any
 
 import numpy as np
-import yaml
+try:
+    import yaml
+except Exception:  # pragma: no cover - optional during unit tests
+    yaml = None
 
 DEFAULT_CONFIG_PATH = Path("configs/handover.yaml")
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -130,6 +133,8 @@ def _resolve_existing_path(path: str | Path, *, config_path: str | Path | None =
 
 
 def load_transform_chain(config_path: str | Path = DEFAULT_CONFIG_PATH) -> TransformChain:
+    if yaml is None:
+        raise RuntimeError("PyYAML is required to load the transform chain from config.")
     config_path = _resolve_existing_path(config_path)
     with open(config_path, "r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle) or {}

@@ -16,6 +16,8 @@ Vec6 = Tuple[float, float, float, float, float, float]
 Shape2D = Tuple[int, int]
 Shape3D = Tuple[int, int, int]
 Matrix3x3 = Tuple[Vec3, Vec3, Vec3]
+Vec4 = Tuple[float, float, float, float]
+Matrix4x4 = Tuple[Vec4, Vec4, Vec4, Vec4]
 
 HEIGHT_AXIS_X = "x"
 HEIGHT_AXIS_Y = "y"
@@ -47,6 +49,12 @@ TASK_MOVE_TO_INITIAL_PLACE = "MOVE_TO_INITIAL_PLACE"
 TASK_RELEASE = "RELEASE"
 TASK_RETREAT = "RETREAT"
 TASK_FAIL_SAFE = "FAIL_SAFE"
+
+POSE_TRACKING_UNINITIALIZED = "UNINITIALIZED"
+POSE_TRACKING_WAITING_STABLE_SCALE = "WAITING_STABLE_SCALE"
+POSE_TRACKING_REGISTERING = "REGISTERING"
+POSE_TRACKING_TRACKING = "TRACKING"
+POSE_TRACKING_REINIT_PENDING = "REINIT_PENDING"
 
 
 def now_timestamp() -> float:
@@ -155,6 +163,23 @@ class GraspTargetState(BaseState):
 
 
 @dataclass
+class PoseTrackingState(BaseState):
+    anchor_camera_id: int | None = None
+    object_detected: bool = False
+    label: str | None = None
+    template_id: str | None = None
+    scale_xyz: Vec3 | None = None
+    pose_cam0: Matrix4x4 | None = None
+    pose_base: Matrix4x4 | None = None
+    tracking_confidence: float = 0.0
+    mask_iou: float = 0.0
+    depth_inlier_ratio: float = 0.0
+    mode: str = POSE_TRACKING_UNINITIALIZED
+    reinit_reason: str | None = None
+    backend_available: bool = False
+
+
+@dataclass
 class LiveFollowState(BaseState):
     follow_enabled: bool = False
     source_mode: str = TASK_IDLE
@@ -223,6 +248,7 @@ class SharedStateBundle(BaseState):
     selected_hand: SelectedHandState = field(default_factory=SelectedHandState)
     fusion: FusionState = field(default_factory=FusionState)
     grasp_target: GraspTargetState = field(default_factory=GraspTargetState)
+    pose_tracking: PoseTrackingState = field(default_factory=PoseTrackingState)
     live_follow: LiveFollowState = field(default_factory=LiveFollowState)
     robot: RobotState = field(default_factory=RobotState)
     robot_command: RobotCommandState = field(default_factory=RobotCommandState)
@@ -238,6 +264,7 @@ __all__ = [
     "SelectedHandState",
     "FusionState",
     "GraspTargetState",
+    "PoseTrackingState",
     "LiveFollowState",
     "RobotState",
     "RobotCommandState",
@@ -269,5 +296,10 @@ __all__ = [
     "TASK_RELEASE",
     "TASK_RETREAT",
     "TASK_FAIL_SAFE",
+    "POSE_TRACKING_UNINITIALIZED",
+    "POSE_TRACKING_WAITING_STABLE_SCALE",
+    "POSE_TRACKING_REGISTERING",
+    "POSE_TRACKING_TRACKING",
+    "POSE_TRACKING_REINIT_PENDING",
     "now_timestamp",
 ]
