@@ -220,6 +220,36 @@ def infer_depth(
     return preprocessed_depth, completed_np, elapsed_ms
 
 
+def bilateral_filter_depth(
+    depth_m: np.ndarray,
+    radius: int = 2,
+    zfar: float = 100.0,
+    sigma_space: float = 2.0,
+) -> np.ndarray:
+    depth_np = np.asarray(depth_m, dtype=np.float32)
+    if depth_np.size == 0:
+        return depth_np.copy()
+
+    valid = np.isfinite(depth_np)
+    valid &= depth_np >= 0.001
+    valid &= depth_np < float(zfar)
+    if not np.any(valid):
+        return np.zeros_like(depth_np, dtype=np.float32)
+
+    filtered = depth_np.copy()
+    filtered[~valid] = 0.0
+    ksize = max(1, int(radius) * 2 + 1)
+    filtered = cv2.bilateralFilter(
+        filtered,
+        d=ksize,
+        sigmaColor=0.02,
+        sigmaSpace=max(float(sigma_space), 1.0),
+    )
+    filtered = np.asarray(filtered, dtype=np.float32)
+    filtered[~valid] = 0.0
+    return filtered
+
+
 class FDCTDepthCompleter:
     """Owns one FDCT model instance and completes BGR + depth frames."""
 
@@ -252,6 +282,7 @@ def format_depth_completion_stats(
     completed_depth_m: np.ndarray,
     depth_min: float,
     depth_max: float,
+    filtered_depth_m: np.ndarray | None = None,
 ) -> str:
     raw_valid = np.logical_and(raw_depth_m >= depth_min, raw_depth_m <= depth_max)
     fdct_valid = np.isfinite(completed_depth_m)
@@ -269,4 +300,12 @@ def format_depth_completion_stats(
     raw_values = raw_depth_m[raw_valid]
     fdct_values = completed_depth_m[fdct_valid]
     diff_values = np.abs(completed_depth_m[paired_valid] - raw_depth_m[paired_valid])
-    return f"raw({_stats(raw_values)}) fdct({_stats(fdct_values)}) absdiff({_stats(diff_values)})"
+    summary = f"raw({_stats(raw_values)}) fdct({_stats(fdct_values)}) absdiff({_stats(diff_values)})"
+
+    if filtered_depth_m is not None:
+        filtered_valid = np.isfinite(filtered_depth_m)
+        filtered_values = filtered_depth_m[filtered_valid]
+        filtered_paired_valid = np.logical_and(fdct_valid, filtered_valid)
+        filtered_diff_values = np.abs(filtered_depth_m[filtered_paired_valid] - completed_depth_m[filtered_paired_valid])
+        summary += f" bilateral({_stats(filtered_values)}) bilateral_absdiff({_stats(filtered_diff_values)})"
+    return summary

@@ -85,7 +85,7 @@ perception:
     stale_timeout_sec: 0.30
   depth_completion:
     fdct:
-      enabled: false
+      enabled: true
       cameras: both
       checkpoint: FDCT/TransCG.tar
       device: auto
@@ -96,6 +96,10 @@ perception:
       depth_norm: 1.0
       depth_coeff: 10.0
       inpaint: true
+      bilateral_enabled: true
+      bilateral_radius: 2
+      bilateral_sigma_space: 2.0
+      bilateral_zfar: 100.0
       fallback_to_raw: true
       debug_stats: false
       debug_every: 30
@@ -195,6 +199,32 @@ perception:
     reinit:
       low_conf_frames: 5
       min_merged_points: 300
+  shape_fitting:
+    enabled: true
+    template_library:
+      cup:
+        template_id: cup_shape_fit
+        asset_path: shape_fitting/template_small.npy
+        unit_scale_m: 0.001
+      wine_glass:
+        template_id: wine_glass_shape_fit
+        asset_path: shape_fitting/template_small.npy
+        unit_scale_m: 0.001
+    cluster:
+      dbscan_eps_m: 0.02
+      dbscan_min_points: 10
+      max_cluster_jump_m: 0.08
+    scale_init:
+      stable_frames: 8
+      percentile_low: 5.0
+      percentile_high: 95.0
+      min_scale: 0.5
+      max_scale: 1.8
+    tracking:
+      min_cluster_extent_m: 1.0e-5
+    downsample:
+      voxel_size_m: 0.004
+      max_points: 6000
   activation:
     hand_approach_distance_threshold_m: 0.15
     stable_frames_required: 5
@@ -210,6 +240,12 @@ grasp:
   candidate_search_radius_from_centroid_m: 0.07
   min_hand_height_clearance_m: 0.05
   no_candidate_action: hold
+  target_selection:
+    enabled: true
+    switch_margin: 0.01
+    hold_frames: 6
+    dropout_hold_frames: 8
+    score_previous_distance_weight: 0.10
 
 # Home pose: the robot moves here at start-up and after each task cycle.
 # Position in metres (robot base frame, project coordinates).

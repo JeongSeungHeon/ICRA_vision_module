@@ -35,7 +35,6 @@ from perception.hand_selector import HandSelector
 from perception.hand_worker import HandWorkerCam0, HandWorkerCam1
 from perception.object_merger import ObjectMerger
 from perception.object_worker import ObjectWorkerCam0, ObjectWorkerCam1
-from perception.pose_tracking import FoundationPoseTracker
 from perception.target_predictor import TargetPredictor
 from robot.rtde_controller import RtdeController
 from system.dual_sensor_hub import DualSensorHub
@@ -69,8 +68,8 @@ MOTION_TRIGGER_MM = 15.0
 
 # control loop
 DEFAULT_CONTROL_HZ = 30.0
-MAX_XY_SPEED_MM_S = 150.0 # 80
-MAX_Z_SPEED_MM_S = 150.0  # 80
+MAX_XY_SPEED_MM_S = 90.0 # 80
+MAX_Z_SPEED_MM_S = 200.0  # 80
 
 # EEF target offset from detected object center (robot base frame)
 EEF_X_OFFSET_MM = -270.0
@@ -660,7 +659,7 @@ def compute_dynamic_eef_target(reference_xyz_mm, eef_xyz_mm):
 
 def get_close_range_step_mm(ref_err_xyz, max_step_mm, max_step_z_mm):
     dist_xy = float(np.linalg.norm(np.asarray(ref_err_xyz, dtype=np.float32)[:2]))
-    if dist_xy < 45.0:
+    if dist_xy < 65.0:
         return 2.5, 1.2, dist_xy
     return float(max_step_mm), float(max_step_z_mm), dist_xy
 
@@ -1190,7 +1189,7 @@ class FollowSharedState:
         controller,
         x_tol_mm=180.0,
         y_tol_mm=30.0,
-        z_tol_mm=20.0,
+        z_tol_mm=30.0,
     ):
         snapshot = self.get_snapshot()
         object_xyz = snapshot["latest_object_xyz_mm"]
@@ -1912,7 +1911,6 @@ def build_dual_perception_pipeline(args):
     hand_selector = HandSelector.from_config(args.config)
     object_merger = ObjectMerger.from_config(args.config)
     fusion = PerceptionFusion.from_config(args.config)
-    pose_tracker = FoundationPoseTracker.from_config(args.config)
     grasp_planner = GraspTargetPlanner.from_config(args.config)
     transform_chain = load_transform_chain(args.config)
     t_cam0_base = np.linalg.inv(transform_chain.t_base_cam0).astype(np.float32)
@@ -1929,7 +1927,6 @@ def build_dual_perception_pipeline(args):
         "hand_selector": hand_selector,
         "object_merger": object_merger,
         "fusion": fusion,
-        "pose_tracker": pose_tracker,
         "grasp_planner": grasp_planner,
         "transform_chain": transform_chain,
         "t_cam0_base": t_cam0_base,
@@ -2031,7 +2028,6 @@ def render_camera_mask_preview(
     object_worker,
     selected_hand,
     fusion_state,
-    pose_tracking,
     grasp_target,
     *,
     camera_label,
@@ -2075,12 +2071,6 @@ def render_camera_mask_preview(
     info_lines = [
         f"seg all: {all_summary}",
         f"seg selected: {selected_summary}",
-        (
-            f"pose: {pose_tracking.mode} conf={pose_tracking.tracking_confidence:.2f}"
-            if camera_label == "cam1"
-            else f"pose label={pose_tracking.label} tpl={pose_tracking.template_id}"
-        ),
-        f"pose backend={pose_tracking.backend_available} valid={pose_tracking.valid}",
     ]
     for line_index, text_line in enumerate(info_lines):
         origin = (12, 54 + line_index * 22)
@@ -2095,7 +2085,6 @@ def render_cam0_perception_debug(
     merged_object,
     selected_hand,
     fusion_state,
-    pose_tracking,
     grasp_target,
     shared_state,
     model_label,
@@ -2124,13 +2113,6 @@ def render_cam0_perception_debug(
         cloud_overlay = image_bgr.copy()
         cloud_overlay[merged_pixels[:, 1], merged_pixels[:, 0]] = np.array([80, 255, 180], dtype=np.uint8)
         image_bgr = cv.addWeighted(image_bgr, 0.78, cloud_overlay, 0.22, 0.0)
-
-    pose_debug = getattr(pipeline["pose_tracker"], "last_debug", None)
-    projected_pixels = getattr(pose_debug, "projected_pixels", None)
-    if projected_pixels is not None and len(projected_pixels) > 0:
-        pose_overlay = image_bgr.copy()
-        pose_overlay[projected_pixels[:, 1], projected_pixels[:, 0]] = np.array([255, 64, 255], dtype=np.uint8)
-        image_bgr = cv.addWeighted(image_bgr, 0.84, pose_overlay, 0.16, 0.0)
 
     object_point = choose_point(fusion_state.filtered_object_centroid_base, merged_object.centroid_base)
     hand_point = choose_point(fusion_state.filtered_hand_center_base, selected_hand.palm_center_base)
@@ -2167,15 +2149,6 @@ def render_cam0_perception_debug(
         f"grasp_valid={bool(grasp_target.valid)} grasp={format_vec3(grasp_target.target_position_base)}",
         f"object={format_vec3(object_point)}",
         f"hand={format_vec3(hand_point)}",
-        (
-            f"pose={pose_tracking.mode} conf={pose_tracking.tracking_confidence:.2f} "
-            f"iou={pose_tracking.mask_iou:.2f} depth={pose_tracking.depth_inlier_ratio:.2f}"
-        ),
-        f"pose backend={pose_tracking.backend_available} valid={pose_tracking.valid}",
-        (
-            f"pose label={pose_tracking.label} tpl={pose_tracking.template_id} "
-            f"scale={format_vec3(pose_tracking.scale_xyz)} reason={pose_tracking.reinit_reason}"
-        ),
     ]
     cam0_all_summary, cam0_selected_summary = get_segmentation_class_summary(pipeline["object_worker_cam0"])
     lines.append(f"cam0 seg all={cam0_all_summary}")
@@ -2246,17 +2219,6 @@ def main():
                 object_cam1,
                 hand_approach_detected=previous_hand_approach,
             )
-            pose_mask_cam0 = None
-            object_debug_cam0 = getattr(pipeline["object_worker_cam0"], "last_debug", None)
-            if object_debug_cam0 is not None:
-                pose_mask_cam0 = getattr(object_debug_cam0, "combined_mask", None)
-            pipeline["pose_tracker"].set_anchor_observation(object_frame_cam0, pose_mask_cam0)
-            pose_tracking = pipeline["pose_tracker"].update(
-                snapshot,
-                object_cam0,
-                object_cam1,
-                merged_object,
-            )
             fusion_state = pipeline["fusion"].process_states(
                 merged_object,
                 selected_hand,
@@ -2321,7 +2283,6 @@ def main():
                 merged_object,
                 selected_hand,
                 fusion_state,
-                pose_tracking,
                 grasp_target,
                 shared_state,
                 model_label,
@@ -2333,7 +2294,6 @@ def main():
                 pipeline["object_worker_cam1"],
                 selected_hand,
                 fusion_state,
-                pose_tracking,
                 grasp_target,
                 camera_label="cam1",
             )

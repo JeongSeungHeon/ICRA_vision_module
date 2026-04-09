@@ -24,6 +24,7 @@ from object_pt_extraction.segmentation_engine import (
     parse_prompt_classes,
 )
 from perception.fdct_depth_completion import (
+    bilateral_filter_depth,
     FDCTDepthCompleter,
     FDCTDepthCompletionConfig,
     format_depth_completion_stats,
@@ -35,6 +36,7 @@ from perception.hand_selector import HandSelector
 from perception.hand_worker import HandWorkerCam0, HandWorkerCam1
 from perception.object_merger import ObjectMerger
 from perception.object_worker import ObjectWorkerCam0, ObjectWorkerCam1
+from perception.shape_fitting_tracker import ShapeFittingTracker
 from perception.target_predictor import TargetPredictor
 from robot.rtde_controller import RtdeController
 from system.dual_sensor_hub import DualSensorHub
@@ -118,7 +120,7 @@ def parse_args():
     parser.add_argument(
         "--select-mode",
         choices=["all_instances", "highest_score", "class_filter"],
-        default="highest_score",
+        default="all_instances",
         help="Instance selection policy for downstream processing.",
     )
     parser.add_argument(
@@ -184,7 +186,7 @@ def parse_args():
     )
     parser.add_argument("--min-depth-m", type=float, default=0.05, help="Minimum valid depth.")
     parser.add_argument("--max-valid-depth-m", type=float, default=2.0, help="Maximum valid depth.")
-    parser.add_argument("--ema-alpha", type=float, default=0.2, help="EMA smoothing factor for 3D point.")
+    parser.add_argument("--ema-alpha", type=float, default=0.1, help="EMA smoothing factor for 3D point.")
 
     # UR5 RTDE follow options
     parser.add_argument("--enable-follow", action="store_true", help="Enable UR5 RTDE follow mode.")
@@ -310,6 +312,10 @@ def apply_config_defaults(args, config):
     args.fdct_depth_norm = float(fdct_cfg.get("depth_norm", 1.0))
     args.fdct_depth_coeff = float(fdct_cfg.get("depth_coeff", 10.0))
     args.fdct_inpaint = bool(fdct_cfg.get("inpaint", True))
+    args.fdct_bilateral_enabled = bool(fdct_cfg.get("bilateral_enabled", True))
+    args.fdct_bilateral_radius = max(0, int(fdct_cfg.get("bilateral_radius", 2)))
+    args.fdct_bilateral_sigma_space = float(fdct_cfg.get("bilateral_sigma_space", 2.0))
+    args.fdct_bilateral_zfar = float(fdct_cfg.get("bilateral_zfar", 100.0))
     args.fdct_debug_every = max(1, int(fdct_cfg.get("debug_every", 30)))
     args.fdct_fallback_to_raw = bool(fdct_cfg.get("fallback_to_raw", True))
     args.fdct_debug_stats = bool(args.fdct_debug_stats or fdct_cfg.get("debug_stats", False))
@@ -406,9 +412,23 @@ def apply_fdct_depth_to_object_frames(snapshot, pipeline, args):
                 print(f"[WARN] cam{camera_id} FDCT skipped; no valid depth after preprocessing.")
             continue
 
+        filtered_depth_m = result.completed_depth_m.astype(np.float32, copy=False)
+        if args.fdct_bilateral_enabled:
+            try:
+                filtered_depth_m = bilateral_filter_depth(
+                    filtered_depth_m,
+                    radius=args.fdct_bilateral_radius,
+                    zfar=args.fdct_bilateral_zfar,
+                    sigma_space=args.fdct_bilateral_sigma_space,
+                )
+            except Exception as exc:
+                if _should_log_fdct_event(pipeline, f"cam{camera_id}:bilateral_exception", args.fdct_debug_every):
+                    print(f"[WARN] cam{camera_id} bilateral filter failed; using FDCT output: {exc}")
+                filtered_depth_m = result.completed_depth_m.astype(np.float32, copy=False)
+
         object_frames[camera_id] = replace(
             frame_bundle,
-            depth_image_m=result.completed_depth_m.astype(np.float32, copy=False),
+            depth_image_m=filtered_depth_m.astype(np.float32, copy=False),
         )
         if args.fdct_debug_stats and _should_log_fdct_event(pipeline, f"cam{camera_id}:stats", args.fdct_debug_every):
             stats = format_depth_completion_stats(
@@ -416,6 +436,7 @@ def apply_fdct_depth_to_object_frames(snapshot, pipeline, args):
                 result.completed_depth_m,
                 args.fdct_depth_min,
                 args.fdct_depth_max,
+                filtered_depth_m=filtered_depth_m,
             )
             print(f"[FDCT] cam{camera_id} elapsed={result.elapsed_ms:.1f}ms {stats}")
 
@@ -813,7 +834,7 @@ class FollowSharedState:
         self.home_pixel_buffer = deque(maxlen=15)
 
         self.object_stopped = False
-        self.stop_pose_buffer = deque(maxlen=15)
+        self.stop_pose_buffer = deque(maxlen=6)
 
         self.latest_object_xyz_mm = None
         self.pregrasp_started = False
@@ -932,7 +953,7 @@ class FollowSharedState:
 
     def update_target(self, grasp_xyz_m, object_xyz_m=None, pixel_xy=None):
         if object_xyz_m is None:
-            self.clear_target(reset_prediction=True, reset_arm=True)
+            self.clear_target()
             return
 
         object_xyz_mm = np.asarray(object_xyz_m, dtype=np.float32)[:3] * 1000.0
@@ -973,8 +994,6 @@ class FollowSharedState:
             if target_xyz_mm is None:
                 self.latest_target_xyz_mm = None
                 self.valid_detection_streak = 0
-                self.control_target_xyz_mm = None
-                self.target_source = "none"
                 return
 
             self.latest_target_xyz_mm = target_xyz_mm.copy()
@@ -1099,8 +1118,8 @@ class FollowSharedState:
         buf = np.stack(self.home_pose_buffer, axis=0)
         xyz_range = buf.max(axis=0) - buf.min(axis=0)
 
-        stable_xy = (xyz_range[0] < 5.0) and (xyz_range[1] < 5.0)
-        stable_z = xyz_range[2] < 8.0
+        stable_xy = (xyz_range[0] < 15.0) and (xyz_range[1] < 15.0)
+        stable_z = xyz_range[2] < 18.0
 
         if stable_xy and stable_z:
             self.home_object_xyz_mm = buf.mean(axis=0)
@@ -1132,8 +1151,8 @@ class FollowSharedState:
         buf = np.stack(self.stop_pose_buffer, axis=0)
         xyz_range = buf.max(axis=0) - buf.min(axis=0)
 
-        stable_xy = (xyz_range[0] < 16.0) and (xyz_range[1] < 16.0)
-        stable_z = xyz_range[2] < 20.0
+        stable_xy = (xyz_range[0] < 30.0) and (xyz_range[1] < 30.0)
+        stable_z = xyz_range[2] < 50.0
 
         if stable_xy and stable_z:
             if not self.object_stopped:
@@ -1727,7 +1746,7 @@ def execute_return_and_place(controller, shared_state, args):
     hover_z = target_z + HOVER_Z_OFFSET_MM
     hover_x, hover_y, hover_z = clamp_pose_mm(target_x, target_y, hover_z, args)
 
-    place_z = target_z + DESCEND_EXTRA_MM
+    place_z = target_z
     place_x, place_y, place_z = clamp_pose_mm(target_x, target_y, place_z, args)
 
     print(f"[INFO] RETURN hover target: ({hover_x:.1f}, {hover_y:.1f}, {hover_z:.1f})")
@@ -1851,6 +1870,7 @@ def build_dual_perception_pipeline(args):
     hand_worker_cam1 = HandWorkerCam1.from_config(args.config)
     hand_selector = HandSelector.from_config(args.config)
     object_merger = ObjectMerger.from_config(args.config)
+    shape_fitting_tracker = ShapeFittingTracker.from_config(args.config)
     fusion = PerceptionFusion.from_config(args.config)
     grasp_planner = GraspTargetPlanner.from_config(args.config)
     transform_chain = load_transform_chain(args.config)
@@ -1867,6 +1887,7 @@ def build_dual_perception_pipeline(args):
         "hand_worker_cam1": hand_worker_cam1,
         "hand_selector": hand_selector,
         "object_merger": object_merger,
+        "shape_fitting_tracker": shape_fitting_tracker,
         "fusion": fusion,
         "grasp_planner": grasp_planner,
         "transform_chain": transform_chain,
@@ -1877,6 +1898,29 @@ def build_dual_perception_pipeline(args):
         "fdct_event_counts": {},
         "prompt_classes": prompt_classes,
     }
+
+
+def build_fitted_merged_object(raw_merged_object, shape_fitting_state):
+    if not shape_fitting_state.valid:
+        return replace(
+            raw_merged_object,
+            object_detected=False,
+            centroid_base=None,
+            merged_point_count=0,
+            merged_points_base=[],
+            valid=False,
+        )
+
+    fitted_points = np.asarray(shape_fitting_state.fitted_points_base, dtype=np.float32).reshape((-1, 3))
+    return replace(
+        raw_merged_object,
+        object_detected=True,
+        label=shape_fitting_state.label or raw_merged_object.label,
+        centroid_base=shape_fitting_state.centroid_base,
+        merged_point_count=int(len(fitted_points)),
+        merged_points_base=[tuple(float(v) for v in point) for point in fitted_points],
+        valid=True,
+    )
 
 
 def project_base_point_to_cam0(point_base, intrinsics, t_cam0_base, width: int, height: int):
@@ -2024,6 +2068,8 @@ def render_cam0_perception_debug(
     snapshot,
     pipeline,
     merged_object,
+    raw_merged_object,
+    shape_fitting_state,
     selected_hand,
     fusion_state,
     grasp_target,
@@ -2086,8 +2132,25 @@ def render_cam0_perception_debug(
         f"model: {model_label}",
         f"fps: {fps:.1f}",
         f"merged_obj={bool(merged_object.valid)} points={merged_object.merged_point_count} proj={len(merged_pixels)}",
+        (
+            "shape_fit="
+            f"{bool(shape_fitting_state.valid)} init={bool(shape_fitting_state.initialized)} "
+            f"template={shape_fitting_state.template_id or '-'} "
+            f"scale={'-' if shape_fitting_state.scale is None else f'{shape_fitting_state.scale:.3f}'}"
+        ),
+        (
+            "shape_fit_reason="
+            f"{shape_fitting_state.reason} raw_points={raw_merged_object.merged_point_count} "
+            f"fitted_points={len(np.asarray(shape_fitting_state.fitted_points_base, dtype=np.float32).reshape((-1, 3)))}"
+        ),
         f"hand={bool(selected_hand.valid)} cam={selected_hand.selected_camera} handed={selected_hand.handedness}",
-        f"grasp_valid={bool(grasp_target.valid)} grasp={format_vec3(grasp_target.target_position_base)}",
+        (
+            "grasp_valid="
+            f"{bool(grasp_target.valid)} grasp={format_vec3(grasp_target.target_position_base)} "
+            f"grasp_hold={bool(getattr(grasp_target, 'used_temporal_hold', False))} "
+            f"cand_idx={int(getattr(grasp_target, 'selected_candidate_index', -1))} "
+            f"xy_lock={bool(getattr(grasp_target, 'xy_locked_to_centroid', False))}"
+        ),
         f"object={format_vec3(object_point)}",
         f"hand={format_vec3(hand_point)}",
     ]
@@ -2160,13 +2223,15 @@ def main():
                 object_cam1,
                 hand_approach_detected=previous_hand_approach,
             )
+            shape_fitting_state = pipeline["shape_fitting_tracker"].process(merged_object)
+            fitted_merged_object = build_fitted_merged_object(merged_object, shape_fitting_state)
             fusion_state = pipeline["fusion"].process_states(
-                merged_object,
+                fitted_merged_object,
                 selected_hand,
                 now_timestamp=current_time,
             )
             grasp_target = pipeline["grasp_planner"].process_states(
-                merged_object,
+                fitted_merged_object,
                 selected_hand,
                 fusion_state,
             )
@@ -2174,7 +2239,7 @@ def main():
                 fusion_state.hand_approach_detected or fusion_state.hand_approach_latched
             )
 
-            object_point_base = choose_point(fusion_state.filtered_object_centroid_base, merged_object.centroid_base)
+            object_point_base = choose_point(fusion_state.filtered_object_centroid_base, fitted_merged_object.centroid_base)
             grasp_point_base = grasp_target.target_position_base if grasp_target.valid else None
             object_pixel = project_base_point_to_cam0(
                 object_point_base,
@@ -2200,7 +2265,7 @@ def main():
                             save_grasp_offset(controller, shared_state)
                             execute_return_and_place(controller, shared_state, args)
             else:
-                shared_state.clear_target(reset_prediction=True, reset_arm=True)
+                shared_state.clear_target()
 
             now = time.perf_counter()
             instant_fps = 1.0 / max(now - last_loop_time, 1e-6)
@@ -2210,7 +2275,9 @@ def main():
             annotated = render_cam0_perception_debug(
                 snapshot,
                 pipeline,
+                fitted_merged_object,
                 merged_object,
+                shape_fitting_state,
                 selected_hand,
                 fusion_state,
                 grasp_target,

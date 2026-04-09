@@ -28,6 +28,7 @@ from object_pt_extraction.segmentation_engine import (  # noqa: E402
     select_instances,
 )
 from perception.fdct_depth_completion import (  # noqa: E402
+    bilateral_filter_depth,
     FDCTDepthCompleter,
     FDCTDepthCompletionConfig,
 )
@@ -44,15 +45,25 @@ TEMPLATE_PATH = SCRIPT_DIR / "template_small.npy"
 TARGET_CLASSES = ["cup"]
 DEPTH_MIN_M = 0.30
 DEPTH_MAX_M = 1.50
+BILATERAL_ENABLED = True
+BILATERAL_RADIUS = 2
+BILATERAL_SIGMA_SPACE = 2.0
+BILATERAL_ZFAR = 100.0
 POINT_STRIDE = 2
 POINT_MAX_POINTS = 12000
 PER_CAMERA_VOXEL_SIZE_M = 0.004
 MERGE_VOXEL_SIZE_M = 0.010
 ICP_MAX_POINTS = 6000
+DBSCAN_EPS_M = 0.02
+DBSCAN_MIN_POINTS = 10
+TRACKING_CLUSTER_MAX_JUMP_M = 0.08
+SCALE_INIT_VALID_FRAMES = 8
+ROBUST_EXTENT_LOW_PERCENTILE = 5.0
+ROBUST_EXTENT_HIGH_PERCENTILE = 95.0
+MIN_TEMPLATE_SCALE = 0.5
+MAX_TEMPLATE_SCALE = 1.8
 RESET_REALSENSE_ON_EXIT = False
-
-DISPLAY_TRANSFORM = np.asarray(
-    [[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]],
+q],
     dtype=np.float64,
 )
 
@@ -159,37 +170,89 @@ def limit_point_count(points: np.ndarray, max_points: int) -> np.ndarray:
     return points[sample_indices]
 
 
-def filter_pcd(points: np.ndarray, target_num: int = 3) -> np.ndarray:
+def compute_robust_extent(
+    points: np.ndarray,
+    low_percentile: float = ROBUST_EXTENT_LOW_PERCENTILE,
+    high_percentile: float = ROBUST_EXTENT_HIGH_PERCENTILE,
+) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float32).reshape((-1, 3))
+    if len(points) == 0:
+        return np.zeros((3,), dtype=np.float32)
+
+    lower = np.percentile(points, low_percentile, axis=0)
+    upper = np.percentile(points, high_percentile, axis=0)
+    return (upper - lower).astype(np.float32)
+
+
+def translate_points_to_centroid(points: np.ndarray, target_centroid: np.ndarray) -> np.ndarray:
     points = np.asarray(points, dtype=np.float64).reshape((-1, 3))
     if len(points) == 0:
         return points
+
+    current_centroid = np.mean(points, axis=0)
+    translation = np.asarray(target_centroid, dtype=np.float64).reshape(3) - current_centroid
+    return points + translation.reshape(1, 3)
+
+
+def scale_template_points(template_points: np.ndarray, uniform_scale: float) -> np.ndarray:
+    template_points = np.asarray(template_points, dtype=np.float64).reshape((-1, 3))
+    if len(template_points) == 0:
+        return template_points
+
+    centroid = np.mean(template_points, axis=0, keepdims=True)
+    return (template_points - centroid) * float(uniform_scale) + centroid
+
+
+def filter_pcd(points: np.ndarray, prev_centroid: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray | None]:
+    points = np.asarray(points, dtype=np.float64).reshape((-1, 3))
+    if len(points) == 0:
+        return points, None
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)
 
     print("Running DBSCAN clustering...")
-    labels = np.array(pcd.cluster_dbscan(eps=0.02, min_points=10, print_progress=False))
+    labels = np.array(
+        pcd.cluster_dbscan(
+            eps=DBSCAN_EPS_M,
+            min_points=DBSCAN_MIN_POINTS,
+            print_progress=False,
+        )
+    )
     valid_cluster_ids = np.unique(labels[labels >= 0])
     num_clusters = len(valid_cluster_ids)
     print(f"Found {num_clusters} valid clusters.")
 
     if num_clusters == 0:
         print("No valid DBSCAN clusters. Skipping this frame.")
-        return np.empty((0, 3), dtype=np.float64)
+        return np.empty((0, 3), dtype=np.float64), None
 
-    if num_clusters <= target_num:
-        print(f"Already at {num_clusters} clusters. Removing noise and keeping everything else.")
-        keep_ids = valid_cluster_ids
-    else:
-        mean_x_values = np.array([np.mean(points[labels == cluster_id, 0]) for cluster_id in valid_cluster_ids])
-        sorted_indices = np.argsort(mean_x_values)
-        keep_indices = sorted_indices[-target_num:]
-        keep_ids = valid_cluster_ids[keep_indices]
-        print(f"Keeping clusters {keep_ids} (Highest X). Removed {num_clusters - target_num} clusters.")
+    cluster_points = {cluster_id: points[labels == cluster_id] for cluster_id in valid_cluster_ids}
+    cluster_counts = {cluster_id: len(cluster_pts) for cluster_id, cluster_pts in cluster_points.items()}
+    cluster_centroids = {
+        cluster_id: np.mean(cluster_pts, axis=0)
+        for cluster_id, cluster_pts in cluster_points.items()
+    }
 
-    mask = np.isin(labels, keep_ids)
-    final_objects = pcd.select_by_index(np.where(mask)[0])
-    return np.asarray(final_objects.points)
+    selected_cluster_id = max(cluster_counts, key=cluster_counts.get)
+    selection_reason = "largest cluster"
+    if prev_centroid is not None:
+        prev_centroid = np.asarray(prev_centroid, dtype=np.float64).reshape(3)
+        closest_cluster_id = min(
+            cluster_centroids,
+            key=lambda cluster_id: np.linalg.norm(cluster_centroids[cluster_id] - prev_centroid),
+        )
+        closest_distance = float(np.linalg.norm(cluster_centroids[closest_cluster_id] - prev_centroid))
+        if closest_distance <= TRACKING_CLUSTER_MAX_JUMP_M:
+            selected_cluster_id = closest_cluster_id
+            selection_reason = f"closest cluster ({closest_distance:.3f} m)"
+        else:
+            selection_reason = f"largest cluster (closest was {closest_distance:.3f} m away)"
+
+    print(f"Selected cluster {selected_cluster_id} using {selection_reason}.")
+    selected_points = cluster_points[selected_cluster_id].astype(np.float64)
+    selected_centroid = cluster_centroids[selected_cluster_id].astype(np.float64)
+    return selected_points, selected_centroid
 
 
 def scale_template(template: o3d.geometry.PointCloud, pcd: o3d.geometry.PointCloud) -> np.ndarray:
@@ -305,6 +368,22 @@ def process_camera_frame(
             status="fdct_failed",
         )
 
+    filtered_depth_m = fdct_result.completed_depth_m.astype(np.float32, copy=False)
+    bilateral_status = "off"
+    if BILATERAL_ENABLED:
+        try:
+            filtered_depth_m = bilateral_filter_depth(
+                filtered_depth_m,
+                radius=BILATERAL_RADIUS,
+                zfar=BILATERAL_ZFAR,
+                sigma_space=BILATERAL_SIGMA_SPACE,
+            )
+            bilateral_status = "on"
+        except Exception as exc:
+            print(f"[WARN] cam{camera_id} bilateral filter failed; using FDCT output: {exc}")
+            filtered_depth_m = fdct_result.completed_depth_m.astype(np.float32, copy=False)
+            bilateral_status = "fallback"
+
     segmentation_result = segmentation_engine.predict(frame_bundle.color_image)
     selected_instances = select_instances(
         segmentation_result.instances,
@@ -314,7 +393,7 @@ def process_camera_frame(
     combined_mask = combine_instance_masks(selected_instances, frame_bundle.color_image.shape)
     points_camera, colors_rgb = build_fdct_demo_style_point_cloud(
         color_bgr=frame_bundle.color_image,
-        depth_m=fdct_result.completed_depth_m,
+        depth_m=filtered_depth_m,
         object_mask=combined_mask,
         intrinsics=frame_bundle.intrinsics,
         depth_min=DEPTH_MIN_M,
@@ -337,7 +416,7 @@ def process_camera_frame(
         [
             f"cam{camera_id} serial: {frame_bundle.serial}",
             format_instance_summary(selected_instances),
-            f"seg: {segmentation_result.infer_ms:.1f} ms | fdct: {fdct_result.elapsed_ms:.1f} ms",
+            f"seg: {segmentation_result.infer_ms:.1f} ms | fdct: {fdct_result.elapsed_ms:.1f} ms | bilateral: {bilateral_status}",
             f"points_base: {len(points_base)} | {'ok' if valid else 'no_object_points'}",
         ],
     )
@@ -358,6 +437,31 @@ def load_template_cloud() -> tuple[o3d.geometry.PointCloud, np.ndarray]:
     template_pcd.paint_uniform_color([0.0, 0.0, 0.0])
     template_pcd.transform(DISPLAY_TRANSFORM)
     return template_pcd, np.asarray(template_pcd.points).copy()
+
+
+def initialize_template_from_buffer(
+    original_template_points: np.ndarray,
+    extent_buffer: list[np.ndarray],
+    target_centroid_display: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    median_extent = np.median(np.asarray(extent_buffer, dtype=np.float64), axis=0)
+    source_extent = compute_robust_extent(
+        np.asarray(original_template_points, dtype=np.float32),
+        low_percentile=0.0,
+        high_percentile=100.0,
+    ).astype(np.float64)
+
+    valid_axes = source_extent > 1e-6
+    if not np.any(valid_axes):
+        return np.asarray(original_template_points, dtype=np.float64).copy(), 1.0
+
+    raw_axis_scales = median_extent[valid_axes] / source_extent[valid_axes]
+    uniform_scale = float(np.median(raw_axis_scales))
+    uniform_scale = float(np.clip(uniform_scale, MIN_TEMPLATE_SCALE, MAX_TEMPLATE_SCALE))
+
+    scaled_points = scale_template_points(original_template_points, uniform_scale)
+    scaled_points = translate_points_to_centroid(scaled_points, target_centroid_display)
+    return scaled_points.astype(np.float64), uniform_scale
 
 
 def main() -> None:
@@ -389,6 +493,9 @@ def main() -> None:
         vis.add_geometry(mesh_frame)
 
         template_scaled = False
+        tracked_cluster_centroid = None
+        scale_extent_buffer: list[np.ndarray] = []
+        frozen_template_scale = None
         print("Dual-camera shape fitting is running. Press q or ESC to quit.")
 
         while True:
@@ -415,12 +522,12 @@ def main() -> None:
                     min_neighbors=8,
                 )
                 merged_points = limit_point_count(merged_points, ICP_MAX_POINTS)
-                filtered_points = filter_pcd(merged_points)
+                filtered_points, tracked_cluster_centroid = filter_pcd(merged_points, tracked_cluster_centroid)
                 merge_status = (
                     f"merged: {merge_stats['raw_summary']['point_count']} -> "
                     f"{merge_stats['voxel_summary']['point_count']} -> "
                     f"{merge_stats['filtered_summary']['point_count']} | "
-                    f"dbscan: {len(filtered_points)}"
+                    f"cluster: {len(filtered_points)}"
                 )
 
                 if len(filtered_points) > 0:
@@ -434,17 +541,39 @@ def main() -> None:
                     else:
                         vis.update_geometry(live_pcd)
 
+                    filtered_points_display = np.asarray(live_pcd.points)
+                    filtered_centroid_display = np.mean(filtered_points_display, axis=0)
+
                     if not template_scaled:
-                        template_pcd.points = o3d.utility.Vector3dVector(original_template_points.copy())
-                        scaled_template = scale_template(template_pcd, live_pcd)
-                        template_pcd.points = o3d.utility.Vector3dVector(scaled_template)
-                        vis.update_geometry(template_pcd)
-                        template_scaled = True
-                        vis.get_view_control().set_zoom(0.8)
+                        robust_extent = compute_robust_extent(filtered_points.astype(np.float32))
+                        if np.all(robust_extent > 1e-5):
+                            scale_extent_buffer.append(robust_extent)
+                        merge_status += f" | init_scale: {len(scale_extent_buffer)}/{SCALE_INIT_VALID_FRAMES}"
+
+                        if len(scale_extent_buffer) >= SCALE_INIT_VALID_FRAMES:
+                            initialized_template, frozen_template_scale = initialize_template_from_buffer(
+                                original_template_points=original_template_points,
+                                extent_buffer=scale_extent_buffer,
+                                target_centroid_display=filtered_centroid_display,
+                            )
+                            template_pcd.points = o3d.utility.Vector3dVector(initialized_template)
+                            vis.update_geometry(template_pcd)
+                            template_scaled = True
+                            merge_status += f" | scale={frozen_template_scale:.3f}"
+                            vis.get_view_control().set_zoom(0.8)
                     else:
-                        final_transform = run_open3d_icp(template_pcd, live_pcd)
-                        template_pcd.transform(final_transform)
+                        translated_template = translate_points_to_centroid(
+                            np.asarray(template_pcd.points),
+                            filtered_centroid_display,
+                        )
+                        template_pcd.points = o3d.utility.Vector3dVector(translated_template.astype(np.float64))
                         vis.update_geometry(template_pcd)
+                        if frozen_template_scale is not None:
+                            merge_status += f" | scale={frozen_template_scale:.3f} | translation-only"
+                else:
+                    tracked_cluster_centroid = None
+            else:
+                tracked_cluster_centroid = None
 
             latency = time.time() - start
             fps = 1.0 / latency if latency > 0 else 0.0

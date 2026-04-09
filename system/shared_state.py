@@ -160,6 +160,10 @@ class GraspTargetState(BaseState):
     hand_height_clearance_m: float | None = None
     distance_to_centroid_m: float | None = None
     source_point_count: int = 0
+    selected_candidate_index: int = -1
+    used_temporal_hold: bool = False
+    xy_locked_to_centroid: bool = False
+    dropout_hold_active: bool = False
 
 
 @dataclass
