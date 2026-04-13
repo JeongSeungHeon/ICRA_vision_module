@@ -1,0 +1,136 @@
+{
+  "submission_version": "1.0",
+  "submission_timestamp": "2026-04-13T08:23:58.210Z",
+  "protocol_version": "1.0.0",
+  "team": "TEAM_NAME",
+  "ethics": {
+    "local_ethics_approval_obtained": true,
+    "ethics_approval_reference": "",
+    "informed_consent_obtained": true,
+    "video_recording_consent": true,
+    "video_sharing_consent": true,
+    "video_publication_consent": false,
+    "demographics_provided": true,
+    "notes": "All participants were informed about the purpose of the study and their rights."
+  },
+  "participants": {
+    "num_human_subjects": 4,
+    "subject_ids": [
+      "S1",
+      "S2",
+      "S3",
+      "S4"
+    ],
+    "demographics": {
+      "S1": {
+        "age_group": "",
+        "gender": "",
+        "dominant_hand": "",
+        "experience_level": ""
+      },
+      "S2": {
+        "age_group": "",
+        "gender": "",
+        "dominant_hand": "",
+        "experience_level": ""
+      },
+      "S3": {
+        "age_group": "",
+        "gender": "",
+        "dominant_hand": "",
+        "experience_level": ""
+      },
+      "S4": {
+        "age_group": "",
+        "gender": "",
+        "dominant_hand": "",
+        "experience_level": ""
+      }
+    },
+    "instructions_given": "Subjects instructed to handover the cup naturally, standing opposite the robot across the table.",
+    "notes": "Demographic fields are optional and should not include personally identifiable information."
+  },
+  "hardware": {
+    "arm_model": "",
+    "dof": null,
+    "gripper_model": "",
+    "controller": "",
+    "mounting": "",
+    "sensors": {
+      "force_torque": false,
+      "gripper_pressure": false,
+      "tactile_sensors": false,
+      "vision_sensors": true
+    }
+  },
+  "environment": {
+    "sensing_setup_description": "",
+    "table_dimensions_mm": [
+      1200,
+      800,
+      750
+    ],
+    "illumination": {
+      "artificial_lights_used": false,
+      "light_positions": []
+    },
+    "camera_setup": {
+      "side_cameras": [],
+      "overhead_camera": {}
+    },
+    "calibration_notes": "",
+    "notes": ""
+  },
+  "software_and_models": {
+    "vision_geometry_model": {
+      "name": "",
+      "version": ""
+    },
+    "vision_mass_model": {
+      "name": "",
+      "version": ""
+    },
+    "vision_fill_level_model": {
+      "name": "",
+      "version": ""
+    },
+    "robot_mass_estimation_method": ""
+  },
+  "annotation_protocol": {
+    "timing_annotation_method": "manual_video_annotation",
+    "annotator_training": "",
+    "video_fps": 30,
+    "video_annotation_used": false,
+    "video_annotation_description": ""
+  },
+  "configuration_file": {
+    "filename": "benchmark_configs.csv",
+    "num_configurations": 288,
+    "subject_id_semantics": "Subject IDs refer to the team's own volunteers performing the handovers."
+  },
+  "physical_assumptions": {
+    "density_rice_g_per_ml": 0.81,
+    "placement_reference_frame": "cup_initial_position_center_of_base"
+  },
+  "learning_policy": {
+    "online_learning": false,
+    "cross_configuration_adaptation": false,
+    "model_updated_during_benchmark": false,
+    "note": "We do not allow learning across configurations."
+  },
+  "execution_policy": {
+    "num_configurations": 288,
+    "runs_per_configuration": 1,
+    "video_recording_required": true,
+    "delivery_location_policy": "same_as_initial_location",
+    "target_delivery_location": [
+      500.0,
+      300.0,
+      0.0
+    ],
+    "end_effector_reachability": [
+      800.0,
+      600.0
+    ]
+  }
+}

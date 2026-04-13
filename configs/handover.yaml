@@ -85,14 +85,14 @@ perception:
     stale_timeout_sec: 0.30
   depth_completion:
     fdct:
-      enabled: true
+      enabled: false
       cameras: both
       checkpoint: FDCT/TransCG.tar
       device: auto
       net_width: 320
       net_height: 240
       depth_min: 0.30
-      depth_max: 1.50
+      depth_max: 1.70
       depth_norm: 1.0
       depth_coeff: 10.0
       inpaint: true
@@ -104,11 +104,11 @@ perception:
       debug_stats: false
       debug_every: 30
   object:
-    target_label: cup, wine_glass
-    confidence_threshold: 0.50
+    target_label: cup ## 의미 없음
+    confidence_threshold: 0.25
     segmentation:
-      model_name: yoloe-26x-seg.pt
-      prompt_classes: [cup, wine_glass]
+      model_name: yoloe-26l-seg.pt
+      prompt_classes: ["cup", "wine glass"]
       imgsz: 640
       conf: 0.25
       iou: 0.45
@@ -118,7 +118,7 @@ perception:
       half: false
       retina_masks: true
       selection_mode: highest_score
-      selection_class_names: [cup, wine_glass]
+      selection_class_names: ["cup", "wine glass"] # 어떤걸로 선택할지 모호할 때 이 클래스 우선 선택
       preprocess:
         enabled: false
         contrast_alpha: 1.0
@@ -132,7 +132,7 @@ perception:
       stride: 2
       max_points: 20000
       min_depth_m: 0.10
-      max_depth_m: 1.50
+      max_depth_m: 1.70
       per_camera_voxel_size_m: 0.005
       outlier_method: statistical
       outlier_nb_neighbors: 20
@@ -141,6 +141,16 @@ perception:
       outlier_min_neighbors: 8
       min_points_per_camera: 300
     merged_voxel_size_m: 0.006
+  fill_level_estimation:
+    roi_shrink_x: 0.18
+    roi_shrink_top: 0.08
+    roi_shrink_bottom: 0.05
+    profile_k: 3
+    rice_top_bias_px: 5
+    bottom_center_offset_px: 5
+    min_depth_m: 0.05
+    max_valid_depth_m: 1.8
+    depth_patch_half: 4
   hand:
     target_fps: 30
     detector:
@@ -150,7 +160,7 @@ perception:
     depth_lifting:
       patch_radius: 2
       min_depth_m: 0.10
-      max_depth_m: 1.20
+      max_depth_m: 1.70
       min_valid_keypoints: 4
     smoothing_window_frames: 5
     velocity_alpha: 0.5
@@ -177,9 +187,9 @@ perception:
         template_id: cup_canonical
         asset_path: shape_fitting/template.npy
         unit_scale_m: 0.001
-      wine_glass:
+      wine glass:
         template_id: wine_glass_canonical
-        asset_path: shape_fitting/template_small.npy
+        asset_path: shape_fitting/wine_glass.npy
         unit_scale_m: 0.001
     scale_estimation:
       stable_frames: 5
@@ -204,11 +214,11 @@ perception:
     template_library:
       cup:
         template_id: cup_shape_fit
-        asset_path: shape_fitting/template_small.npy
+        asset_path: shape_fitting/template.npy
         unit_scale_m: 0.001
-      wine_glass:
+      wine glass:
         template_id: wine_glass_shape_fit
-        asset_path: shape_fitting/template_small.npy
+        asset_path: shape_fitting/wine_glass.npy
         unit_scale_m: 0.001
     cluster:
       dbscan_eps_m: 0.02
@@ -222,6 +232,20 @@ perception:
       max_scale: 1.8
     tracking:
       min_cluster_extent_m: 1.0e-5
+    icp:
+      max_points: 3500
+      max_iterations: 10
+      distance_threshold_m: 0.15
+      min_fitness: 0.02
+      translation_tolerance_m: 1.0e-5
+      max_centroid_jump_m: 0.25
+      crop:
+        enabled: true
+        height_axis_index: 2
+        target_top_fraction: 0.08
+        source_top_fraction:
+        min_points_after_crop: 80
+        min_height_extent_m: 0.01
     downsample:
       voxel_size_m: 0.004
       max_points: 6000
@@ -240,6 +264,12 @@ grasp:
   candidate_search_radius_from_centroid_m: 0.07
   min_hand_height_clearance_m: 0.05
   no_candidate_action: hold
+  hand_relative_fallback:
+    enabled: true
+    lock_frames: 5
+    max_dropout_sec: 1.0
+    require_hand_approach: true
+    require_motion_triggered: true
   target_selection:
     enabled: true
     switch_margin: 0.01
@@ -252,7 +282,7 @@ grasp:
 # Orientation reuses grasp.fixed_orientation_base (same RPY).
 home_pose:
   enabled: true
-  position_m: [0.478, 0.102, 0.478]   # x=478mm, y=102mm, z=478mm
+  position_m: [-0.292, -0.110, -0.030]   # x, y, z
   move_speed_mps: 0.05                 # slow, safe home motion
   move_acceleration: 0.10
 
@@ -298,7 +328,7 @@ robot:
     use_mock_fallback: true
     force_mock: false
     move_asynchronous: true
-    move_acceleration: 0.20
+    move_acceleration: 0.30
     servo_velocity: 0.05
     servo_acceleration: 0.20
     servo_lookahead_time: 0.10
@@ -306,7 +336,7 @@ robot:
     stop_acceleration: 1.0
   # 로봇 동작 속도 조절
   motion:
-    approach_speed_mps: 0.20
+    approach_speed_mps: 0.35
     retreat_speed_mps: 0.18
     max_translation_step_m: 0.05
   gripper:
@@ -321,7 +351,7 @@ robot:
     open_force: 255
     close_speed: 255
     close_force: 255
-    position_complete_threshold: 100
+    position_complete_threshold: 40
     debug: true
     output_domain: tool              # Fallback only when control_mode is not socket
     open_digital_output: 1
@@ -351,3 +381,25 @@ safety:
   stop_on_stale_perception: false     # runner에서 wall clock timestamp로 통일 후 활성화 가능
   stop_on_invalid_calibration: true
   stop_on_missing_grasp_target: true
+
+benchmark:
+  s8:
+    team_name: TEAM_NAME
+    run_id: 1
+    horizontal_reach_mm: 800.0
+    vertical_reach_mm: 600.0
+    repetitions: 3
+    max_motion_time_ms: 5000
+    target_hold_sec: 1.5
+    output_dir: output/benchmark
+    submission_csv_name: s8_submission_{team_name}.csv
+    metadata_json_path: output/benchmark/metadata_{team_name}.json
+    metadata_template_path: benchmarks/metadata_template.json
+    init_position_tolerance_mm: 15.0
+    init_orientation_tolerance_deg: 10.0
+    orientation:
+      mode: look_at_center
+      tool_forward_axis: x+
+      tool_up_axis: z+
+      world_up_axis_hint: z+
+      roll_offset_deg: 0.0

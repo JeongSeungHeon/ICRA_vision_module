@@ -32,6 +32,7 @@ from perception.fdct_depth_completion import (
 )
 from perception.fusion import PerceptionFusion
 from perception.grasp_target import GraspTargetPlanner
+from perception.hand_relative_fallback import HandRelativeFallbackTracker
 from perception.hand_selector import HandSelector
 from perception.hand_worker import HandWorkerCam0, HandWorkerCam1
 from perception.object_merger import ObjectMerger
@@ -50,6 +51,7 @@ from system.shared_state import (
     ROBOT_CMD_STOP,
     RobotCommandState,
 )
+from utils.handover_metadata import HandoverMetadataRecorder
 from utils.realsense_stream import list_realsense_serials
 
 
@@ -66,12 +68,12 @@ DEFAULT_WORKSPACE_MM = {
 
 # object motion trigger
 REFERENCE_LOCK_COUNT = 8
-MOTION_TRIGGER_MM = 15.0
+MOTION_TRIGGER_MM = 30.0
 
 # control loop
 DEFAULT_CONTROL_HZ = 30.0
-MAX_XY_SPEED_MM_S = 150.0 # 80
-MAX_Z_SPEED_MM_S = 150.0  # 80
+MAX_XY_SPEED_MM_S = 200.0 # 80
+MAX_Z_SPEED_MM_S = 250.0  # 80
 
 # EEF target offset from detected object center (robot base frame)
 EEF_X_OFFSET_MM = -270.0
@@ -87,7 +89,7 @@ GRIPPER_FORCE_STOP_DELTA_N = 10.0
 GRIPPER_FORCE_STOP_MIN_ELAPSED_S = 0.12
 DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD = 200
 BASE_POSE = {
-    "x": 258.0,
+    "x": 208.0,
     "y": 102.0,
     "z": 308.0,
     "roll": 90.0,
@@ -654,6 +656,56 @@ def mm_to_m_tuple(values):
     return tuple(float(v) for v in vec)
 
 
+def compute_dynamic_eef_target(reference_xyz_mm, eef_xyz_mm):
+    reference_xyz_mm = np.asarray(reference_xyz_mm, dtype=np.float32).reshape(3)
+    eef_xyz_mm = np.asarray(eef_xyz_mm, dtype=np.float32).reshape(3)
+
+    dist_xy = float(np.linalg.norm(reference_xyz_mm[:2] - eef_xyz_mm[:2]))
+    far_offset_x = EEF_X_OFFSET_MM
+    near_offset_x = 0.0
+    near_d = 40.0
+    far_d = abs(float(EEF_X_OFFSET_MM)) + near_d
+
+    if dist_xy >= far_d:
+        offset_x = far_offset_x
+    elif dist_xy <= near_d:
+        offset_x = near_offset_x
+    else:
+        t = (dist_xy - near_d) / max(far_d - near_d, 1e-6)
+        offset_x = t * far_offset_x + (1.0 - t) * near_offset_x
+
+    target_xyz_mm = reference_xyz_mm.copy()
+    target_xyz_mm[0] += offset_x
+    target_xyz_mm[1] += EEF_Y_OFFSET_MM
+    return target_xyz_mm.astype(np.float32), float(offset_x), dist_xy
+
+
+def get_close_range_step_mm(ref_err_xyz, max_step_mm, max_step_z_mm):
+    dist_xy = float(np.linalg.norm(np.asarray(ref_err_xyz, dtype=np.float32)[:2]))
+    if dist_xy < 55.0:
+        return 5, 2.2, dist_xy
+    return float(max_step_mm), float(max_step_z_mm), dist_xy
+
+
+def compute_close_range_ref_step_xyz(ref_err_xyz, max_step_xy, max_step_z, *, follow_z):
+    ref_err_xyz = np.asarray(ref_err_xyz, dtype=np.float32).reshape(3)
+    ref_step_xyz = np.zeros(3, dtype=np.float32)
+    dist_xy = float(np.linalg.norm(ref_err_xyz[:2]))
+    dominant_axis = None
+
+    # Stage the final XY approach along one axis to reduce diagonal tip collisions.
+    if dist_xy < 65.0 and abs(float(ref_err_xyz[0])) > 15.0 and abs(float(ref_err_xyz[1])) > 15.0:
+        dominant_axis = 0 if abs(float(ref_err_xyz[0])) >= abs(float(ref_err_xyz[1])) else 1
+        ref_step_xyz[dominant_axis] = np.clip(ref_err_xyz[dominant_axis], -max_step_xy, max_step_xy)
+    else:
+        ref_step_xyz[0:2] = np.clip(ref_err_xyz[0:2], -max_step_xy, max_step_xy)
+
+    if follow_z:
+        ref_step_xyz[2] = np.clip(ref_err_xyz[2], -max_step_z, max_step_z)
+
+    return ref_step_xyz, dominant_axis
+
+
 def rpy_degrees_to_rotvec(roll_deg, pitch_deg, yaw_deg):
     roll, pitch, yaw = np.deg2rad([roll_deg, pitch_deg, yaw_deg])
     cx, sx = np.cos(roll), np.sin(roll)
@@ -802,6 +854,7 @@ class FollowSharedState:
         self.follow_enabled = args.enable_follow
         self.latest_target_xyz_mm = None
         self.latest_grasp_xyz_mm = None
+        self.latest_measurement_source = "none"
         self.latest_target_t = 0.0
         self.last_measured_target_xyz_mm = None
         self.last_measured_target_t = 0.0
@@ -890,6 +943,7 @@ class FollowSharedState:
         with self.lock:
             self.latest_target_xyz_mm = None
             self.latest_grasp_xyz_mm = None
+            self.latest_measurement_source = "none"
             self.valid_detection_streak = 0
             self.reference_streak = 0
             self.control_target_xyz_mm = None
@@ -912,6 +966,7 @@ class FollowSharedState:
             self.follow_enabled = bool(follow_enabled)
             self.latest_target_xyz_mm = None
             self.latest_grasp_xyz_mm = None
+            self.latest_measurement_source = "none"
             self.latest_target_t = 0.0
             self.last_measured_target_xyz_mm = None
             self.last_measured_target_t = 0.0
@@ -951,20 +1006,39 @@ class FollowSharedState:
     def wait_for_follow_idle(self, timeout_s):
         return self.follow_idle_event.wait(timeout=max(float(timeout_s), 0.0))
 
-    def update_target(self, grasp_xyz_m, object_xyz_m=None, pixel_xy=None):
+    def update_target(self, grasp_xyz_m, object_xyz_m=None, pixel_xy=None, eef_xyz_mm=None, measurement_source="measured"):
         if object_xyz_m is None:
-            self.clear_target()
+            self.clear_target(reset_prediction=False, reset_arm=False)
             return
+
+        measurement_source = str(measurement_source or "measured").strip().lower()
+        if measurement_source not in {"measured", "hand_fallback"}:
+            measurement_source = "measured"
 
         object_xyz_mm = np.asarray(object_xyz_m, dtype=np.float32)[:3] * 1000.0
         object_xy_mm = object_xyz_mm[:2].copy()
         grasp_xyz_mm = None
+        tracking_reference_xyz_mm = object_xyz_mm.copy()
         target_xyz_mm = None
         if grasp_xyz_m is not None:
             grasp_xyz_mm = np.asarray(grasp_xyz_m, dtype=np.float32)[:3] * 1000.0
-            target_xyz_mm = grasp_xyz_mm.copy()
+            tracking_reference_xyz_mm = grasp_xyz_mm.copy()
+
+        if eef_xyz_mm is None:
+            target_xyz_mm = tracking_reference_xyz_mm.copy()
             target_xyz_mm[0] += EEF_X_OFFSET_MM
             target_xyz_mm[1] += EEF_Y_OFFSET_MM
+        else:
+            target_xyz_mm, dynamic_offset_x, dist_xy = compute_dynamic_eef_target(
+                tracking_reference_xyz_mm,
+                eef_xyz_mm,
+            )
+            if self.args.verbose_robot:
+                target_kind = "grasp" if grasp_xyz_mm is not None else "object"
+                print(
+                    f"[ROBOT] tracking={target_kind}, dynamic_offset_x={dynamic_offset_x:.1f} mm, "
+                    f"eef_target_dist_xy={dist_xy:.1f} mm"
+                )
 
         self.try_lock_home_pose(object_xyz_mm, pixel_xy)
         self.update_stop_state(object_xyz_mm)
@@ -973,6 +1047,7 @@ class FollowSharedState:
             current_perf = time.perf_counter()
             self.latest_object_xyz_mm = object_xyz_mm.copy()
             self.latest_grasp_xyz_mm = None if grasp_xyz_mm is None else grasp_xyz_mm.copy()
+            self.latest_measurement_source = measurement_source
 
             if not self.reference_locked:
                 self.reference_streak += 1
@@ -991,19 +1066,19 @@ class FollowSharedState:
                 self.motion_triggered = True
                 print(f"[INFO] Object motion detected: {move_dist_mm:.2f} mm -> follow start")
 
-            if target_xyz_mm is None:
-                self.latest_target_xyz_mm = None
-                self.valid_detection_streak = 0
-                return
-
             self.latest_target_xyz_mm = target_xyz_mm.copy()
             self.valid_detection_streak += 1
             self.latest_target_t = current_perf
-            self.last_measured_target_xyz_mm = target_xyz_mm.copy()
-            self.last_measured_target_t = current_perf
+            if measurement_source == "measured":
+                self.last_measured_target_xyz_mm = target_xyz_mm.copy()
+                self.last_measured_target_t = current_perf
             if self.valid_detection_streak >= int(self.args.min_valid_count):
                 self.prediction_armed = True
-            if self.args.enable_target_prediction and self.task_state == "FOLLOW":
+            if (
+                measurement_source == "measured"
+                and self.args.enable_target_prediction
+                and self.task_state == "FOLLOW"
+            ):
                 self.target_predictor.update(target_xyz_mm, current_perf)
 
     def _refresh_tracking_targets_locked(self, now_perf):
@@ -1035,7 +1110,7 @@ class FollowSharedState:
         )
         if raw_is_fresh:
             self.control_target_xyz_mm = raw_target
-            self.target_source = "measured"
+            self.target_source = str(self.latest_measurement_source or "measured")
             return measurement_age_s
 
         predicted_is_valid = (
@@ -1059,6 +1134,7 @@ class FollowSharedState:
                 "follow_enabled": self.follow_enabled,
                 "latest_target_xyz_mm": None if self.latest_target_xyz_mm is None else self.latest_target_xyz_mm.copy(),
                 "latest_grasp_xyz_mm": None if self.latest_grasp_xyz_mm is None else self.latest_grasp_xyz_mm.copy(),
+                "measurement_source": self.latest_measurement_source,
                 "latest_target_t": self.latest_target_t,
                 "last_measured_target_xyz_mm": None if self.last_measured_target_xyz_mm is None else self.last_measured_target_xyz_mm.copy(),
                 "last_measured_target_t": self.last_measured_target_t,
@@ -1099,7 +1175,7 @@ class FollowSharedState:
 
         return [
             f"follow: {mode} | trigger: {trig} | stopped: {stopped}",
-            f"home: {home} | streak: {streak} | src: {snapshot['target_source']}",
+            f"home: {home} | streak: {streak} | src: {snapshot['target_source']} | raw: {snapshot['measurement_source']}",
             f"raw_mm: {raw_target}",
             f"ctrl_mm: {control_target} | pred_age: {prediction_age}",
         ]
@@ -1161,11 +1237,17 @@ class FollowSharedState:
         else:
             self.object_stopped = False
 
-    def should_start_pregrasp(self, controller, xy_thresh_mm=30.0):
+    def should_start_pregrasp(
+        self,
+        controller,
+        x_tol_mm=180.0,
+        y_tol_mm=30.0,
+        z_tol_mm=30.0,
+    ):
         snapshot = self.get_snapshot()
-        if not snapshot["object_stopped"] or snapshot["pregrasp_started"]:
-            return False
-        target_xyz = snapshot["control_target_xyz_mm"]
+        target_xyz = snapshot["latest_grasp_xyz_mm"]
+        if target_xyz is None:
+            target_xyz = snapshot["latest_object_xyz_mm"]
 
         if target_xyz is None:
             return False
@@ -1175,19 +1257,24 @@ class FollowSharedState:
         if cur_pose is None:
             return False
 
-        cur_x, cur_y = meters_to_mm(cur_pose[:3])[:2]
-        target_x, target_y = target_xyz[0], target_xyz[1]
-        dxy = float(np.linalg.norm(np.array([cur_x - target_x, cur_y - target_y], dtype=np.float32)))
+        eef_x, eef_y, eef_z = meters_to_mm(cur_pose[:3])
+        obj_x, obj_y, obj_z = target_xyz[:3]
 
-        if dxy < xy_thresh_mm:
-            with self.lock:
-                self.pregrasp_started = True
-                self._reset_prediction_locked(reset_arm=True)
-            print(f"[INFO] PREGRASP condition met. dxy={dxy:.1f}")
-            return True
+        dx = float(obj_x - eef_x)
+        dy = float(obj_y - eef_y)
+        dz = float(obj_z - eef_z)
 
-        print(f"[DEBUG] pregrasp check dxy={dxy:.1f}, thresh={xy_thresh_mm}")
-        return False
+        x_ok = abs(dx) <= x_tol_mm
+        y_ok = abs(dy) <= y_tol_mm
+        z_ok = abs(dz) <= z_tol_mm
+
+        # print(
+        #     f"[DEBUG] final grasp window | "
+        #     f"|dx|={abs(dx):.1f} <= {x_tol_mm:.1f} -> {x_ok}, "
+        #     f"|dy|={abs(dy):.1f} <= {y_tol_mm:.1f} -> {y_ok}, "
+        #     f"|dz|={abs(dz):.1f} <= {z_tol_mm:.1f} -> {z_ok}"
+        # )
+        return x_ok and y_ok and z_ok
 
 
 class TaskTargetLogger:
@@ -1354,7 +1441,7 @@ def robot_control_loop(controller, shared_state, args):
             active = False
         elif control_target_xyz_mm is None:
             active = False
-        elif target_source == "measured" and snap["valid_detection_streak"] < args.min_valid_count and not snap["prediction_armed"]:
+        elif target_source != "predicted" and snap["valid_detection_streak"] < args.min_valid_count and not snap["prediction_armed"]:
             active = False
         elif target_source == "predicted" and not snap["prediction_armed"]:
             active = False
@@ -1393,12 +1480,19 @@ def robot_control_loop(controller, shared_state, args):
             print(f"[INFO] ref_target initialized from current EEF xyz: {ref_target_xyz_mm}")
 
         ref_err_xyz = target_xyz_mm - ref_target_xyz_mm
-        ref_step_xyz = np.zeros(3, dtype=np.float32)
-        ref_step_xyz[0:2] = np.clip(ref_err_xyz[0:2], -max_step_mm, max_step_mm)
+        max_step_xy, max_step_z, dist_xy = get_close_range_step_mm(
+            ref_err_xyz,
+            max_step_mm,
+            max_step_z_mm,
+        )
+        ref_step_xyz, dominant_axis = compute_close_range_ref_step_xyz(
+            ref_err_xyz,
+            max_step_xy,
+            max_step_z,
+            follow_z=bool(args.follow_z),
+        )
 
-        if args.follow_z:
-            ref_step_xyz[2] = np.clip(ref_err_xyz[2], -max_step_z_mm, max_step_z_mm)
-        else:
+        if not args.follow_z:
             ref_target_xyz_mm[2] = fixed_z_mm
 
         ref_target_xyz_mm = ref_target_xyz_mm + ref_step_xyz
@@ -1429,7 +1523,10 @@ def robot_control_loop(controller, shared_state, args):
                     f"[ROBOT] source={target_source}, "
                     f"raw_mm={snap['latest_target_xyz_mm']}, "
                     f"control_mm={target_xyz_mm}, "
-                    f"ref_mm={ref_target_xyz_mm}, cmd_m={target_position_base}"
+                    f"ref_mm={ref_target_xyz_mm}, "
+                    f"close_range_dist_xy={dist_xy:.1f}, "
+                    f"stage_axis={'xy' if dominant_axis is None else ('x' if dominant_axis == 0 else 'y')}, "
+                    f"cmd_m={target_position_base}"
                 )
         except Exception as exc:
             print(f"[WARN] servo command failed: {exc}")
@@ -1500,7 +1597,7 @@ def move_robot_to_home_pose(controller, args):
     print("[INFO] HOME pose reached")
 
 
-def reset_system_to_start_state(controller, shared_state, args, target_logger=None):
+def reset_system_to_start_state(controller, shared_state, args, target_logger=None, metadata_recorder=None):
     print("[INFO] Reset requested: returning to startup state")
     if target_logger is not None:
         target_logger.abort_session("reset")
@@ -1518,6 +1615,9 @@ def reset_system_to_start_state(controller, shared_state, args, target_logger=No
 
     shared_state.reset_for_restart(follow_enabled=args.enable_follow)
     shared_state.set_fixed_pose_from_robot(controller)
+    if metadata_recorder is not None:
+        task_ready_timestamp = metadata_recorder.mark_task_ready(shared_state)
+        print(f"[INFO] Metadata task start timestamp={task_ready_timestamp}")
     shared_state.clear_follow_pause()
     print("[INFO] Reset complete. System is back at startup state.")
 
@@ -1572,7 +1672,7 @@ def execute_pregrasp_x_only(controller, shared_state, args):
     return True
 
 
-def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True):
+def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True, metadata_recorder=None):
     if verbose:
         print("[INFO] GRIPPER CLOSE start")
 
@@ -1650,6 +1750,10 @@ def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True)
                     controller.stop_gripper_motion()
                 except Exception as exc:
                     print(f"[WARN] Failed to stop gripper after force trigger: {exc}")
+            if metadata_recorder is not None:
+                first_contact_timestamp = metadata_recorder.note_robot_first_contact()
+                if first_contact_timestamp is not None:
+                    print(f"[INFO] Robot first contact timestamp={first_contact_timestamp}")
             delta_str = "n/a" if force_delta is None else f"{force_delta:.3f}"
             print(
                 f"[INFO] Force rise detected during close (abs={float(force_norm):.3f} N, delta={delta_str} N). "
@@ -1662,6 +1766,10 @@ def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True)
                     controller.stop_gripper_motion()
                 except Exception as exc:
                     print(f"[WARN] Failed to stop gripper after position trigger: {exc}")
+            if metadata_recorder is not None:
+                first_contact_timestamp = metadata_recorder.note_robot_first_contact()
+                if first_contact_timestamp is not None:
+                    print(f"[INFO] Robot first contact timestamp={first_contact_timestamp}")
             position_threshold = int(
                 getattr(controller, "gripper_position_complete_threshold", DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD)
             )
@@ -1680,7 +1788,11 @@ def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True)
     return False
 
 
-def execute_gripper_open(controller, dwell_s=0.5):
+def execute_gripper_open(controller, dwell_s=0.5, metadata_recorder=None):
+    if metadata_recorder is not None:
+        last_contact_timestamp = metadata_recorder.note_robot_last_contact()
+        if last_contact_timestamp is not None:
+            print(f"[INFO] Robot last contact timestamp={last_contact_timestamp}")
     send_robot_command(
         controller,
         ROBOT_CMD_HOLD,
@@ -1727,7 +1839,7 @@ def compute_place_target(shared_state):
     return home_xyz - grasp_offset
 
 
-def execute_return_and_place(controller, shared_state, args):
+def execute_return_and_place(controller, shared_state, args, metadata_recorder=None):
     target_eef_xyz = compute_place_target(shared_state)
     if target_eef_xyz is None:
         print("[WARN] Cannot compute place target.")
@@ -1769,24 +1881,14 @@ def execute_return_and_place(controller, shared_state, args):
             print(f"[WARN] Move timed out during {source_mode}.")
             return False
 
-    execute_gripper_open(controller, dwell_s=args.gripper_release_dwell_s)
-
-    safe_lift_z = hover_z + SAFE_LIFT_EXTRA_MM
-    safe_x, safe_y, safe_lift_z = clamp_pose_mm(hover_x, hover_y, safe_lift_z, args)
-    ok = move_robot_and_wait(
+    execute_gripper_open(
         controller,
-        mm_to_m_tuple([safe_x, safe_y, safe_lift_z]),
-        fixed_orientation_base,
-        timeout_s=args.move_timeout_s,
-        tolerance_m=args.position_tolerance_m,
-        source_mode="return_lift",
+        dwell_s=args.gripper_release_dwell_s,
+        metadata_recorder=metadata_recorder,
     )
-    if not ok:
-        print("[WARN] Retreat lift move timed out.")
-        return False
 
-    backoff_x = safe_x - BACKOFF_X_MM
-    backoff_x, backoff_y, backoff_z = clamp_pose_mm(backoff_x, safe_y, safe_lift_z, args)
+    backoff_x = place_x - BACKOFF_X_MM
+    backoff_x, backoff_y, backoff_z = clamp_pose_mm(backoff_x, place_y, place_z, args)
     ok = move_robot_and_wait(
         controller,
         mm_to_m_tuple([backoff_x, backoff_y, backoff_z]),
@@ -1827,7 +1929,15 @@ def execute_return_and_place(controller, shared_state, args):
             print("[WARN] Return to initial pose timed out.")
             return False
 
+    if metadata_recorder is not None:
+        home_xyz = None if shared_state.home_object_xyz_mm is None else shared_state.home_object_xyz_mm.copy()
+        metadata_recorder.note_delivery_location(home_xyz)
+
     shared_state.set_task_state("DONE", reset_prediction=True, reset_arm=True)
+    if metadata_recorder is not None:
+        csv_path = metadata_recorder.record_completion()
+        if csv_path is not None:
+            print(f"[INFO] Handover metadata appended: {csv_path}")
 
     print("[INFO] RETURN + PLACE done")
     return True
@@ -1873,6 +1983,7 @@ def build_dual_perception_pipeline(args):
     shape_fitting_tracker = ShapeFittingTracker.from_config(args.config)
     fusion = PerceptionFusion.from_config(args.config)
     grasp_planner = GraspTargetPlanner.from_config(args.config)
+    hand_relative_fallback = HandRelativeFallbackTracker.from_config(args.config)
     transform_chain = load_transform_chain(args.config)
     t_cam0_base = np.linalg.inv(transform_chain.t_base_cam0).astype(np.float32)
     t_cam1_base = np.linalg.inv(transform_chain.t_base_cam1).astype(np.float32)
@@ -1890,6 +2001,7 @@ def build_dual_perception_pipeline(args):
         "shape_fitting_tracker": shape_fitting_tracker,
         "fusion": fusion,
         "grasp_planner": grasp_planner,
+        "hand_relative_fallback": hand_relative_fallback,
         "transform_chain": transform_chain,
         "t_cam0_base": t_cam0_base,
         "t_cam1_base": t_cam1_base,
@@ -2014,6 +2126,7 @@ def render_camera_mask_preview(
     selected_hand,
     fusion_state,
     grasp_target,
+    display_grasp_point,
     *,
     camera_label,
 ):
@@ -2032,7 +2145,7 @@ def render_camera_mask_preview(
     camera_transform = pipeline["t_cam0_base"] if camera_label == "cam0" else pipeline["t_cam1_base"]
     hand_point = choose_point(fusion_state.filtered_hand_center_base, selected_hand.palm_center_base)
     draw_specs = [
-        (grasp_target.target_position_base if grasp_target.valid else None, (0, 255, 0), "grasp"),
+        (display_grasp_point, (0, 255, 0), "grasp"),
         (hand_point, (255, 120, 0), "hand"),
     ]
     for point_base, color_bgr, label in draw_specs:
@@ -2073,6 +2186,9 @@ def render_cam0_perception_debug(
     selected_hand,
     fusion_state,
     grasp_target,
+    display_object_point,
+    display_grasp_point,
+    hand_relative_fallback_state,
     shared_state,
     model_label,
     fps,
@@ -2097,15 +2213,16 @@ def render_cam0_perception_debug(
         max_points=1800,
     )
     if len(merged_pixels) > 0:
-        cloud_overlay = image_bgr.copy()
-        cloud_overlay[merged_pixels[:, 1], merged_pixels[:, 0]] = np.array([80, 255, 180], dtype=np.uint8)
-        image_bgr = cv.addWeighted(image_bgr, 0.78, cloud_overlay, 0.22, 0.0)
+        point_mask = np.zeros(image_bgr.shape[:2], dtype=np.uint8)
+        point_mask[merged_pixels[:, 1], merged_pixels[:, 0]] = 255
+        point_mask = cv.dilate(point_mask, np.ones((3, 3), dtype=np.uint8), iterations=1)
+        image_bgr[point_mask > 0] = np.array([0, 0, 255], dtype=np.uint8)
 
-    object_point = choose_point(fusion_state.filtered_object_centroid_base, merged_object.centroid_base)
+    object_point = display_object_point
     hand_point = choose_point(fusion_state.filtered_hand_center_base, selected_hand.palm_center_base)
     draw_specs = [
         (object_point, (0, 140, 255), "obj"),
-        (grasp_target.target_position_base if grasp_target.valid else None, (0, 255, 0), "grasp"),
+        (display_grasp_point, (0, 255, 0), "grasp"),
         (hand_point, (255, 120, 0), "hand"),
     ]
     for point_base, color_bgr, label in draw_specs:
@@ -2151,6 +2268,14 @@ def render_cam0_perception_debug(
             f"cand_idx={int(getattr(grasp_target, 'selected_candidate_index', -1))} "
             f"xy_lock={bool(getattr(grasp_target, 'xy_locked_to_centroid', False))}"
         ),
+        (
+            "hand_fallback="
+            f"{bool(getattr(hand_relative_fallback_state, 'valid', False))} "
+            f"obj={format_vec3(getattr(hand_relative_fallback_state, 'object_position_base', None))} "
+            f"grasp={format_vec3(getattr(hand_relative_fallback_state, 'grasp_position_base', None))} "
+            f"age={'-' if getattr(hand_relative_fallback_state, 'dropout_age_s', None) is None else f'{float(hand_relative_fallback_state.dropout_age_s):.3f}s'} "
+            f"reason={getattr(hand_relative_fallback_state, 'reason', None)}"
+        ),
         f"object={format_vec3(object_point)}",
         f"hand={format_vec3(hand_point)}",
     ]
@@ -2192,13 +2317,17 @@ def main():
     controller = None
     shared_state = FollowSharedState(args)
     target_logger = TaskTargetLogger(shared_state, args.target_log_dir, args.fps)
+    metadata_recorder = HandoverMetadataRecorder()
     target_logger.start()
     control_thread = None
+    active_task_epoch = None
 
     if args.enable_follow:
         controller = init_rtde(args)
         move_robot_to_home_pose(controller, args)
         shared_state.set_fixed_pose_from_robot(controller)
+        task_ready_timestamp = metadata_recorder.mark_task_ready(shared_state)
+        print(f"[INFO] Metadata task start timestamp={task_ready_timestamp}")
 
         control_thread = threading.Thread(
             target=robot_control_loop,
@@ -2210,6 +2339,14 @@ def main():
     try:
         while True:
             current_time = time.time()
+            loop_perf = time.perf_counter()
+            with shared_state.lock:
+                current_task_epoch = int(shared_state.task_epoch)
+                motion_triggered = bool(shared_state.motion_triggered)
+            if current_task_epoch != active_task_epoch:
+                pipeline["hand_relative_fallback"].reset()
+                active_task_epoch = current_task_epoch
+
             snapshot = sensor_hub.read_next_pair()
             object_frame_cam0, object_frame_cam1 = apply_fdct_depth_to_object_frames(snapshot, pipeline, args)
 
@@ -2224,6 +2361,7 @@ def main():
                 hand_approach_detected=previous_hand_approach,
             )
             shape_fitting_state = pipeline["shape_fitting_tracker"].process(merged_object)
+            metadata_recorder.update_geometry(shape_fitting_state, now_perf=loop_perf)
             fitted_merged_object = build_fitted_merged_object(merged_object, shape_fitting_state)
             fusion_state = pipeline["fusion"].process_states(
                 fitted_merged_object,
@@ -2239,8 +2377,28 @@ def main():
                 fusion_state.hand_approach_detected or fusion_state.hand_approach_latched
             )
 
-            object_point_base = choose_point(fusion_state.filtered_object_centroid_base, fitted_merged_object.centroid_base)
-            grasp_point_base = grasp_target.target_position_base if grasp_target.valid else None
+            measured_object_point_base = choose_point(
+                fusion_state.filtered_object_centroid_base,
+                fitted_merged_object.centroid_base,
+            )
+            measured_grasp_point_base = grasp_target.target_position_base if grasp_target.valid else None
+            hand_relative_fallback_state = pipeline["hand_relative_fallback"].process(
+                measured_object_position_base=measured_object_point_base,
+                measured_grasp_position_base=measured_grasp_point_base,
+                selected_hand=selected_hand,
+                fusion_state=fusion_state,
+                motion_triggered=motion_triggered,
+                now_timestamp=current_time,
+            )
+
+            object_point_base = measured_object_point_base
+            grasp_point_base = measured_grasp_point_base
+            measurement_source = "measured"
+            if measured_object_point_base is None and hand_relative_fallback_state.valid:
+                object_point_base = hand_relative_fallback_state.object_position_base
+                grasp_point_base = hand_relative_fallback_state.grasp_position_base
+                measurement_source = "hand_fallback"
+
             object_pixel = project_base_point_to_cam0(
                 object_point_base,
                 snapshot.cam0.intrinsics,
@@ -2250,22 +2408,40 @@ def main():
             )
 
             if object_point_base is not None:
-                shared_state.update_target(grasp_point_base, object_point_base, object_pixel)
+                eef_xyz_mm = None
+                if controller is not None:
+                    state = controller.read_robot_state(now_timestamp=time.time())
+                    if state.actual_tcp_pose_base is not None:
+                        eef_xyz_mm = meters_to_mm(state.actual_tcp_pose_base[:3])
+
+                shared_state.update_target(
+                    grasp_point_base,
+                    object_point_base,
+                    object_pixel,
+                    eef_xyz_mm=eef_xyz_mm,
+                    measurement_source=measurement_source,
+                )
                 if controller is not None and shared_state.should_start_pregrasp(controller):
-                    print("[INFO] STOPPED + CLOSE_ENOUGH -> PREGRASP transition")
-                    ok = execute_pregrasp_x_only(controller, shared_state, args)
-                    if ok:
+                    print("[INFO] DIRECT GRASP trigger")
+                    shared_state.stop_follow()
+                    if stop_follow_for_handoff(controller, shared_state, args.follow_handoff_timeout_s):
                         grasp_ok = execute_gripper_close(
                             controller,
                             timeout_s=args.gripper_close_timeout_s,
                             verbose=True,
+                            metadata_recorder=metadata_recorder,
                         )
                         print(f"[INFO] grasp_ok = {grasp_ok}")
                         if grasp_ok:
                             save_grasp_offset(controller, shared_state)
-                            execute_return_and_place(controller, shared_state, args)
+                            execute_return_and_place(
+                                controller,
+                                shared_state,
+                                args,
+                                metadata_recorder=metadata_recorder,
+                            )
             else:
-                shared_state.clear_target()
+                shared_state.clear_target(reset_prediction=False, reset_arm=False)
 
             now = time.perf_counter()
             instant_fps = 1.0 / max(now - last_loop_time, 1e-6)
@@ -2281,6 +2457,9 @@ def main():
                 selected_hand,
                 fusion_state,
                 grasp_target,
+                object_point_base,
+                grasp_point_base,
+                hand_relative_fallback_state,
                 shared_state,
                 model_label,
                 smoothed_fps,
@@ -2292,6 +2471,7 @@ def main():
                 selected_hand,
                 fusion_state,
                 grasp_target,
+                grasp_point_base,
                 camera_label="cam1",
             )
             cv.imshow(window_name, annotated)
@@ -2307,7 +2487,13 @@ def main():
                 shared_state.toggle_follow()
             elif key == ord("r"):
                 try:
-                    reset_system_to_start_state(controller, shared_state, args, target_logger=target_logger)
+                    reset_system_to_start_state(
+                        controller,
+                        shared_state,
+                        args,
+                        target_logger=target_logger,
+                        metadata_recorder=metadata_recorder,
+                    )
                 except Exception as exc:
                     print(f"[WARN] Reset failed: {exc}")
             elif key == ord("s"):

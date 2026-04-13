@@ -48,6 +48,7 @@ from system.shared_state import (
     ROBOT_CMD_STOP,
     RobotCommandState,
 )
+from utils.handover_metadata import HandoverMetadataRecorder
 from utils.realsense_stream import list_realsense_serials
 
 
@@ -64,7 +65,7 @@ DEFAULT_WORKSPACE_MM = {
 
 # object motion trigger
 REFERENCE_LOCK_COUNT = 8
-MOTION_TRIGGER_MM = 15.0
+MOTION_TRIGGER_MM = 5.0
 
 # control loop
 DEFAULT_CONTROL_HZ = 30.0
@@ -969,23 +970,27 @@ class FollowSharedState:
         object_xyz_mm = np.asarray(object_xyz_m, dtype=np.float32)[:3] * 1000.0
         object_xy_mm = object_xyz_mm[:2].copy()
         grasp_xyz_mm = None
+        tracking_reference_xyz_mm = object_xyz_mm.copy()
         target_xyz_mm = None
         if grasp_xyz_m is not None:
             grasp_xyz_mm = np.asarray(grasp_xyz_m, dtype=np.float32)[:3] * 1000.0
-            if eef_xyz_mm is None:
-                target_xyz_mm = grasp_xyz_mm.copy()
-                target_xyz_mm[0] += EEF_X_OFFSET_MM
-                target_xyz_mm[1] += EEF_Y_OFFSET_MM
-            else:
-                target_xyz_mm, dynamic_offset_x, dist_xy = compute_dynamic_eef_target(
-                    grasp_xyz_mm,
-                    eef_xyz_mm,
+            tracking_reference_xyz_mm = grasp_xyz_mm.copy()
+
+        if eef_xyz_mm is None:
+            target_xyz_mm = tracking_reference_xyz_mm.copy()
+            target_xyz_mm[0] += EEF_X_OFFSET_MM
+            target_xyz_mm[1] += EEF_Y_OFFSET_MM
+        else:
+            target_xyz_mm, dynamic_offset_x, dist_xy = compute_dynamic_eef_target(
+                tracking_reference_xyz_mm,
+                eef_xyz_mm,
+            )
+            if self.args.verbose_robot:
+                target_kind = "grasp" if grasp_xyz_mm is not None else "object"
+                print(
+                    f"[ROBOT] tracking={target_kind}, dynamic_offset_x={dynamic_offset_x:.1f} mm, "
+                    f"eef_target_dist_xy={dist_xy:.1f} mm"
                 )
-                if self.args.verbose_robot:
-                    print(
-                        f"[ROBOT] dynamic_offset_x={dynamic_offset_x:.1f} mm, "
-                        f"eef_grasp_dist_xy={dist_xy:.1f} mm"
-                    )
 
         self.try_lock_home_pose(object_xyz_mm, pixel_xy)
         self.update_stop_state(object_xyz_mm)
@@ -1011,13 +1016,6 @@ class FollowSharedState:
             if not self.motion_triggered and move_dist_mm >= MOTION_TRIGGER_MM:
                 self.motion_triggered = True
                 print(f"[INFO] Object motion detected: {move_dist_mm:.2f} mm -> follow start")
-
-            if target_xyz_mm is None:
-                self.latest_target_xyz_mm = None
-                self.valid_detection_streak = 0
-                self.control_target_xyz_mm = None
-                self.target_source = "none"
-                return
 
             self.latest_target_xyz_mm = target_xyz_mm.copy()
             self.valid_detection_streak += 1
@@ -1187,9 +1185,9 @@ class FollowSharedState:
     def should_start_pregrasp(
         self,
         controller,
-        x_tol_mm=180.0,
-        y_tol_mm=30.0,
-        z_tol_mm=30.0,
+        x_tol_mm=18.0,
+        y_tol_mm=20.0,
+        z_tol_mm=20.0,
     ):
         snapshot = self.get_snapshot()
         object_xyz = snapshot["latest_object_xyz_mm"]
@@ -1540,7 +1538,7 @@ def move_robot_to_home_pose(controller, args):
     print("[INFO] HOME pose reached")
 
 
-def reset_system_to_start_state(controller, shared_state, args, target_logger=None):
+def reset_system_to_start_state(controller, shared_state, args, target_logger=None, metadata_recorder=None):
     print("[INFO] Reset requested: returning to startup state")
     if target_logger is not None:
         target_logger.abort_session("reset")
@@ -1558,6 +1556,9 @@ def reset_system_to_start_state(controller, shared_state, args, target_logger=No
 
     shared_state.reset_for_restart(follow_enabled=args.enable_follow)
     shared_state.set_fixed_pose_from_robot(controller)
+    if metadata_recorder is not None:
+        task_ready_timestamp = metadata_recorder.mark_task_ready(shared_state)
+        print(f"[INFO] Metadata task start timestamp={task_ready_timestamp}")
     shared_state.clear_follow_pause()
     print("[INFO] Reset complete. System is back at startup state.")
 
@@ -1612,7 +1613,7 @@ def execute_pregrasp_x_only(controller, shared_state, args):
     return True
 
 
-def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True):
+def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True, metadata_recorder=None):
     if verbose:
         print("[INFO] GRIPPER CLOSE start")
 
@@ -1690,6 +1691,10 @@ def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True)
                     controller.stop_gripper_motion()
                 except Exception as exc:
                     print(f"[WARN] Failed to stop gripper after force trigger: {exc}")
+            if metadata_recorder is not None:
+                first_contact_timestamp = metadata_recorder.note_robot_first_contact()
+                if first_contact_timestamp is not None:
+                    print(f"[INFO] Robot first contact timestamp={first_contact_timestamp}")
             delta_str = "n/a" if force_delta is None else f"{force_delta:.3f}"
             print(
                 f"[INFO] Force rise detected during close (abs={float(force_norm):.3f} N, delta={delta_str} N). "
@@ -1702,6 +1707,10 @@ def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True)
                     controller.stop_gripper_motion()
                 except Exception as exc:
                     print(f"[WARN] Failed to stop gripper after position trigger: {exc}")
+            if metadata_recorder is not None:
+                first_contact_timestamp = metadata_recorder.note_robot_first_contact()
+                if first_contact_timestamp is not None:
+                    print(f"[INFO] Robot first contact timestamp={first_contact_timestamp}")
             position_threshold = int(
                 getattr(controller, "gripper_position_complete_threshold", DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD)
             )
@@ -1720,7 +1729,11 @@ def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True)
     return False
 
 
-def execute_gripper_open(controller, dwell_s=0.5):
+def execute_gripper_open(controller, dwell_s=0.5, metadata_recorder=None):
+    if metadata_recorder is not None:
+        last_contact_timestamp = metadata_recorder.note_robot_last_contact()
+        if last_contact_timestamp is not None:
+            print(f"[INFO] Robot last contact timestamp={last_contact_timestamp}")
     send_robot_command(
         controller,
         ROBOT_CMD_HOLD,
@@ -1767,7 +1780,7 @@ def compute_place_target(shared_state):
     return home_xyz - grasp_offset
 
 
-def execute_return_and_place(controller, shared_state, args):
+def execute_return_and_place(controller, shared_state, args, metadata_recorder=None):
     target_eef_xyz = compute_place_target(shared_state)
     if target_eef_xyz is None:
         print("[WARN] Cannot compute place target.")
@@ -1809,7 +1822,11 @@ def execute_return_and_place(controller, shared_state, args):
             print(f"[WARN] Move timed out during {source_mode}.")
             return False
 
-    execute_gripper_open(controller, dwell_s=args.gripper_release_dwell_s)
+    execute_gripper_open(
+        controller,
+        dwell_s=args.gripper_release_dwell_s,
+        metadata_recorder=metadata_recorder,
+    )
 
     safe_lift_z = hover_z + SAFE_LIFT_EXTRA_MM
     safe_x, safe_y, safe_lift_z = clamp_pose_mm(hover_x, hover_y, safe_lift_z, args)
@@ -1867,7 +1884,15 @@ def execute_return_and_place(controller, shared_state, args):
             print("[WARN] Return to initial pose timed out.")
             return False
 
+    if metadata_recorder is not None:
+        home_xyz = None if shared_state.home_object_xyz_mm is None else shared_state.home_object_xyz_mm.copy()
+        metadata_recorder.note_delivery_location(home_xyz)
+
     shared_state.set_task_state("DONE", reset_prediction=True, reset_arm=True)
+    if metadata_recorder is not None:
+        csv_path = metadata_recorder.record_completion()
+        if csv_path is not None:
+            print(f"[INFO] Handover metadata appended: {csv_path}")
 
     print("[INFO] RETURN + PLACE done")
     return True
@@ -2188,6 +2213,7 @@ def main():
     controller = None
     shared_state = FollowSharedState(args)
     target_logger = TaskTargetLogger(shared_state, args.target_log_dir, args.fps)
+    metadata_recorder = HandoverMetadataRecorder()
     target_logger.start()
     control_thread = None
 
@@ -2195,6 +2221,8 @@ def main():
         controller = init_rtde(args)
         move_robot_to_home_pose(controller, args)
         shared_state.set_fixed_pose_from_robot(controller)
+        task_ready_timestamp = metadata_recorder.mark_task_ready(shared_state)
+        print(f"[INFO] Metadata task start timestamp={task_ready_timestamp}")
 
         control_thread = threading.Thread(
             target=robot_control_loop,
@@ -2264,11 +2292,17 @@ def main():
                             controller,
                             timeout_s=args.gripper_close_timeout_s,
                             verbose=True,
+                            metadata_recorder=metadata_recorder,
                         )
                         print(f"[INFO] grasp_ok = {grasp_ok}")
                         if grasp_ok:
                             save_grasp_offset(controller, shared_state)
-                            execute_return_and_place(controller, shared_state, args)
+                            execute_return_and_place(
+                                controller,
+                                shared_state,
+                                args,
+                                metadata_recorder=metadata_recorder,
+                            )
             else:
                 shared_state.clear_target(reset_prediction=True, reset_arm=True)
 
@@ -2310,7 +2344,13 @@ def main():
                 shared_state.toggle_follow()
             elif key == ord("r"):
                 try:
-                    reset_system_to_start_state(controller, shared_state, args, target_logger=target_logger)
+                    reset_system_to_start_state(
+                        controller,
+                        shared_state,
+                        args,
+                        target_logger=target_logger,
+                        metadata_recorder=metadata_recorder,
+                    )
                 except Exception as exc:
                     print(f"[WARN] Reset failed: {exc}")
             elif key == ord("s"):

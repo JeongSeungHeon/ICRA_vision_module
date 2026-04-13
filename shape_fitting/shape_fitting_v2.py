@@ -969,27 +969,9 @@ def main() -> None:
                         )
                         last_icp_time_ms = (time.time() - icp_start) * 1000.0
                         proposed_points = transform_points(scaled_points, icp_transform)
-                        centroid_jump = float(
-                            np.linalg.norm(
-                                np.mean(proposed_points, axis=0) - np.mean(current_template_points, axis=0)
-                            )
-                        )
-                        quality_ok = (
-                            np.isfinite(last_icp_fitness) and last_icp_fitness >= ICP_MIN_FITNESS
-                        ) or (
-                            np.isfinite(last_icp_rmse) and last_icp_rmse <= (2.5 * ICP_DISTANCE_THRESHOLD_M)
-                        )
-
-                        if centroid_jump <= ICP_MAX_CENTROID_JUMP_M and (quality_ok or last_icp_translation_m > 0.0):
-                            template_pcd.points = o3d.utility.Vector3dVector(proposed_points.astype(np.float64))
-                            vis.update_geometry(template_pcd)
-                            tracking_mode = "translation_icp"
-                        else:
-                            tracking_mode = "hold"
-                            merge_status += (
-                                f" | hold: fitness={last_icp_fitness:.3f}, "
-                                f"jump={centroid_jump:.3f}"
-                            )
+                        template_pcd.points = o3d.utility.Vector3dVector(proposed_points.astype(np.float64))
+                        vis.update_geometry(template_pcd)
+                        tracking_mode = "translation_icp"
                 else:
                     tracked_cluster_centroid = None
                     last_icp_translation_m = 0.0

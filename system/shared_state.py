@@ -167,6 +167,15 @@ class GraspTargetState(BaseState):
 
 
 @dataclass
+class HandRelativeFallbackState(BaseState):
+    object_position_base: Vec3 | None = None
+    grasp_position_base: Vec3 | None = None
+    anchor_hand_position_base: Vec3 | None = None
+    dropout_age_s: float | None = None
+    reason: str | None = None
+
+
+@dataclass
 class PoseTrackingState(BaseState):
     anchor_camera_id: int | None = None
     object_detected: bool = False
@@ -252,6 +261,7 @@ class SharedStateBundle(BaseState):
     selected_hand: SelectedHandState = field(default_factory=SelectedHandState)
     fusion: FusionState = field(default_factory=FusionState)
     grasp_target: GraspTargetState = field(default_factory=GraspTargetState)
+    hand_relative_fallback: HandRelativeFallbackState = field(default_factory=HandRelativeFallbackState)
     pose_tracking: PoseTrackingState = field(default_factory=PoseTrackingState)
     live_follow: LiveFollowState = field(default_factory=LiveFollowState)
     robot: RobotState = field(default_factory=RobotState)
