@@ -41,8 +41,9 @@ FPS = 30
 YOLO_MODEL_PATH = REPO_ROOT / "yoloe-26l-seg.pt"
 FDCT_CHECKPOINT_PATH = REPO_ROOT / "FDCT" / "TransCG.tar"
 CONFIG_PATH = REPO_ROOT / "configs" / "handover.yaml"
-TEMPLATE_PATH = SCRIPT_DIR / "template_small.npy"
-TARGET_CLASSES = ["cup"]
+CONFIG_PATH = REPO_ROOT / "configs" / "handover.yaml"
+TEMPLATE_PATH = SCRIPT_DIR / "glass.npy"
+TARGET_CLASSES = ["wine glass", "cup"]
 DEPTH_MIN_M = 0.30
 DEPTH_MAX_M = 1.50
 BILATERAL_ENABLED = True
@@ -63,7 +64,9 @@ ROBUST_EXTENT_HIGH_PERCENTILE = 95.0
 MIN_TEMPLATE_SCALE = 0.5
 MAX_TEMPLATE_SCALE = 1.8
 RESET_REALSENSE_ON_EXIT = False
-q],
+
+DISPLAY_TRANSFORM = np.asarray(
+    [[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]],
     dtype=np.float64,
 )
 
