@@ -247,10 +247,19 @@ def estimate_mass_full_g_vision(filled_volume_ml, density_g_per_ml=DEFAULT_RICE_
     return float(empty_cup_mass_g + density_g_per_ml * filled_volume_ml)
 
 
-def estimate_empty_container_mass_g(label=None):
+def estimate_empty_container_mass_g(label=None, height_mm=None):
     normalized_label = "" if label is None else str(label).strip().lower()
     if normalized_label == "wine glass":
         return float(DEFAULT_EMPTY_WINE_GLASS_MASS_G)
+    if normalized_label == "cup":
+        if height_mm is None or not np.isfinite(float(height_mm)):
+            return float(DEFAULT_EMPTY_CUP_MASS_G)
+        height_mm = float(height_mm)
+        if height_mm <= 110.0:
+            return 15.0
+        if height_mm < 135.0:
+            return 9.0
+        return 10.0
     return float(DEFAULT_EMPTY_CUP_MASS_G)
 
 
@@ -275,6 +284,8 @@ class HandoverMetadataRecorder:
         self._lock = threading.Lock()
         self._task_start_perf = None
         self._task_start_timestamp_iso = None
+        self._config_id_by_task_timestamp = {}
+        self._row_index_by_task_timestamp = {}
         self._initial_pose_base = None
         self._geometry_fields = {}
         self._geometry_timepoint_ms = None
@@ -310,6 +321,35 @@ class HandoverMetadataRecorder:
             self._robot_last_contact_timestamp_iso = None
             self._row_written = False
             return self._task_start_timestamp_iso
+
+    def attach_config_id(self, config_id, *, task_start_timestamp_iso=None):
+        if config_id is None or str(config_id).strip() == "":
+            return False
+
+        task_timestamp = self._task_start_timestamp_iso if task_start_timestamp_iso is None else str(task_start_timestamp_iso)
+        if not task_timestamp:
+            return False
+
+        normalized_config_id = int(config_id)
+        with self._lock:
+            self._config_id_by_task_timestamp[task_timestamp] = normalized_config_id
+            row_index = self._row_index_by_task_timestamp.get(task_timestamp)
+            if row_index is None or not self.csv_path.exists():
+                return False
+
+            with self.csv_path.open("r", newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                rows = list(reader)
+
+            if row_index < 0 or row_index >= len(rows):
+                return False
+
+            rows[row_index]["config_id"] = _format_metadata_int(normalized_config_id)
+            with self.csv_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=METADATA_COLUMNS)
+                writer.writeheader()
+                writer.writerows(rows)
+            return True
 
     def _elapsed_ms_locked(self, now_perf=None, now_timestamp_iso=None):
         if self._task_start_timestamp_iso is not None:
@@ -378,7 +418,10 @@ class HandoverMetadataRecorder:
             if total_volume_ml is None or filled_volume_ml is None:
                 return False
             fill_level_percent = estimate_fill_level_percent(filled_volume_ml, total_volume_ml)
-            empty_container_mass_g = estimate_empty_container_mass_g(getattr(shape_fitting_state, "label", None))
+            empty_container_mass_g = estimate_empty_container_mass_g(
+                getattr(shape_fitting_state, "label", None),
+                height_mm=height_mm,
+            )
             mass_full_g = estimate_mass_full_g_vision(
                 filled_volume_ml,
                 empty_cup_mass_g=empty_container_mass_g,
@@ -439,6 +482,7 @@ class HandoverMetadataRecorder:
             if self._task_start_perf is None or self._row_written:
                 return None
 
+            task_timestamp = self._task_start_timestamp_iso
             row = {column: "" for column in METADATA_COLUMNS}
             initial_pose = self._initial_pose_base
             if initial_pose is not None and len(initial_pose) >= 6:
@@ -470,6 +514,10 @@ class HandoverMetadataRecorder:
             row["robot_mass_est_available"] = "0"
             row["robot_mass_est_g"] = "-1"
 
+            config_id = self._config_id_by_task_timestamp.get(task_timestamp)
+            if config_id is not None:
+                row["config_id"] = _format_metadata_int(config_id)
+
             for key, value in self._delivery_location_mm.items():
                 row[key] = _format_metadata_float(value)
 
@@ -477,13 +525,18 @@ class HandoverMetadataRecorder:
             row["t_robot_last_contact_ms"] = _format_metadata_int(self._robot_last_contact_ms)
 
             self.csv_path.parent.mkdir(parents=True, exist_ok=True)
-            file_exists = self.csv_path.exists()
-            should_write_header = (not file_exists) or self.csv_path.stat().st_size == 0
+            existing_row_count = 0
+            if self.csv_path.exists() and self.csv_path.stat().st_size > 0:
+                with self.csv_path.open("r", newline="", encoding="utf-8") as handle:
+                    existing_row_count = sum(1 for _ in csv.DictReader(handle))
+            should_write_header = existing_row_count == 0
             with self.csv_path.open("a", newline="", encoding="utf-8") as handle:
                 writer = csv.DictWriter(handle, fieldnames=METADATA_COLUMNS)
                 if should_write_header:
                     writer.writeheader()
                 writer.writerow(row)
 
+            if task_timestamp:
+                self._row_index_by_task_timestamp[task_timestamp] = existing_row_count
             self._row_written = True
             return self.csv_path

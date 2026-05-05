@@ -87,9 +87,14 @@ class HandoverMetadataTests(unittest.TestCase):
         self.assertAlmostEqual(fill_level_percent, 50.0, places=5)
         self.assertAlmostEqual(mass_full_g, 15.0 + 0.87 * filled_volume_ml, places=5)
 
-    def test_empty_container_mass_switches_for_wine_glass(self) -> None:
-        self.assertEqual(estimate_empty_container_mass_g("cup"), 15.0)
-        self.assertEqual(estimate_empty_container_mass_g("wine glass"), DEFAULT_EMPTY_WINE_GLASS_MASS_G)
+    def test_empty_container_mass_uses_label_and_height_rules(self) -> None:
+        self.assertEqual(estimate_empty_container_mass_g("cup", 100.0), 15.0)
+        self.assertEqual(estimate_empty_container_mass_g("cup", 110.0), 15.0)
+        self.assertEqual(estimate_empty_container_mass_g("cup", 120.0), 9.0)
+        self.assertEqual(estimate_empty_container_mass_g("cup", 135.0), 10.0)
+        self.assertEqual(estimate_empty_container_mass_g("cup", None), 15.0)
+        self.assertEqual(estimate_empty_container_mass_g("wine glass", 90.0), DEFAULT_EMPTY_WINE_GLASS_MASS_G)
+        self.assertEqual(estimate_empty_container_mass_g("other", 120.0), 15.0)
 
     def test_wine_glass_bowl_volume_helpers(self) -> None:
         total_volume_ml = estimate_wine_glass_bowl_volume_ml(80.0, 130.0, 0.42)
@@ -256,6 +261,32 @@ class HandoverMetadataTests(unittest.TestCase):
             )
             self.assertAlmostEqual(recorder._fill_mass_fields["fill_level_est_percent_vision"], expected_fill_level, places=5)
             self.assertAlmostEqual(recorder._fill_mass_fields["mass_full_est_g_vision"], expected_mass, places=5)
+
+    def test_metadata_recorder_zero_fill_uses_height_based_cup_mass(self) -> None:
+        shared_state = SimpleNamespace(get_snapshot=lambda: {"initial_pose_base": None})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            recorder = HandoverMetadataRecorder(csv_path=Path(tmpdir) / "handover_metadata.csv")
+            recorder.mark_task_ready(
+                shared_state,
+                now_perf=10.0,
+                now_timestamp_iso="2026-04-14T10:00:00.000Z",
+            )
+            recorder._geometry_fields = {
+                "width_top_est_mm_vision": 80.0,
+                "width_bottom_est_mm_vision": 60.0,
+                "height_est_mm_vision": 120.0,
+            }
+            updated = recorder.update_fill_and_mass(
+                SimpleNamespace(valid=True, fill_height_mm=0.0),
+                shape_fitting_state=SimpleNamespace(label="cup", bowl_height_fraction=None),
+                now_perf=10.1,
+                now_timestamp_iso="2026-04-14T10:00:00.100Z",
+            )
+
+            self.assertTrue(updated)
+            self.assertAlmostEqual(recorder._fill_mass_fields["fill_level_est_percent_vision"], 0.0, places=5)
+            self.assertAlmostEqual(recorder._fill_mass_fields["mass_full_est_g_vision"], 9.0, places=5)
 
 
 if __name__ == "__main__":

@@ -105,12 +105,12 @@ perception:
       debug_every: 30
   object:
     target_label: cup ## 의미 없음
-    confidence_threshold: 0.25
+    confidence_threshold: 0.15
     segmentation:
       model_name: yoloe-26l-seg.pt
       prompt_classes: ["cup", "wine glass"]
       imgsz: 640
-      conf: 0.25
+      conf: 0.15
       iou: 0.45
       max_det: 100
       device: null
@@ -118,7 +118,7 @@ perception:
       half: false
       retina_masks: true
       selection_mode: highest_score
-      selection_class_names: ["cup", "wine glass"] # 어떤걸로 선택할지 모호할 때 이 클래스 우선 선택
+      selection_class_names: ["wine glass"] # 어떤걸로 선택할지 모호할 때 이 클래스 우선 선택
       preprocess:
         enabled: false
         contrast_alpha: 1.0
@@ -142,6 +142,7 @@ perception:
       min_points_per_camera: 300
     merged_voxel_size_m: 0.006
   fill_level_estimation:
+    fillings_empty: false
     roi_shrink_x: 0.18
     roi_shrink_top: 0.08
     roi_shrink_bottom: 0.05
@@ -160,7 +161,7 @@ perception:
     depth_lifting:
       patch_radius: 2
       min_depth_m: 0.10
-      max_depth_m: 1.70
+      max_depth_m: 2.00
       min_valid_keypoints: 4
     smoothing_window_frames: 5
     velocity_alpha: 0.5
@@ -177,38 +178,38 @@ perception:
     hand_normal_alpha: 0.50
     max_position_jump_m: 0.20
     stable_frames_required: 5
-  pose_tracking:
-    enabled: true
-    anchor_camera: cam0
-    debug_dir: logs/foundationpose_debug
-    surface_sample_count: 1500
-    template_library:
-      cup:
-        template_id: cup_canonical
-        asset_path: shape_fitting/template.npy
-        unit_scale_m: 0.001
-      wine glass:
-        template_id: wine_glass_canonical
-        asset_path: shape_fitting/wine_glass.npy
-        unit_scale_m: 0.001
-    scale_estimation:
-      stable_frames: 5
-      min_points: 500
-      percentile_low: 5.0
-      percentile_high: 95.0
-      min_scale: 0.25
-      max_scale: 4.0
-    registration:
-      refine_iter: 5
-    tracking:
-      refine_iter: 2
-    health:
-      mask_iou_threshold: 0.15
-      depth_inlier_threshold: 0.30
-      depth_tolerance_m: 0.03
-    reinit:
-      low_conf_frames: 5
-      min_merged_points: 300
+  # pose_tracking:
+  #   enabled: true
+  #   anchor_camera: cam0
+  #   debug_dir: logs/foundationpose_debug
+  #   surface_sample_count: 1500
+  #   template_library:
+  #     cup:
+  #       template_id: cup_canonical
+  #       asset_path: shape_fitting/template.npy
+  #       unit_scale_m: 0.001
+  #     wine glass:
+  #       template_id: wine_glass_canonical
+  #       asset_path: shape_fitting/wine_glass.npy
+  #       unit_scale_m: 0.001
+  #   scale_estimation:
+  #     stable_frames: 5
+  #     min_points: 500
+  #     percentile_low: 5.0
+  #     percentile_high: 95.0
+  #     min_scale: 0.25
+  #     max_scale: 4.0
+  #   registration:
+  #     refine_iter: 5
+  #   tracking:
+  #     refine_iter: 2
+  #   health:
+  #     mask_iou_threshold: 0.15
+  #     depth_inlier_threshold: 0.30
+  #     depth_tolerance_m: 0.03
+  #   reinit:
+  #     low_conf_frames: 5
+  #     min_merged_points: 300
   shape_fitting:
     enabled: true
     template_library:
@@ -242,8 +243,8 @@ perception:
       crop:
         enabled: true
         height_axis_index: 2
-        target_top_fraction: 0.08
-        source_top_fraction:
+        target_top_fraction: 0.05
+        # source_top_fraction:
         min_points_after_crop: 80
         min_height_extent_m: 0.01
     downsample:
@@ -252,22 +253,22 @@ perception:
   activation:
     hand_approach_distance_threshold_m: 0.15
     stable_frames_required: 5
-    lift_detection:
-      enabled: true
-      threshold_m: 0.05
-      axis_name: z
-      require_hand_approach_first: true
+    # lift_detection:
+    #   enabled: true
+    #   threshold_m: 0.05
+    #   axis_name: z
+    #   require_hand_approach_first: true
 
 grasp:
   fixed_orientation_format: rpy
   fixed_orientation_base: [1.591, -0.017, 1.561]   # EEF RPY (rad) — locked throughout task
-  candidate_search_radius_from_centroid_m: 0.07
-  min_hand_height_clearance_m: 0.05
+  candidate_search_radius_from_centroid_m: 0.11 ### 0.07
+  min_hand_height_clearance_m: 0.05 ### 0.05
   no_candidate_action: hold
   hand_relative_fallback:
     enabled: true
-    lock_frames: 5
-    max_dropout_sec: 1.0
+    lock_frames: 8
+    max_dropout_sec: 3.0
     require_hand_approach: true
     require_motion_triggered: true
   target_selection:
@@ -282,7 +283,7 @@ grasp:
 # Orientation reuses grasp.fixed_orientation_base (same RPY).
 home_pose:
   enabled: true
-  position_m: [-0.292, -0.110, -0.030]   # x, y, z
+  position_m: [0.3965, -0.015, 0.237]   # x, y, z
   move_speed_mps: 0.05                 # slow, safe home motion
   move_acceleration: 0.10
 

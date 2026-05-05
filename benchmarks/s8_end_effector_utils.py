@@ -427,12 +427,12 @@ def load_s8_settings(
 def build_target_positions_local_mm(horizontal_reach_mm: float, vertical_reach_mm: float) -> dict[int, tuple[float, float, float]]:
     del horizontal_reach_mm, vertical_reach_mm
     return {
-        1: (-400.0, 0.0, 0.0),
-        2: (-400.0, 400.0, 0.0),
-        3: (-400.0, -400.0, 0.0),
-        4: (-400.0, 0.0, 150.0),
-        5: (-400.0, 400.0, 150.0),
-        6: (-400.0, -400.0, 150.0),
+        1: (0.0, 0.0, 0.0),
+        2: (0.0, 0.0, 0.0),
+        3: (0.0, 0.0, 0.0),
+        4: (0.0, 0.0, 0.0),
+        5: (0.0, 0.0, 0.0),
+        6: (0.0, 0.0, 0.0),
     }
 
 

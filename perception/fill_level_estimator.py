@@ -393,6 +393,7 @@ class FillLevelEstimator:
         min_depth_m: float = 0.05,
         max_valid_depth_m: float = 2.0,
         depth_patch_half: int = 4,
+        fillings_empty: bool = False,
     ) -> None:
         self.roi_shrink_x = float(roi_shrink_x)
         self.roi_shrink_top = float(roi_shrink_top)
@@ -403,6 +404,7 @@ class FillLevelEstimator:
         self.min_depth_m = float(min_depth_m)
         self.max_valid_depth_m = float(max_valid_depth_m)
         self.depth_patch_half = int(depth_patch_half)
+        self.fillings_empty = bool(fillings_empty)
 
     @classmethod
     def from_config(cls, config_path: str | Path = DEFAULT_CONFIG_PATH) -> "FillLevelEstimator":
@@ -421,6 +423,7 @@ class FillLevelEstimator:
             min_depth_m=float(fill_cfg.get("min_depth_m", 0.05)),
             max_valid_depth_m=float(fill_cfg.get("max_valid_depth_m", 2.0)),
             depth_patch_half=int(fill_cfg.get("depth_patch_half", 4)),
+            fillings_empty=bool(fill_cfg.get("fillings_empty", False)),
         )
 
     def estimate_fill_level_from_cam0(
@@ -441,6 +444,15 @@ class FillLevelEstimator:
         mask_bool = np.asarray(container_mask, dtype=bool)
         if not np.any(mask_bool):
             return FillLevelEstimate(False, None, "raw", None, None)
+
+        if self.fillings_empty:
+            return FillLevelEstimate(
+                valid=True,
+                fill_height_mm=0.0,
+                mask_mode="forced_empty",
+                rice_top_y_center=None,
+                bottom_center_y=None,
+            )
 
         fx = float(intrinsics["fx"])
         fy = float(intrinsics["fy"])
@@ -486,7 +498,6 @@ class FillLevelEstimator:
         )
         if metrics is None:
             return FillLevelEstimate(False, None, mask_mode, rice_top_y_center, y_bottom_center, usable_mask=usable_mask)
-
         rice_top_x = get_row_center_x(usable_mask, rice_top_y_center)
         bottom_center_x = get_row_center_x(usable_mask, y_bottom_center)
         fill_height_mm = float(metrics["fill_h_mm_axis"])

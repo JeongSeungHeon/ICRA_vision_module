@@ -1,0 +1,111 @@
+{
+  "submission_version": "1.0",
+  "submission_timestamp": "",
+  "protocol_version": "1.0.0",
+  "team": "3D Vision & Robotics Lab",
+
+  "ethics": {
+    "local_ethics_approval_obtained": true,
+    "ethics_approval_reference": "",
+    "informed_consent_obtained": true,
+    "video_recording_consent": true,
+    "video_sharing_consent": true,
+    "video_publication_consent": false,
+    "demographics_provided": true,
+    "notes": "All participants were informed about the purpose of the study and their rights."
+  },
+
+  "participants": {
+    "num_human_subjects": 4,
+    "subject_ids": ["S1", "S2", "S3", "S4"],
+    "demographics": {
+      "S1": { "age_group": "18-25", "gender": "female", "dominant_hand": "right", "experience_level": "novice" },
+      "S2": { "age_group": "26-35", "gender": "male", "dominant_hand": "right", "experience_level": "intermediate" },
+      "S3": { "age_group": "18-25", "gender": "female", "dominant_hand": "left", "experience_level": "intermediate" },
+      "S4": { "age_group": "26-35", "gender": "male", "dominant_hand": "right", "experience_level": "expert" }
+    },
+    "instructions_given": "Subjects instructed to handover the cup naturally, standing opposite the robot across the table.",
+    "notes": "Demographic fields are optional and should not include personally identifiable information."
+  },
+
+  "hardware": {
+    "arm_model": "ur5",
+    "dof": 6,
+    "gripper_model": "robotiq_2f_85",
+    "controller": "Python-based RTDE control",
+    "mounting": "table-mounted",
+    "sensors": {
+      "force_torque": false,
+      "gripper_pressure": false,
+      "tactile_sensors": false,
+      "vision_sensors": true
+    }
+  },
+
+  "environment": {
+    "sensing_setup_description": "Two RGB-D cameras were used to observe the handover area near the center of the table from the right-side and left-side views.",
+    "table_dimensions_mm": [840, 840, 895],
+    "illumination": {
+      "artificial_lights_used": false,
+      "light_positions": ["top"]
+    },
+    "camera_setup": {
+      "side_cameras": [
+        {
+          "model": "Intel RealSense D435i",
+          "position": "left side"
+        },
+        {
+          "model": "Intel RealSense D435i",
+          "position": "right side"
+        }
+      ],
+      "overhead_camera": {}
+    },
+    "calibration_notes": "All cameras were calibrated and localized with respect to a 50cm square 5x5 ChArUco board before recording. The sensing setup was fixed during data collection. For camera-to-robot calibration, we used marker ID 49, as in the CORSMAL baseline source code. ",
+    "notes": ""
+  },
+
+  "software_and_models": {
+    "vision_geometry_model": { "name": "Yolo", "version": "yoloe-26l-seg" },
+    "vision_mass_model": { "name": "Yolo", "version": "yoloe-26l-seg" },
+    "vision_fill_level_model": { "name": "Yolo", "version": "yoloe-26l-seg" },
+    "robot_mass_estimation_method": "",
+    "notes": "Geometry was estimated by fitting a canonical 3D category-level template to the merged dual-camera point cloud and measuring top width, bottom width, and height from the fitted shape. Fill level was estimated from the segmented RGB-D view by detecting the fill surface and container bottom, converting that distance to fill height, and computing filled versus total volume with a geometry-based volume model. Vision-based mass was then estimated from the filled volume using an assumed material density and a nominal empty-container mass. The weight of the container was not estimated, but instead provided as prior knowledge."
+  },
+
+  "annotation_protocol": {
+    "timing_annotation_method": "manual_video_annotation",
+    "annotator_training": "Timing annotations were performed by a team member following a fixed internal guideline for identifying handover start and end events",
+    "video_fps": 30,
+    "video_annotation_used": true,
+    "video_annotation_description": "Execution timing was obtained from recorded videos at 30 fps using manual frame-level inspection."
+  },
+
+  "configuration_file": {
+    "filename": "benchmark_configs.csv",
+    "num_configurations": 288,
+    "subject_id_semantics": "Subject IDs refer to the team's own volunteers performing the handovers."
+  },
+
+  "physical_assumptions": {
+    "density_rice_g_per_ml": 0.87,
+    "placement_reference_frame": "cup_initial_position_center_of_base"
+  },
+
+  "learning_policy": {
+    "online_learning": false,
+    "cross_configuration_adaptation": false,
+    "model_updated_during_benchmark": false,
+    "note": "We do not allow learning across configurations."
+  },
+
+  "execution_policy": {
+    "num_configurations": 288,
+    "runs_per_configuration": 2.53,
+    "video_recording_required": true,
+    "delivery_location_policy": "same_as_initial_location",
+    "target_delivery_location" : [600.0, 0.0, 0.0],
+    "end_effector_reachability": [800.0, 600.0]
+  }
+}

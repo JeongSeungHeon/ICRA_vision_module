@@ -52,6 +52,7 @@ from system.shared_state import (
     ROBOT_CMD_STOP,
     RobotCommandState,
 )
+from video_record import HandoverVideoRecorderService
 from utils.handover_metadata import HandoverMetadataRecorder
 from utils.realsense_stream import list_realsense_serials
 
@@ -69,7 +70,8 @@ DEFAULT_WORKSPACE_MM = {
 
 # object motion trigger
 REFERENCE_LOCK_COUNT = 8
-MOTION_TRIGGER_MM = 30.0
+MOTION_TRIGGER_MM = 50
+MOTION_TRIGGER_Z_MM = 60.0
 
 # control loop
 DEFAULT_CONTROL_HZ = 30.0
@@ -77,20 +79,25 @@ MAX_XY_SPEED_MM_S = 200.0 # 80
 MAX_Z_SPEED_MM_S = 250.0  # 80
 
 # EEF target offset from detected object center (robot base frame)
-EEF_X_OFFSET_MM = -270.0
+EEF_X_OFFSET_MM = -320.0
 EEF_Y_OFFSET_MM = 0.0
 
 # grasp / place behavior
 PREGRASP_X_OFFSET_MM = -120.0
-HOVER_Z_OFFSET_MM = 30.0
-DESCEND_EXTRA_MM = 5.0
-SAFE_LIFT_EXTRA_MM = 40.0
-BACKOFF_X_MM = 100.0
-GRIPPER_FORCE_STOP_DELTA_N = 10.0
+HOVER_Z_OFFSET_MM = 0
+DESCEND_EXTRA_MM = 0.0
+BACKOFF_X_MM = 120.0
+HOME_PLACE_X_OFFSET_MM = 0.0
+HOME_PLACE_Y_OFFSET_MM = -3.0
+HOME_PLACE_MIN_Z_MM = 45.0
+GRASP_POINT_Y_OFFSET_MM = 10.0
+PLACE_Z_GRASP_BUFFER_FRAMES = 5
+PLACE_Z_MIN_VALID_SAMPLES = 3
+GRIPPER_FORCE_STOP_DELTA_N = 100000
 GRIPPER_FORCE_STOP_MIN_ELAPSED_S = 0.12
 DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD = 200
-WINE_GLASS_GRIPPER_POSITION_COMPLETE_THRESHOLD = 40
-CUP_GRIPPER_POSITION_COMPLETE_THRESHOLD = 120
+WINE_GLASS_GRIPPER_POSITION_COMPLETE_THRESHOLD = 50
+CUP_GRIPPER_POSITION_COMPLETE_THRESHOLD = 75
 BASE_POSE = {
     "x": 208.0,
     "y": 102.0,
@@ -99,6 +106,8 @@ BASE_POSE = {
     "pitch": 0.0,
     "yaw": 90.0,
 }
+VIDEO_RECORDER_SERIAL = "231522072349"
+VIDEO_RECORDER_PORT = 5000
 
 
 def parse_args():
@@ -328,13 +337,13 @@ def apply_config_defaults(args, config):
     return args
 
 
-def pick_serial(serial):
-    if serial:
-        return serial
-    serials = list_realsense_serials()
-    if not serials:
-        raise RuntimeError("No RealSense devices detected.")
-    return serials[0]
+# def pick_serial(serial):
+#     if serial:
+#         return serial
+#     serials = list_realsense_serials()
+#     if not serials:
+#         raise RuntimeError("No RealSense devices detected.")
+#     return serials[0]
 
 
 def render_depth(depth_image_m, max_depth_m):
@@ -447,198 +456,6 @@ def apply_fdct_depth_to_object_frames(snapshot, pipeline, args):
 
     return object_frames[0], object_frames[1]
 
-
-def overlay_status(frame, serial, model_name, fps, infer_ms, summary, follow_lines=None):
-    lines = [
-        f"model: {model_name}",
-    ]
-    if follow_lines is not None:
-        lines.extend(follow_lines)
-
-    for line_index, text in enumerate(lines):
-        origin = (12, 28 + line_index * 26)
-        cv.putText(frame, text, origin, cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv.LINE_AA)
-        cv.putText(frame, text, origin, cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv.LINE_AA)
-
-
-def load_camera_to_robot_transform(path):
-    p = Path(path)
-    if not p.exists():
-        print(f"[WARN] calibration file not found: {path}")
-        return None
-
-    with open(p, "rb") as f:
-        transform = pickle.load(f)
-
-    transform = np.asarray(transform, dtype=np.float64)
-    if transform.shape != (4, 4):
-        raise RuntimeError(f"Invalid transform shape: {transform.shape}, expected (4, 4)")
-    print(f"[INFO] Loaded calibration: {path}")
-    return transform
-
-
-def get_color_intrinsics(camera, frame_bundle):
-    candidates = []
-    for obj in [frame_bundle, camera]:
-        if obj is None:
-            continue
-        for attr in ["color_intrinsics", "intrinsics", "rs_intrinsics", "color_rs_intrinsics"]:
-            if hasattr(obj, attr):
-                candidates.append(getattr(obj, attr))
-
-    for intr in candidates:
-        if all(hasattr(intr, name) for name in ["fx", "fy", "ppx", "ppy"]):
-            return float(intr.fx), float(intr.fy), float(intr.ppx), float(intr.ppy)
-
-        if isinstance(intr, dict):
-            if "fx" in intr and "fy" in intr:
-                cx = intr["cx"] if "cx" in intr else intr.get("ppx")
-                cy = intr["cy"] if "cy" in intr else intr.get("ppy")
-                if cx is not None and cy is not None:
-                    return float(intr["fx"]), float(intr["fy"]), float(cx), float(cy)
-
-        if isinstance(intr, (list, tuple)) and len(intr) >= 4:
-            return float(intr[0]), float(intr[1]), float(intr[2]), float(intr[3])
-
-    raise RuntimeError(
-        "Could not find color intrinsics in RealSenseCamera/frame_bundle. "
-        "Please patch get_color_intrinsics() to match your wrapper."
-    )
-
-
-def erode_mask(mask, ksize=5):
-    kernel = np.ones((ksize, ksize), np.uint8)
-    return cv.erode(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
-
-
-def mask_to_point_cloud(mask, depth_image_m, fx, fy, cx, cy, min_depth_m, max_depth_m):
-    valid = (
-        mask.astype(bool)
-        & np.isfinite(depth_image_m)
-        & (depth_image_m > min_depth_m)
-        & (depth_image_m < max_depth_m)
-    )
-
-    vs, us = np.where(valid)
-    if len(us) == 0:
-        return None, None, None
-
-    zs = depth_image_m[vs, us].astype(np.float32)
-
-    z_med = float(np.median(zs))
-    z_keep = np.abs(zs - z_med) < 0.03
-    if np.count_nonzero(z_keep) == 0:
-        return None, None, None
-
-    us = us[z_keep]
-    vs = vs[z_keep]
-    zs = zs[z_keep]
-
-    xs = (us.astype(np.float32) - cx) * zs / fx
-    ys = (vs.astype(np.float32) - cy) * zs / fy
-    points_3d = np.stack([xs, ys, zs], axis=1)
-    return points_3d, us, vs
-
-
-def compute_object_3d_point(instance, depth_image_m, fx, fy, cx, cy, point_mode, min_depth_m, max_depth_m):
-    mask = erode_mask(instance.mask, ksize=5)
-
-    if point_mode == "centroid_depth":
-        ys, xs = np.where(mask)
-        if len(xs) == 0:
-            return None
-
-        u = int(np.median(xs))
-        v = int(np.median(ys))
-
-        h, w = depth_image_m.shape[:2]
-        x0 = max(0, u - 2)
-        x1 = min(w, u + 3)
-        y0 = max(0, v - 2)
-        y1 = min(h, v + 3)
-
-        patch = depth_image_m[y0:y1, x0:x1]
-        patch_valid = patch[
-            np.isfinite(patch)
-            & (patch > min_depth_m)
-            & (patch < max_depth_m)
-        ]
-        if patch_valid.size == 0:
-            return None
-
-        z = float(np.median(patch_valid))
-        x = (u - cx) * z / fx
-        y = (v - cy) * z / fy
-        return {
-            "pixel": (u, v),
-            "camera_xyz": np.array([x, y, z], dtype=np.float32),
-            "num_points": int(patch_valid.size),
-        }
-
-    points_3d, us, vs = mask_to_point_cloud(mask, depth_image_m, fx, fy, cx, cy, min_depth_m, max_depth_m)
-    if points_3d is None or len(points_3d) == 0:
-        return None
-
-    if point_mode == "mean":
-        center_3d = np.mean(points_3d, axis=0)
-    else:
-        center_3d = np.median(points_3d, axis=0)
-
-    deltas = points_3d - center_3d[None, :]
-    dist2 = np.sum(deltas * deltas, axis=1)
-    best_idx = int(np.argmin(dist2))
-
-    u = int(us[best_idx])
-    v = int(vs[best_idx])
-
-    return {
-        "pixel": (u, v),
-        "camera_xyz": center_3d.astype(np.float32),
-        "num_points": int(len(points_3d)),
-    }
-
-
-def smooth_point(current_xyz, previous_xyz, alpha):
-    if current_xyz is None:
-        return previous_xyz
-    if previous_xyz is None:
-        return current_xyz
-    return alpha * current_xyz + (1.0 - alpha) * previous_xyz
-
-
-def camera_to_robot_point(camera_xyz, camera_to_robot):
-    if camera_to_robot is None or camera_xyz is None:
-        return None
-    p_cam = np.array([camera_xyz[0], camera_xyz[1], camera_xyz[2], 1.0], dtype=np.float64).reshape(4, 1)
-    p_robot = (camera_to_robot @ p_cam).reshape(-1)
-    return p_robot[:3].astype(np.float32)
-
-
-def draw_point_overlay(frame, point_info, robot_xyz=None, home_pixel=None):
-    if point_info is None:
-        return
-    u, v = point_info["pixel"]
-    cam_xyz = point_info["camera_xyz"]
-
-    cv.circle(frame, (u, v), 5, (0, 255, 255), -1, cv.LINE_AA)
-
-    text_x, text_y = 10, 440
-    lines = [f"cam xyz: [{cam_xyz[0]:.3f}, {cam_xyz[1]:.3f}, {cam_xyz[2]:.3f}] m"]
-    if robot_xyz is not None:
-        lines.append(f"robot xyz: [{robot_xyz[0]:.3f}, {robot_xyz[1]:.3f}, {robot_xyz[2]:.3f}] m")
-
-    for i, text in enumerate(lines):
-        org = (text_x, text_y + i * 25)
-        cv.putText(frame, text, org, cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv.LINE_AA)
-        cv.putText(frame, text, org, cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1, cv.LINE_AA)
-
-    if home_pixel is not None:
-        hu, hv = home_pixel
-        cv.circle(frame, (hu, hv), 5, (0, 0, 255), -1, cv.LINE_AA)
-        cv.putText(frame, "HOME", (hu + 10, hv - 10), cv.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv.LINE_AA)
-        cv.putText(frame, "HOME", (hu + 10, hv - 10), cv.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 1, cv.LINE_AA)
-
-
 def clamp_value(v, low, high):
     return max(low, min(high, v))
 
@@ -685,7 +502,7 @@ def compute_dynamic_eef_target(reference_xyz_mm, eef_xyz_mm):
 
 def get_close_range_step_mm(ref_err_xyz, max_step_mm, max_step_z_mm):
     dist_xy = float(np.linalg.norm(np.asarray(ref_err_xyz, dtype=np.float32)[:2]))
-    if dist_xy < 55.0:
+    if dist_xy < 95.0:
         return 5, 2.2, dist_xy
     return float(max_step_mm), float(max_step_z_mm), dist_xy
 
@@ -708,42 +525,6 @@ def compute_close_range_ref_step_xyz(ref_err_xyz, max_step_xy, max_step_z, *, fo
 
     return ref_step_xyz, dominant_axis
 
-
-def rpy_degrees_to_rotvec(roll_deg, pitch_deg, yaw_deg):
-    roll, pitch, yaw = np.deg2rad([roll_deg, pitch_deg, yaw_deg])
-    cx, sx = np.cos(roll), np.sin(roll)
-    cy, sy = np.cos(pitch), np.sin(pitch)
-    cz, sz = np.cos(yaw), np.sin(yaw)
-
-    rot_x = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]], dtype=np.float64)
-    rot_y = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=np.float64)
-    rot_z = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
-    rotation = rot_z @ rot_y @ rot_x
-
-    trace = float(np.trace(rotation))
-    cos_theta = max(min((trace - 1.0) * 0.5, 1.0), -1.0)
-    theta = float(np.arccos(cos_theta))
-    if theta < 1e-9:
-        return (0.0, 0.0, 0.0)
-
-    axis = np.array(
-        [
-            rotation[2, 1] - rotation[1, 2],
-            rotation[0, 2] - rotation[2, 0],
-            rotation[1, 0] - rotation[0, 1],
-        ],
-        dtype=np.float64,
-    )
-    axis_norm = float(np.linalg.norm(axis))
-    if axis_norm < 1e-9:
-        diag = np.diag(rotation)
-        axis = np.sqrt(np.maximum((diag + 1.0) * 0.5, 0.0))
-        axis_norm = float(np.linalg.norm(axis))
-        if axis_norm < 1e-9:
-            return (0.0, 0.0, 0.0)
-    axis = axis / axis_norm
-    rotvec = axis * theta
-    return (float(rotvec[0]), float(rotvec[1]), float(rotvec[2]))
 
 
 def get_base_pose_target(controller):
@@ -870,9 +651,11 @@ class FollowSharedState:
         self.target_source = "none"
 
         self.reference_object_xy_mm = None
+        self.reference_object_xyz_mm = None
         self.reference_locked = False
         self.motion_triggered = False
         self.reference_streak = 0
+        self.initial_object_label = None
 
         self.fixed_z_mm = None
         self.fixed_orientation_base = None
@@ -885,7 +668,7 @@ class FollowSharedState:
 
         self.home_object_xyz_mm = None
         self.home_object_locked = False
-        self.home_pose_buffer = deque(maxlen=15)
+        self.home_pose_buffer = deque(maxlen=8)
         self.home_object_pixel = None
         self.home_pixel_buffer = deque(maxlen=15)
 
@@ -896,6 +679,13 @@ class FollowSharedState:
         self.pregrasp_started = False
         self.grasp_closed = False
         self.grasp_offset_xyz_mm = None
+        self.recent_grasp_z_mm_buffer = deque(maxlen=PLACE_Z_GRASP_BUFFER_FRAMES)
+        self.recent_template_bottom_z_mm_buffer = deque(maxlen=PLACE_Z_GRASP_BUFFER_FRAMES)
+        self.frozen_place_z_mm = None
+        self.frozen_place_z_raw_mm = None
+        self.frozen_place_z_grasp_median_mm = None
+        self.frozen_place_z_template_bottom_median_mm = None
+        self.frozen_place_z_used_fallback = True
         self.task_state = "FOLLOW"
         self.task_epoch = 0
 
@@ -954,6 +744,80 @@ class FollowSharedState:
             if reset_prediction:
                 self._reset_prediction_locked(reset_arm=reset_arm)
 
+    def update_place_z_samples(
+        self,
+        *,
+        grasp_point_base=None,
+        object_point_base=None,
+        fitted_points_base=None,
+    ):
+        grasp_z_mm = None
+        source_point = grasp_point_base if grasp_point_base is not None else object_point_base
+        if source_point is not None:
+            source_point_arr = np.asarray(source_point, dtype=np.float32).reshape(3)
+            if np.all(np.isfinite(source_point_arr)):
+                grasp_z_mm = float(source_point_arr[2] * 1000.0)
+
+        template_bottom_z_mm = None
+        if fitted_points_base is not None:
+            fitted_points = np.asarray(fitted_points_base, dtype=np.float32).reshape((-1, 3))
+            if len(fitted_points) > 0:
+                valid_z = fitted_points[np.isfinite(fitted_points[:, 2]), 2]
+                if len(valid_z) > 0:
+                    template_bottom_z_mm = float(np.min(valid_z) * 1000.0)
+
+        with self.lock:
+            if grasp_z_mm is not None:
+                self.recent_grasp_z_mm_buffer.append(grasp_z_mm)
+            if template_bottom_z_mm is not None:
+                self.recent_template_bottom_z_mm_buffer.append(template_bottom_z_mm)
+
+    def finalize_place_z_from_recent_samples(self):
+        with self.lock:
+            self.frozen_place_z_mm = None
+            self.frozen_place_z_raw_mm = None
+            self.frozen_place_z_grasp_median_mm = None
+            self.frozen_place_z_template_bottom_median_mm = None
+            self.frozen_place_z_used_fallback = True
+
+            grasp_samples = np.asarray(self.recent_grasp_z_mm_buffer, dtype=np.float32)
+            template_bottom_samples = np.asarray(self.recent_template_bottom_z_mm_buffer, dtype=np.float32)
+            if (
+                len(grasp_samples) < PLACE_Z_MIN_VALID_SAMPLES
+                or len(template_bottom_samples) < PLACE_Z_MIN_VALID_SAMPLES
+            ):
+                return {
+                    "valid": False,
+                    "reason": "insufficient_samples",
+                    "grasp_sample_count": int(len(grasp_samples)),
+                    "template_bottom_sample_count": int(len(template_bottom_samples)),
+                    "grasp_z_median_mm": None,
+                    "template_bottom_z_median_mm": None,
+                    "raw_place_z_mm": None,
+                    "place_z_mm": None,
+                }
+
+            grasp_z_median_mm = float(np.median(grasp_samples))
+            template_bottom_z_median_mm = float(np.median(template_bottom_samples))
+            raw_place_z_mm = float(grasp_z_median_mm - template_bottom_z_median_mm)
+            place_z_mm = max(raw_place_z_mm, HOME_PLACE_MIN_Z_MM)
+
+            self.frozen_place_z_mm = place_z_mm
+            self.frozen_place_z_raw_mm = raw_place_z_mm
+            self.frozen_place_z_grasp_median_mm = grasp_z_median_mm
+            self.frozen_place_z_template_bottom_median_mm = template_bottom_z_median_mm
+            self.frozen_place_z_used_fallback = False
+            return {
+                "valid": True,
+                "reason": "ok",
+                "grasp_sample_count": int(len(grasp_samples)),
+                "template_bottom_sample_count": int(len(template_bottom_samples)),
+                "grasp_z_median_mm": grasp_z_median_mm,
+                "template_bottom_z_median_mm": template_bottom_z_median_mm,
+                "raw_place_z_mm": raw_place_z_mm,
+                "place_z_mm": place_z_mm,
+            }
+
     def request_follow_pause(self):
         with self.lock:
             self.follow_pause_requested = True
@@ -976,9 +840,11 @@ class FollowSharedState:
             self.valid_detection_streak = 0
             self.prediction_armed = False
             self.reference_object_xy_mm = None
+            self.reference_object_xyz_mm = None
             self.reference_locked = False
             self.motion_triggered = False
             self.reference_streak = 0
+            self.initial_object_label = None
             self.fixed_z_mm = None
             self.fixed_orientation_base = None
             self.initial_pose_base = None
@@ -994,6 +860,13 @@ class FollowSharedState:
             self.pregrasp_started = False
             self.grasp_closed = False
             self.grasp_offset_xyz_mm = None
+            self.recent_grasp_z_mm_buffer.clear()
+            self.recent_template_bottom_z_mm_buffer.clear()
+            self.frozen_place_z_mm = None
+            self.frozen_place_z_raw_mm = None
+            self.frozen_place_z_grasp_median_mm = None
+            self.frozen_place_z_template_bottom_median_mm = None
+            self.frozen_place_z_used_fallback = True
             self.task_state = "FOLLOW"
             self.task_epoch += 1
             self._reset_prediction_locked(reset_arm=True)
@@ -1009,7 +882,15 @@ class FollowSharedState:
     def wait_for_follow_idle(self, timeout_s):
         return self.follow_idle_event.wait(timeout=max(float(timeout_s), 0.0))
 
-    def update_target(self, grasp_xyz_m, object_xyz_m=None, pixel_xy=None, eef_xyz_mm=None, measurement_source="measured"):
+    def update_target(
+        self,
+        grasp_xyz_m,
+        object_xyz_m=None,
+        pixel_xy=None,
+        eef_xyz_mm=None,
+        measurement_source="measured",
+        object_label=None,
+    ):
         if object_xyz_m is None:
             self.clear_target(reset_prediction=False, reset_arm=False)
             return
@@ -1017,6 +898,9 @@ class FollowSharedState:
         measurement_source = str(measurement_source or "measured").strip().lower()
         if measurement_source not in {"measured", "hand_fallback"}:
             measurement_source = "measured"
+        normalized_object_label = None
+        if object_label is not None:
+            normalized_object_label = str(object_label).strip().lower() or None
 
         object_xyz_mm = np.asarray(object_xyz_m, dtype=np.float32)[:3] * 1000.0
         object_xy_mm = object_xyz_mm[:2].copy()
@@ -1056,18 +940,43 @@ class FollowSharedState:
                 self.reference_streak += 1
                 if self.reference_streak >= REFERENCE_LOCK_COUNT:
                     self.reference_object_xy_mm = object_xy_mm.copy()
+                    self.reference_object_xyz_mm = object_xyz_mm.copy()
                     self.reference_locked = True
                     self.motion_triggered = False
-                    print(f"[INFO] Reference object position locked: {self.reference_object_xy_mm}")
+                    print(f"[INFO] Reference object position locked: {self.reference_object_xyz_mm}")
                 self.latest_target_xyz_mm = None
                 self.valid_detection_streak = 0
                 self._reset_prediction_locked(reset_arm=True)
                 return
 
+            if (
+                measurement_source == "measured"
+                and not self.motion_triggered
+                and normalized_object_label is not None
+                and self.initial_object_label != normalized_object_label
+            ):
+                self.initial_object_label = normalized_object_label
+                print(
+                    "[INFO] Cached initial segmentation label for grasp threshold: "
+                    f"label={self.initial_object_label}"
+                )
+
             move_dist_mm = float(np.linalg.norm(object_xy_mm - self.reference_object_xy_mm))
-            if not self.motion_triggered and move_dist_mm >= MOTION_TRIGGER_MM:
+            move_dist_z_mm = 0.0
+            if self.reference_object_xyz_mm is not None:
+                move_dist_z_mm = float(abs(object_xyz_mm[2] - self.reference_object_xyz_mm[2]))
+            if (
+                not self.motion_triggered
+                and (
+                    move_dist_mm >= MOTION_TRIGGER_MM
+                    or move_dist_z_mm >= MOTION_TRIGGER_Z_MM
+                )
+            ):
                 self.motion_triggered = True
-                print(f"[INFO] Object motion detected: {move_dist_mm:.2f} mm -> follow start")
+                print(
+                    "[INFO] Object motion detected: "
+                    f"xy={move_dist_mm:.2f} mm, z={move_dist_z_mm:.2f} mm -> follow start"
+                )
 
             self.latest_target_xyz_mm = target_xyz_mm.copy()
             self.valid_detection_streak += 1
@@ -1154,12 +1063,17 @@ class FollowSharedState:
                 "fixed_z_mm": self.fixed_z_mm,
                 "fixed_orientation_base": None if self.fixed_orientation_base is None else tuple(self.fixed_orientation_base),
                 "latest_object_xyz_mm": None if self.latest_object_xyz_mm is None else self.latest_object_xyz_mm.copy(),
+                "initial_object_label": self.initial_object_label,
                 "object_stopped": self.object_stopped,
                 "pregrasp_started": self.pregrasp_started,
                 "initial_pose_base": None if self.initial_pose_base is None else tuple(self.initial_pose_base),
                 "task_state": self.task_state,
                 "task_epoch": self.task_epoch,
             }
+
+    def get_initial_object_label(self):
+        with self.lock:
+            return self.initial_object_label
 
     def get_follow_status_text(self):
         snapshot = self.get_snapshot()
@@ -1202,6 +1116,7 @@ class FollowSharedState:
 
         if stable_xy and stable_z:
             self.home_object_xyz_mm = buf.mean(axis=0)
+            self.home_object_xyz_mm[1] = 0.0
 
             if len(self.home_pixel_buffer) > 0:
                 pix_buf = np.stack(self.home_pixel_buffer, axis=0)
@@ -1243,7 +1158,7 @@ class FollowSharedState:
     def should_start_pregrasp(
         self,
         controller,
-        x_tol_mm=180.0,
+        x_tol_mm=210.0,
         y_tol_mm=30.0,
         z_tol_mm=30.0,
     ):
@@ -1280,147 +1195,147 @@ class FollowSharedState:
         return x_ok and y_ok and z_ok
 
 
-class TaskTargetLogger:
-    def __init__(self, shared_state, output_dir, sample_hz):
-        self.shared_state = shared_state
-        self.output_dir = Path(output_dir)
-        self.sample_hz = max(float(sample_hz), 1e-6)
-        self.sample_interval_s = 1.0 / self.sample_hz
-        self.stop_event = threading.Event()
-        self.thread = None
+# class TaskTargetLogger:
+#     def __init__(self, shared_state, output_dir, sample_hz):
+#         self.shared_state = shared_state
+#         self.output_dir = Path(output_dir)
+#         self.sample_hz = max(float(sample_hz), 1e-6)
+#         self.sample_interval_s = 1.0 / self.sample_hz
+#         self.stop_event = threading.Event()
+#         self.thread = None
 
-        self._lock = threading.Lock()
-        self._active = False
-        self._session_epoch = None
-        self._session_index = 0
-        self._sample_index = 0
-        self._session_started_wall_time = None
-        self._session_started_perf = None
-        self._csv_file = None
-        self._csv_writer = None
-        self._csv_path = None
-        self._completed_epochs = set()
+#         self._lock = threading.Lock()
+#         self._active = False
+#         self._session_epoch = None
+#         self._session_index = 0
+#         self._sample_index = 0
+#         self._session_started_wall_time = None
+#         self._session_started_perf = None
+#         self._csv_file = None
+#         self._csv_writer = None
+#         self._csv_path = None
+#         self._completed_epochs = set()
 
-    def start(self):
-        if self.thread is not None:
-            return
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.thread.start()
+#     def start(self):
+#         if self.thread is not None:
+#             return
+#         self.thread = threading.Thread(target=self._run, daemon=True)
+#         self.thread.start()
 
-    def stop(self):
-        self.stop_event.set()
-        if self.thread is not None:
-            self.thread.join(timeout=1.0)
-        with self._lock:
-            self._finalize_locked("shutdown")
+#     def stop(self):
+#         self.stop_event.set()
+#         if self.thread is not None:
+#             self.thread.join(timeout=1.0)
+#         with self._lock:
+#             self._finalize_locked("shutdown")
 
-    def abort_session(self, reason="aborted"):
-        with self._lock:
-            self._finalize_locked(reason)
+#     def abort_session(self, reason="aborted"):
+#         with self._lock:
+#             self._finalize_locked(reason)
 
-    def _run(self):
-        while not self.stop_event.is_set():
-            sample_perf = time.perf_counter()
-            sample_wall = time.time()
-            snapshot = self.shared_state.get_snapshot(now_perf=sample_perf)
+#     def _run(self):
+#         while not self.stop_event.is_set():
+#             sample_perf = time.perf_counter()
+#             sample_wall = time.time()
+#             snapshot = self.shared_state.get_snapshot(now_perf=sample_perf)
 
-            with self._lock:
-                if self._active and snapshot["task_epoch"] != self._session_epoch:
-                    self._finalize_locked("reset")
+#             with self._lock:
+#                 if self._active and snapshot["task_epoch"] != self._session_epoch:
+#                     self._finalize_locked("reset")
 
-                can_open = (
-                    (not self._active)
-                    and snapshot["task_state"] == "FOLLOW"
-                    and snapshot["last_measured_target_t"] > 0.0
-                    and int(snapshot["task_epoch"]) not in self._completed_epochs
-                )
-                if can_open:
-                    self._open_locked(snapshot["task_epoch"], sample_wall, sample_perf)
+#                 can_open = (
+#                     (not self._active)
+#                     and snapshot["task_state"] == "FOLLOW"
+#                     and snapshot["last_measured_target_t"] > 0.0
+#                     and int(snapshot["task_epoch"]) not in self._completed_epochs
+#                 )
+#                 if can_open:
+#                     self._open_locked(snapshot["task_epoch"], sample_wall, sample_perf)
 
-                if self._active:
-                    self._write_row_locked(sample_wall, sample_perf, snapshot)
-                    if snapshot["task_state"] == "DONE":
-                        self._finalize_locked("done")
+#                 if self._active:
+#                     self._write_row_locked(sample_wall, sample_perf, snapshot)
+#                     if snapshot["task_state"] == "DONE":
+#                         self._finalize_locked("done")
 
-            self.stop_event.wait(self.sample_interval_s)
+#             self.stop_event.wait(self.sample_interval_s)
 
-    def _open_locked(self, task_epoch, sample_wall, sample_perf):
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self._session_index += 1
-        self._sample_index = 0
-        self._session_epoch = int(task_epoch)
-        self._session_started_wall_time = float(sample_wall)
-        self._session_started_perf = float(sample_perf)
-        timestamp = datetime.fromtimestamp(sample_wall).strftime("%Y%m%d_%H%M%S")
-        self._csv_path = self.output_dir / f"target_points_task{self._session_index:03d}_{timestamp}.csv"
-        self._csv_file = self._csv_path.open("w", newline="", encoding="utf-8")
-        self._csv_writer = csv.writer(self._csv_file)
-        self._csv_writer.writerow(
-            [
-                "sample_index",
-                "wall_time_iso",
-                "elapsed_s",
-                "task_epoch",
-                "task_state",
-                "target_source",
-                "measurement_age_s",
-                "prediction_age_s",
-                "raw_target_x_mm",
-                "raw_target_y_mm",
-                "raw_target_z_mm",
-                "control_target_x_mm",
-                "control_target_y_mm",
-                "control_target_z_mm",
-            ]
-        )
-        self._active = True
-        print(f"[INFO] Target point logging started: {self._csv_path}")
+#     def _open_locked(self, task_epoch, sample_wall, sample_perf):
+#         self.output_dir.mkdir(parents=True, exist_ok=True)
+#         self._session_index += 1
+#         self._sample_index = 0
+#         self._session_epoch = int(task_epoch)
+#         self._session_started_wall_time = float(sample_wall)
+#         self._session_started_perf = float(sample_perf)
+#         timestamp = datetime.fromtimestamp(sample_wall).strftime("%Y%m%d_%H%M%S")
+#         self._csv_path = self.output_dir / f"target_points_task{self._session_index:03d}_{timestamp}.csv"
+#         self._csv_file = self._csv_path.open("w", newline="", encoding="utf-8")
+#         self._csv_writer = csv.writer(self._csv_file)
+#         self._csv_writer.writerow(
+#             [
+#                 "sample_index",
+#                 "wall_time_iso",
+#                 "elapsed_s",
+#                 "task_epoch",
+#                 "task_state",
+#                 "target_source",
+#                 "measurement_age_s",
+#                 "prediction_age_s",
+#                 "raw_target_x_mm",
+#                 "raw_target_y_mm",
+#                 "raw_target_z_mm",
+#                 "control_target_x_mm",
+#                 "control_target_y_mm",
+#                 "control_target_z_mm",
+#             ]
+#         )
+#         self._active = True
+#         print(f"[INFO] Target point logging started: {self._csv_path}")
 
-    def _write_row_locked(self, sample_wall, sample_perf, snapshot):
-        if self._csv_writer is None:
-            return
+#     def _write_row_locked(self, sample_wall, sample_perf, snapshot):
+#         if self._csv_writer is None:
+#             return
 
-        self._sample_index += 1
-        raw_target = snapshot["latest_target_xyz_mm"]
-        control_target = snapshot["control_target_xyz_mm"]
-        raw_values = ["NaN", "NaN", "NaN"] if raw_target is None else [f"{float(v):.6f}" for v in raw_target]
-        control_values = ["NaN", "NaN", "NaN"] if control_target is None else [f"{float(v):.6f}" for v in control_target]
-        measurement_age = "NaN" if snapshot["measurement_age_s"] is None else f"{float(snapshot['measurement_age_s']):.6f}"
-        prediction_age = "NaN" if snapshot["prediction_age_s"] is None else f"{float(snapshot['prediction_age_s']):.6f}"
-        elapsed_s = float(sample_perf - self._session_started_perf)
-        self._csv_writer.writerow(
-            [
-                self._sample_index,
-                datetime.fromtimestamp(sample_wall).isoformat(timespec="milliseconds"),
-                f"{elapsed_s:.6f}",
-                snapshot["task_epoch"],
-                snapshot["task_state"],
-                snapshot["target_source"],
-                measurement_age,
-                prediction_age,
-                *raw_values,
-                *control_values,
-            ]
-        )
-        self._csv_file.flush()
+#         self._sample_index += 1
+#         raw_target = snapshot["latest_target_xyz_mm"]
+#         control_target = snapshot["control_target_xyz_mm"]
+#         raw_values = ["NaN", "NaN", "NaN"] if raw_target is None else [f"{float(v):.6f}" for v in raw_target]
+#         control_values = ["NaN", "NaN", "NaN"] if control_target is None else [f"{float(v):.6f}" for v in control_target]
+#         measurement_age = "NaN" if snapshot["measurement_age_s"] is None else f"{float(snapshot['measurement_age_s']):.6f}"
+#         prediction_age = "NaN" if snapshot["prediction_age_s"] is None else f"{float(snapshot['prediction_age_s']):.6f}"
+#         elapsed_s = float(sample_perf - self._session_started_perf)
+#         self._csv_writer.writerow(
+#             [
+#                 self._sample_index,
+#                 datetime.fromtimestamp(sample_wall).isoformat(timespec="milliseconds"),
+#                 f"{elapsed_s:.6f}",
+#                 snapshot["task_epoch"],
+#                 snapshot["task_state"],
+#                 snapshot["target_source"],
+#                 measurement_age,
+#                 prediction_age,
+#                 *raw_values,
+#                 *control_values,
+#             ]
+#         )
+#         self._csv_file.flush()
 
-    def _finalize_locked(self, reason):
-        if not self._active:
-            return
-        session_epoch = self._session_epoch
-        csv_path = self._csv_path
-        if self._csv_file is not None:
-            self._csv_file.close()
-        self._active = False
-        self._session_epoch = None
-        self._session_started_wall_time = None
-        self._session_started_perf = None
-        self._csv_file = None
-        self._csv_writer = None
-        self._csv_path = None
-        if reason == "done" and session_epoch is not None:
-            self._completed_epochs.add(int(session_epoch))
-        print(f"[INFO] Target point logging finished ({reason}): {csv_path}")
+#     def _finalize_locked(self, reason):
+#         if not self._active:
+#             return
+#         session_epoch = self._session_epoch
+#         csv_path = self._csv_path
+#         if self._csv_file is not None:
+#             self._csv_file.close()
+#         self._active = False
+#         self._session_epoch = None
+#         self._session_started_wall_time = None
+#         self._session_started_perf = None
+#         self._csv_file = None
+#         self._csv_writer = None
+#         self._csv_path = None
+#         if reason == "done" and session_epoch is not None:
+#             self._completed_epochs.add(int(session_epoch))
+#         print(f"[INFO] Target point logging finished ({reason}): {csv_path}")
 
 
 def robot_control_loop(controller, shared_state, args):
@@ -1604,11 +1519,12 @@ def configure_gripper_position_threshold_for_label(controller, label):
     if controller is None:
         return None
 
-    current_threshold = int(
-        getattr(controller, "gripper_position_complete_threshold", DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD)
-    )
     if not hasattr(controller, "_default_gripper_position_complete_threshold"):
-        controller._default_gripper_position_complete_threshold = current_threshold
+        controller._default_gripper_position_complete_threshold = int(
+            controller.config.get("robot", {})
+            .get("gripper", {})
+            .get("position_complete_threshold", DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD)
+        )
 
     normalized_label = "" if label is None else str(label).strip().lower()
     if normalized_label == "wine glass":
@@ -1626,8 +1542,62 @@ def configure_gripper_position_threshold_for_label(controller, label):
     return int(position_threshold)
 
 
-def reset_system_to_start_state(controller, shared_state, args, target_logger=None, metadata_recorder=None, pipeline=None):
+def start_task_video_recording(video_recorder, task_ready_timestamp):
+    if video_recorder is None:
+        return
+    ok, message = video_recorder.start_recording_for_task(task_start_timestamp_iso=task_ready_timestamp)
+    level = "[INFO]" if ok else "[WARN]"
+    print(f"{level} Video recorder: {message}")
+
+
+def open_video_recorder_ui(video_recorder):
+    if video_recorder is None:
+        return
+    opened, url = video_recorder.open_browser()
+    if opened:
+        print(f"[INFO] Video recorder UI opened: {url}")
+    else:
+        print(f"[INFO] Open the video recorder UI to finalize save: {url}")
+
+
+def discard_video_recording_for_reset(video_recorder):
+    if video_recorder is None:
+        return
+    ok, message = video_recorder.discard_pending_recording()
+    if ok:
+        print(f"[INFO] Video recorder reset discard: {message}")
+    elif message != "nothing to discard":
+        print(f"[WARN] Video recorder reset discard failed: {message}")
+    else:
+        print("[INFO] Video recorder reset discard: nothing to discard")
+
+    try:
+        status = video_recorder.get_status()
+    except Exception as exc:
+        print(f"[WARN] Video recorder status check failed after reset: {exc}")
+        return
+
+    has_live_frame = bool(status.get("has_live_frame"))
+    last_frame_age_ms = status.get("last_frame_age_ms")
+    if has_live_frame:
+        age_text = "-" if last_frame_age_ms is None else f"{int(last_frame_age_ms)} ms"
+        print(f"[INFO] Video recorder kept live stream active after reset (last_frame_age={age_text}).")
+    else:
+        print("[WARN] Video recorder has no live frame after reset; next task recording will wait for the next frame.")
+
+
+def reset_system_to_start_state(
+    controller,
+    shared_state,
+    args,
+    target_logger=None,
+    metadata_recorder=None,
+    pipeline=None,
+    video_recorder=None,
+):
     print("[INFO] Reset requested: returning to startup state")
+    task_start_perf = None
+    discard_video_recording_for_reset(video_recorder)
     if target_logger is not None:
         target_logger.abort_session("reset")
     if pipeline is not None:
@@ -1660,59 +1630,12 @@ def reset_system_to_start_state(controller, shared_state, args, target_logger=No
     shared_state.set_fixed_pose_from_robot(controller)
     if metadata_recorder is not None:
         task_ready_timestamp = metadata_recorder.mark_task_ready(shared_state)
+        task_start_perf = time.perf_counter()
         print(f"[INFO] Metadata task start timestamp={task_ready_timestamp}")
+        start_task_video_recording(video_recorder, task_ready_timestamp)
     shared_state.clear_follow_pause()
     print("[INFO] Reset complete. System is back at startup state.")
-
-
-def execute_pregrasp_x_only(controller, shared_state, args):
-    snap = shared_state.get_snapshot()
-    grasp_xyz = snap["latest_grasp_xyz_mm"]
-    obj_xyz = snap["latest_object_xyz_mm"]
-    fixed_orientation_base = snap["fixed_orientation_base"]
-
-    approach_xyz = grasp_xyz if grasp_xyz is not None else obj_xyz
-    if approach_xyz is None or fixed_orientation_base is None:
-        print("[WARN] No grasp/object pose available for pregrasp.")
-        return False
-
-    state = controller.read_robot_state(now_timestamp=time.time())
-    cur_pose = state.actual_tcp_pose_base
-    if cur_pose is None:
-        print("[WARN] Failed to read current robot pose.")
-        return False
-
-    cur_x, cur_y, cur_z = meters_to_mm(cur_pose[:3])
-    obj_x, obj_y, obj_z = approach_xyz
-
-    target_x = obj_x + PREGRASP_X_OFFSET_MM
-    target_y = cur_y
-    target_z = cur_z
-    target_x, target_y, target_z = clamp_pose_mm(target_x, target_y, target_z, args)
-
-    print("[INFO] PREGRASP start")
-    print(f"[INFO] current pose: x={cur_x:.1f}, y={cur_y:.1f}, z={cur_z:.1f}")
-    print(f"[INFO] object xyz:  x={obj_x:.1f}, y={obj_y:.1f}, z={obj_z:.1f}")
-    print(f"[INFO] pregrasp target: x={target_x:.1f}, y={target_y:.1f}, z={target_z:.1f}")
-
-    shared_state.stop_follow()
-    if not stop_follow_for_handoff(controller, shared_state, args.follow_handoff_timeout_s):
-        return False
-
-    ok = move_robot_and_wait(
-        controller,
-        mm_to_m_tuple([target_x, target_y, target_z]),
-        fixed_orientation_base,
-        timeout_s=args.move_timeout_s,
-        tolerance_m=args.position_tolerance_m,
-        source_mode="pregrasp",
-    )
-    if not ok:
-        print("[WARN] Pregrasp move timed out.")
-        return False
-
-    print("[INFO] PREGRASP reached")
-    return True
+    return task_start_perf
 
 
 def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True, metadata_recorder=None):
@@ -1865,9 +1788,25 @@ def save_grasp_offset(controller, shared_state):
     with shared_state.lock:
         shared_state.grasp_offset_xyz_mm = grasp_offset_xyz
         shared_state.grasp_closed = True
+    place_z_result = shared_state.finalize_place_z_from_recent_samples()
     shared_state.set_task_state("GRASPED", reset_prediction=True, reset_arm=True)
 
     print(f"[INFO] grasp_offset_xyz_mm saved: {grasp_offset_xyz}")
+    if place_z_result["valid"]:
+        print(
+            "[INFO] frozen_place_z_mm saved: "
+            f"grasp_z_med={place_z_result['grasp_z_median_mm']:.1f}, "
+            f"template_bottom_z_med={place_z_result['template_bottom_z_median_mm']:.1f}, "
+            f"raw_place_z={place_z_result['raw_place_z_mm']:.1f}, "
+            f"place_z={place_z_result['place_z_mm']:.1f}"
+        )
+    else:
+        print(
+            "[WARN] frozen_place_z_mm fallback armed: "
+            f"reason={place_z_result['reason']}, "
+            f"grasp_samples={place_z_result['grasp_sample_count']}, "
+            f"template_bottom_samples={place_z_result['template_bottom_sample_count']}"
+        )
     return True
 
 
@@ -1875,15 +1814,39 @@ def compute_place_target(shared_state):
     with shared_state.lock:
         home_xyz = None if shared_state.home_object_xyz_mm is None else shared_state.home_object_xyz_mm.copy()
         grasp_offset = None if shared_state.grasp_offset_xyz_mm is None else shared_state.grasp_offset_xyz_mm.copy()
+        frozen_place_z_mm = shared_state.frozen_place_z_mm
+        frozen_place_z_raw_mm = shared_state.frozen_place_z_raw_mm
+        frozen_place_z_grasp_median_mm = shared_state.frozen_place_z_grasp_median_mm
+        frozen_place_z_template_bottom_median_mm = shared_state.frozen_place_z_template_bottom_median_mm
 
-    if home_xyz is None or grasp_offset is None:
-        return None
+    if home_xyz is None:
+        return None, {
+            "used_fallback": True,
+            "fallback_reason": "no_home_xyz",
+            "grasp_z_median_mm": None,
+            "template_bottom_z_median_mm": None,
+            "raw_place_z_mm": None,
+        }
 
-    return home_xyz - grasp_offset
+    if grasp_offset is not None:
+        home_xyz[0] -= grasp_offset[0]
+    home_xyz[0] += HOME_PLACE_X_OFFSET_MM
+    home_xyz[1] += HOME_PLACE_Y_OFFSET_MM
+    debug = {
+        "used_fallback": frozen_place_z_mm is None,
+        "fallback_reason": "home_z" if frozen_place_z_mm is None else "none",
+        "grasp_z_median_mm": frozen_place_z_grasp_median_mm,
+        "template_bottom_z_median_mm": frozen_place_z_template_bottom_median_mm,
+        "raw_place_z_mm": float(home_xyz[2]) if frozen_place_z_raw_mm is None else float(frozen_place_z_raw_mm),
+    }
+    if frozen_place_z_mm is not None:
+        home_xyz[2] = float(frozen_place_z_mm)
+    home_xyz[2] = max(float(home_xyz[2]), HOME_PLACE_MIN_Z_MM)
+    return home_xyz, debug
 
 
 def execute_return_and_place(controller, shared_state, args, metadata_recorder=None):
-    target_eef_xyz = compute_place_target(shared_state)
+    target_eef_xyz, place_target_debug = compute_place_target(shared_state)
     if target_eef_xyz is None:
         print("[WARN] Cannot compute place target.")
         return False
@@ -1904,8 +1867,31 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
     place_z = target_z + DESCEND_EXTRA_MM
     place_x, place_y, place_z = clamp_pose_mm(target_x, target_y, place_z, args)
 
+    grasp_z_med_text = (
+        "-"
+        if place_target_debug["grasp_z_median_mm"] is None
+        else f"{float(place_target_debug['grasp_z_median_mm']):.1f}"
+    )
+    template_bottom_z_med_text = (
+        "-"
+        if place_target_debug["template_bottom_z_median_mm"] is None
+        else f"{float(place_target_debug['template_bottom_z_median_mm']):.1f}"
+    )
+    raw_place_z_text = (
+        "-"
+        if place_target_debug["raw_place_z_mm"] is None
+        else f"{float(place_target_debug['raw_place_z_mm']):.1f}"
+    )
+
     print(f"[INFO] RETURN hover target: ({hover_x:.1f}, {hover_y:.1f}, {hover_z:.1f})")
     print(f"[INFO] PLACE target: ({place_x:.1f}, {place_y:.1f}, {place_z:.1f})")
+    print(
+        "[INFO] PLACE z debug: "
+        f"grasp_z_med={grasp_z_med_text} "
+        f"template_bottom_z_med={template_bottom_z_med_text} "
+        f"raw_place_z={raw_place_z_text} "
+        f"fallback={place_target_debug['used_fallback']}"
+    )
 
     move_sequence = [
         ("return_hover", [hover_x, hover_y, hover_z]),
@@ -1977,10 +1963,6 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
         metadata_recorder.note_delivery_location(home_xyz)
 
     shared_state.set_task_state("DONE", reset_prediction=True, reset_arm=True)
-    if metadata_recorder is not None:
-        csv_path = metadata_recorder.record_completion()
-        if csv_path is not None:
-            print(f"[INFO] Handover metadata appended: {csv_path}")
 
     print("[INFO] RETURN + PLACE done")
     return True
@@ -2141,6 +2123,16 @@ def choose_point(primary, fallback=None):
     return primary if primary is not None else fallback
 
 
+def offset_point_base_mm(point_base, *, x_mm=0.0, y_mm=0.0, z_mm=0.0):
+    if point_base is None:
+        return None
+    point = np.asarray(point_base, dtype=np.float32).reshape(3).copy()
+    point[0] += float(x_mm) / 1000.0
+    point[1] += float(y_mm) / 1000.0
+    point[2] += float(z_mm) / 1000.0
+    return tuple(float(v) for v in point)
+
+
 def _summarize_class_names(class_names):
     if not class_names:
         return "-"
@@ -2204,21 +2196,42 @@ def render_camera_mask_preview(
         if pixel is None:
             continue
         cv.circle(image_bgr, pixel, 6, color_bgr, -1, cv.LINE_AA)
-        cv.putText(image_bgr, label, (pixel[0] + 8, pixel[1] - 8), cv.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv.LINE_AA)
-        cv.putText(image_bgr, label, (pixel[0] + 8, pixel[1] - 8), cv.FONT_HERSHEY_SIMPLEX, 0.55, color_bgr, 1, cv.LINE_AA)
+        # cv.putText(image_bgr, label, (pixel[0] + 8, pixel[1] - 8), cv.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv.LINE_AA)
+        # cv.putText(image_bgr, label, (pixel[0] + 8, pixel[1] - 8), cv.FONT_HERSHEY_SIMPLEX, 0.55, color_bgr, 1, cv.LINE_AA)
 
-    title = f"{camera_label} view"
-    cv.putText(image_bgr, title, (12, 28), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv.LINE_AA)
-    cv.putText(image_bgr, title, (12, 28), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
-    all_summary, selected_summary = get_segmentation_class_summary(object_worker)
-    info_lines = [
-        f"seg all: {all_summary}",
-        f"seg selected: {selected_summary}",
-    ]
-    for line_index, text_line in enumerate(info_lines):
-        origin = (12, 54 + line_index * 22)
-        cv.putText(image_bgr, text_line, origin, cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv.LINE_AA)
-        cv.putText(image_bgr, text_line, origin, cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv.LINE_AA)
+    # title = f"{camera_label} view"
+    # cv.putText(image_bgr, title, (12, 28), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv.LINE_AA)
+    # cv.putText(image_bgr, title, (12, 28), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
+    # all_summary, selected_summary = get_segmentation_class_summary(object_worker)
+    # info_lines = [
+    #     f"seg all: {all_summary}",
+    #     f"seg selected: {selected_summary}",
+    # ]
+    # for line_index, text_line in enumerate(info_lines):
+    #     origin = (12, 54 + line_index * 22)
+    #     cv.putText(image_bgr, text_line, origin, cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv.LINE_AA)
+    #     cv.putText(image_bgr, text_line, origin, cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv.LINE_AA)
+    return image_bgr
+
+
+def format_record_clock(elapsed_s):
+    if elapsed_s is None:
+        return None
+    elapsed_s = max(float(elapsed_s), 0.0)
+    minutes = int(elapsed_s // 60.0)
+    seconds = int(elapsed_s % 60.0)
+    tenths = int((elapsed_s - int(elapsed_s)) * 10.0)
+    return f"REC {minutes:02d}:{seconds:02d}.{tenths:d}"
+
+
+def draw_record_clock_overlay(image_bgr, elapsed_s):
+    clock_text = format_record_clock(elapsed_s)
+    if not clock_text:
+        return image_bgr
+
+    origin = (18, 42)
+    cv.putText(image_bgr, clock_text, origin, cv.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 5, cv.LINE_AA)
+    cv.putText(image_bgr, clock_text, origin, cv.FONT_HERSHEY_SIMPLEX, 1.0, (40, 40, 255), 2, cv.LINE_AA)
     return image_bgr
 
 
@@ -2237,6 +2250,7 @@ def render_cam0_perception_debug(
     shared_state,
     model_label,
     fps,
+    record_elapsed_s=None,
 ):
     image_bgr = np.asarray(snapshot.cam0.color_image).copy()
 
@@ -2301,57 +2315,58 @@ def render_cam0_perception_debug(
     shape_fit_icp_fitness_text = "-" if shape_fit_icp_fitness is None else f"{float(shape_fit_icp_fitness):.3f}"
     shape_fit_icp_rmse_text = "-" if shape_fit_icp_rmse is None else f"{float(shape_fit_icp_rmse):.4f}"
 
-    lines = [
-        f"model: {model_label}",
-        f"fps: {fps:.1f}",
-        f"merged_obj={bool(merged_object.valid)} points={merged_object.merged_point_count} proj={len(merged_pixels)}",
-        (
-            "shape_fit="
-            f"{bool(shape_fitting_state.valid)} init={bool(shape_fitting_state.initialized)} "
-            f"template={shape_fitting_state.template_id or '-'} "
-            f"scale={'-' if shape_fitting_state.scale is None else f'{shape_fitting_state.scale:.3f}'}"
-        ),
-        (
-            "shape_fit_reason="
-            f"{shape_fitting_state.reason} raw_points={raw_merged_object.merged_point_count} "
-            f"fitted_points={len(np.asarray(shape_fitting_state.fitted_points_base, dtype=np.float32).reshape((-1, 3)))}"
-        ),
-        (
-            "shape_fit_icp="
-            f"mode={shape_fit_mode} "
-            f"time={shape_fit_icp_time_text} "
-            f"fps={shape_fit_icp_fps_text} "
-            f"fit={shape_fit_icp_fitness_text} "
-            f"rmse={shape_fit_icp_rmse_text}"
-        ),
-        f"hand={bool(selected_hand.valid)} cam={selected_hand.selected_camera} handed={selected_hand.handedness}",
-        (
-            "grasp_valid="
-            f"{bool(grasp_target.valid)} grasp={format_vec3(grasp_target.target_position_base)} "
-            f"grasp_hold={bool(getattr(grasp_target, 'used_temporal_hold', False))} "
-            f"cand_idx={int(getattr(grasp_target, 'selected_candidate_index', -1))} "
-            f"xy_lock={bool(getattr(grasp_target, 'xy_locked_to_centroid', False))}"
-        ),
-        (
-            "hand_fallback="
-            f"{bool(getattr(hand_relative_fallback_state, 'valid', False))} "
-            f"obj={format_vec3(getattr(hand_relative_fallback_state, 'object_position_base', None))} "
-            f"grasp={format_vec3(getattr(hand_relative_fallback_state, 'grasp_position_base', None))} "
-            f"age={'-' if getattr(hand_relative_fallback_state, 'dropout_age_s', None) is None else f'{float(hand_relative_fallback_state.dropout_age_s):.3f}s'} "
-            f"reason={getattr(hand_relative_fallback_state, 'reason', None)}"
-        ),
-        f"object={format_vec3(object_point)}",
-        f"hand={format_vec3(hand_point)}",
-    ]
-    cam0_all_summary, cam0_selected_summary = get_segmentation_class_summary(pipeline["object_worker_cam0"])
-    lines.append(f"cam0 seg all={cam0_all_summary}")
-    lines.append(f"cam0 seg selected={cam0_selected_summary}")
-    lines.extend(shared_state.get_follow_status_text())
-
-    for line_index, text_line in enumerate(lines):
-        origin = (12, 28 + line_index * 24)
-        cv.putText(image_bgr, text_line, origin, cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv.LINE_AA)
-        cv.putText(image_bgr, text_line, origin, cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv.LINE_AA)
+    # lines = [
+    #     f"model: {model_label}",
+    #     f"fps: {fps:.1f}",
+    #     f"merged_obj={bool(merged_object.valid)} points={merged_object.merged_point_count} proj={len(merged_pixels)}",
+    #     (
+    #         "shape_fit="
+    #         f"{bool(shape_fitting_state.valid)} init={bool(shape_fitting_state.initialized)} "
+    #         f"template={shape_fitting_state.template_id or '-'} "
+    #         f"scale={'-' if shape_fitting_state.scale is None else f'{shape_fitting_state.scale:.3f}'}"
+    #     ),
+    #     (
+    #         "shape_fit_reason="
+    #         f"{shape_fitting_state.reason} raw_points={raw_merged_object.merged_point_count} "
+    #         f"fitted_points={len(np.asarray(shape_fitting_state.fitted_points_base, dtype=np.float32).reshape((-1, 3)))}"
+    #     ),
+    #     (
+    #         "shape_fit_icp="
+    #         f"mode={shape_fit_mode} "
+    #         f"time={shape_fit_icp_time_text} "
+    #         f"fps={shape_fit_icp_fps_text} "
+    #         f"fit={shape_fit_icp_fitness_text} "
+    #         f"rmse={shape_fit_icp_rmse_text}"
+    #     ),
+    #     f"hand={bool(selected_hand.valid)} cam={selected_hand.selected_camera} handed={selected_hand.handedness}",
+    #     (
+    #         "grasp_valid="
+    #         f"{bool(grasp_target.valid)} grasp={format_vec3(grasp_target.target_position_base)} "
+    #         f"grasp_hold={bool(getattr(grasp_target, 'used_temporal_hold', False))} "
+    #         f"cand_idx={int(getattr(grasp_target, 'selected_candidate_index', -1))} "
+    #         f"xy_lock={bool(getattr(grasp_target, 'xy_locked_to_centroid', False))}"
+    #     ),
+    #     (
+    #         "hand_fallback="
+    #         f"{bool(getattr(hand_relative_fallback_state, 'valid', False))} "
+    #         f"obj={format_vec3(getattr(hand_relative_fallback_state, 'object_position_base', None))} "
+    #         f"grasp={format_vec3(getattr(hand_relative_fallback_state, 'grasp_position_base', None))} "
+    #         f"age={'-' if getattr(hand_relative_fallback_state, 'dropout_age_s', None) is None else f'{float(hand_relative_fallback_state.dropout_age_s):.3f}s'} "
+    #         f"reason={getattr(hand_relative_fallback_state, 'reason', None)}"
+    #     ),
+    #     f"object={format_vec3(object_point)}",
+    #     f"hand={format_vec3(hand_point)}",
+    # ]
+    # cam0_all_summary, cam0_selected_summary = get_segmentation_class_summary(pipeline["object_worker_cam0"])
+    # lines.append(f"cam0 seg all={cam0_all_summary}")
+    # lines.append(f"cam0 seg selected={cam0_selected_summary}")
+    # lines.extend(shared_state.get_follow_status_text())
+    #
+    # for line_index, text_line in enumerate(lines):
+    #     origin = (12, 28 + line_index * 24)
+    #     cv.putText(image_bgr, text_line, origin, cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv.LINE_AA)
+    #     cv.putText(image_bgr, text_line, origin, cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv.LINE_AA)
+    image_bgr = draw_record_clock_overlay(image_bgr, record_elapsed_s)
     return image_bgr
 
 
@@ -2380,18 +2395,33 @@ def main():
 
     controller = None
     shared_state = FollowSharedState(args)
-    target_logger = TaskTargetLogger(shared_state, args.target_log_dir, args.fps)
+    target_logger = None
     metadata_recorder = HandoverMetadataRecorder()
-    target_logger.start()
+    video_recorder = None
     control_thread = None
     active_task_epoch = None
+    task_record_start_perf = None
+
+    try:
+        video_recorder = HandoverVideoRecorderService(
+            serial=VIDEO_RECORDER_SERIAL,
+            port=VIDEO_RECORDER_PORT,
+            metadata_recorder=metadata_recorder,
+        )
+        recorder_url = video_recorder.start_server()
+        print(f"[INFO] Video recorder UI ready: {recorder_url}")
+    except Exception as exc:
+        video_recorder = None
+        print(f"[WARN] Failed to start video recorder service: {exc}")
 
     if args.enable_follow:
         controller = init_rtde(args)
         move_robot_to_home_pose(controller, args)
         shared_state.set_fixed_pose_from_robot(controller)
         task_ready_timestamp = metadata_recorder.mark_task_ready(shared_state)
+        task_record_start_perf = time.perf_counter()
         print(f"[INFO] Metadata task start timestamp={task_ready_timestamp}")
+        start_task_video_recording(video_recorder, task_ready_timestamp)
 
         control_thread = threading.Thread(
             target=robot_control_loop,
@@ -2461,6 +2491,10 @@ def main():
                 fitted_merged_object.centroid_base,
             )
             measured_grasp_point_base = grasp_target.target_position_base if grasp_target.valid else None
+            measured_grasp_point_base = offset_point_base_mm(
+                measured_grasp_point_base,
+                y_mm=GRASP_POINT_Y_OFFSET_MM,
+            )
             hand_relative_fallback_state = pipeline["hand_relative_fallback"].process(
                 measured_object_position_base=measured_object_point_base,
                 measured_grasp_position_base=measured_grasp_point_base,
@@ -2487,6 +2521,11 @@ def main():
             )
 
             if object_point_base is not None:
+                shared_state.update_place_z_samples(
+                    grasp_point_base=grasp_point_base,
+                    object_point_base=object_point_base,
+                    fitted_points_base=shape_fitting_state.fitted_points_base,
+                )
                 eef_xyz_mm = None
                 if controller is not None:
                     state = controller.read_robot_state(now_timestamp=time.time())
@@ -2499,14 +2538,24 @@ def main():
                     object_pixel,
                     eef_xyz_mm=eef_xyz_mm,
                     measurement_source=measurement_source,
+                    object_label=merged_object.label,
                 )
                 if controller is not None and shared_state.should_start_pregrasp(controller):
                     print("[INFO] DIRECT GRASP trigger")
                     shared_state.stop_follow()
                     if stop_follow_for_handoff(controller, shared_state, args.follow_handoff_timeout_s):
+                        initial_threshold_label = shared_state.get_initial_object_label()
+                        threshold_label = initial_threshold_label or merged_object.label or fitted_merged_object.label
+                        print(
+                            "[INFO] Using grasp threshold label: "
+                            f"cached_initial={initial_threshold_label}, "
+                            f"merged={merged_object.label}, "
+                            f"fitted={fitted_merged_object.label}, "
+                            f"selected={threshold_label}"
+                        )
                         configure_gripper_position_threshold_for_label(
                             controller,
-                            fitted_merged_object.label,
+                            threshold_label,
                         )
                         grasp_ok = execute_gripper_close(
                             controller,
@@ -2530,6 +2579,7 @@ def main():
             instant_fps = 1.0 / max(now - last_loop_time, 1e-6)
             smoothed_fps = instant_fps if smoothed_fps == 0.0 else 0.9 * smoothed_fps + 0.1 * instant_fps
             last_loop_time = now
+            record_elapsed_s = None if task_record_start_perf is None else max(now - task_record_start_perf, 0.0)
 
             annotated = render_cam0_perception_debug(
                 snapshot,
@@ -2546,6 +2596,7 @@ def main():
                 shared_state,
                 model_label,
                 smoothed_fps,
+                record_elapsed_s=record_elapsed_s,
             )
             cam1_preview = render_camera_mask_preview(
                 snapshot,
@@ -2570,14 +2621,17 @@ def main():
                 shared_state.toggle_follow()
             elif key == ord("r"):
                 try:
-                    reset_system_to_start_state(
+                    reset_task_start_perf = reset_system_to_start_state(
                         controller,
                         shared_state,
                         args,
                         target_logger=target_logger,
                         metadata_recorder=metadata_recorder,
                         pipeline=pipeline,
+                        video_recorder=video_recorder,
                     )
+                    if reset_task_start_perf is not None:
+                        task_record_start_perf = reset_task_start_perf
                 except Exception as exc:
                     print(f"[WARN] Reset failed: {exc}")
             elif key == ord("s"):
@@ -2585,12 +2639,24 @@ def main():
                 shared_state.stop_follow()
                 shared_state.wait_for_follow_idle(args.follow_handoff_timeout_s)
                 safe_stop_rtde(controller)
+                if metadata_recorder is not None:
+                    csv_path = metadata_recorder.record_completion()
+                    if csv_path is not None:
+                        print(f"[INFO] Handover metadata appended: {csv_path}")
+                    else:
+                        print("[INFO] Handover metadata was already saved or no task metadata is available.")
+                if video_recorder is not None:
+                    ok, message = video_recorder.finish_recording_to_pending()
+                    level = "[INFO]" if ok else "[WARN]"
+                    print(f"{level} Video recorder: {message}")
+                    open_video_recorder_ui(video_recorder)
 
     finally:
         shared_state.stop_event.set()
         if control_thread is not None:
             control_thread.join(timeout=1.0)
-        target_logger.stop()
+        if target_logger is not None:
+            target_logger.stop()
         safe_stop_rtde(controller)
         disconnect_rtde(controller)
         try:
@@ -2600,6 +2666,8 @@ def main():
                 pipeline["hand_worker_cam1"].close()
             finally:
                 sensor_hub.stop()
+        if video_recorder is not None:
+            video_recorder.stop()
         cv.destroyAllWindows()
 
 

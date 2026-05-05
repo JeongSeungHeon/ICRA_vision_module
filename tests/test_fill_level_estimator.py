@@ -122,6 +122,27 @@ class FillLevelEstimatorTests(unittest.TestCase):
         self.assertAlmostEqual(float(cup_result.fill_height_mm), 30.0 + CUP_FILL_HEIGHT_BIAS_MM, places=5)
         self.assertAlmostEqual(float(wine_result.fill_height_mm), 30.0, places=5)
 
+    def test_estimate_fill_level_from_cam0_forced_empty_overrides_bias(self) -> None:
+        estimator = FillLevelEstimator(fillings_empty=True)
+        image = np.zeros((20, 20, 3), dtype=np.uint8)
+        mask = np.ones((20, 20), dtype=bool)
+        depth = np.ones((20, 20), dtype=np.float32)
+
+        result = estimator.estimate_fill_level_from_cam0(
+            color_image_bgr=image,
+            depth_image_m=depth,
+            intrinsics=self.intrinsics,
+            container_mask=mask,
+            camera_to_base=self.camera_to_base,
+            label="cup",
+        )
+
+        self.assertTrue(result.valid)
+        self.assertEqual(result.mask_mode, "forced_empty")
+        self.assertEqual(float(result.fill_height_mm), 0.0)
+        self.assertIsNone(result.rice_top_y_center)
+        self.assertIsNone(result.bottom_center_y)
+
 
 if __name__ == "__main__":
     unittest.main()
