@@ -198,3 +198,6 @@ pyrightconfig.json
 *.npy
 *.jpg
 *.csv
+*.mp4
+output/debug_3d/
+archive_non_rtde_main/

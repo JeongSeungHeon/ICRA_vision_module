@@ -1,0 +1,277 @@
+"""3D debug recording for handover failure analysis."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+
+SCHEMA_VERSION = 2
+
+
+def _timestamp_for_filename() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+
+def _none_if_missing(value: Any) -> Any:
+    return None if value is None else value
+
+
+def format_record_clock(elapsed_s: float | None) -> str:
+    if elapsed_s is None or not np.isfinite(float(elapsed_s)):
+        return ""
+    elapsed_s = max(float(elapsed_s), 0.0)
+    minutes = int(elapsed_s // 60.0)
+    seconds = int(elapsed_s % 60.0)
+    tenths = int((elapsed_s - int(elapsed_s)) * 10.0)
+    return f"REC {minutes:02d}:{seconds:02d}.{tenths:d}"
+
+
+def _vec(value: Any, length: int, *, dtype=np.float32) -> np.ndarray:
+    output = np.full((int(length),), np.nan, dtype=dtype)
+    if value is None:
+        return output
+    array = np.asarray(value, dtype=dtype).reshape(-1)
+    count = min(len(array), int(length))
+    if count > 0:
+        output[:count] = array[:count]
+    return output
+
+
+def _matrix(value: Any, shape: tuple[int, int], *, dtype=np.float32) -> np.ndarray:
+    output = np.full(shape, np.nan, dtype=dtype)
+    if value is None:
+        return output
+    array = np.asarray(value, dtype=dtype)
+    if array.shape == shape:
+        output[...] = array
+    return output
+
+
+def _points(value: Any, *, max_points: int) -> np.ndarray:
+    if value is None:
+        return np.empty((0, 3), dtype=np.float32)
+    points = np.asarray(value, dtype=np.float32).reshape((-1, 3))
+    if max_points > 0 and len(points) > int(max_points):
+        sample_indices = np.linspace(0, len(points) - 1, int(max_points), dtype=np.int64)
+        points = points[sample_indices]
+    return np.ascontiguousarray(points, dtype=np.float32)
+
+
+def _hand_debug_points(hand_debug: Any) -> np.ndarray:
+    if hand_debug is None:
+        return np.full((21, 3), np.nan, dtype=np.float32)
+    points = getattr(hand_debug, "points_3d_base", None)
+    output = np.full((21, 3), np.nan, dtype=np.float32)
+    if points is None:
+        return output
+    points = np.asarray(points, dtype=np.float32).reshape((-1, 3))
+    count = min(len(points), 21)
+    output[:count] = points[:count]
+    return output
+
+
+def _hand_debug_mask(hand_debug: Any) -> np.ndarray:
+    if hand_debug is None:
+        return np.zeros((21,), dtype=bool)
+    mask = getattr(hand_debug, "valid_mask", None)
+    output = np.zeros((21,), dtype=bool)
+    if mask is None:
+        return output
+    mask = np.asarray(mask, dtype=bool).reshape(-1)
+    count = min(len(mask), 21)
+    output[:count] = mask[:count]
+    return output
+
+
+def _hand_debug_rotation(hand_debug: Any) -> np.ndarray:
+    if hand_debug is None:
+        return np.full((3, 3), np.nan, dtype=np.float32)
+    palm_pose = getattr(hand_debug, "palm_pose_base", None)
+    if not isinstance(palm_pose, dict):
+        return np.full((3, 3), np.nan, dtype=np.float32)
+    return _matrix(palm_pose.get("rotation_matrix"), (3, 3), dtype=np.float32)
+
+
+@dataclass
+class Debug3DRecorder:
+    """In-memory recorder that saves one compressed 3D debug session on demand."""
+
+    output_dir: str | Path = "output/debug_3d"
+    enabled: bool = True
+    max_object_points: int = 8000
+    max_template_points: int = 8000
+    frames: list[dict[str, Any]] = field(default_factory=list)
+    session_index: int = 0
+
+    def clear(self) -> None:
+        self.frames.clear()
+        self.session_index += 1
+
+    def append_frame(
+        self,
+        *,
+        frame_index: int,
+        timestamp_unix_s: float,
+        timestamp_perf_s: float,
+        record_elapsed_s: float | None,
+        task_epoch: int,
+        selected_hand: Any,
+        hand_debug_cam0: Any,
+        hand_debug_cam1: Any,
+        raw_merged_object: Any,
+        shape_fitting_state: Any,
+        object_point_base: Any,
+        grasp_point_base: Any,
+        eef_pose_base: Any,
+        measurement_source: str,
+    ) -> None:
+        if not self.enabled:
+            return
+
+        raw_points = _points(
+            getattr(raw_merged_object, "merged_points_base", None),
+            max_points=self.max_object_points,
+        )
+        fitted_points = _points(
+            getattr(shape_fitting_state, "fitted_points_base", None),
+            max_points=self.max_template_points,
+        )
+
+        self.frames.append(
+            {
+                "frame_index": int(frame_index),
+                "timestamp_unix_s": float(timestamp_unix_s),
+                "timestamp_perf_s": float(timestamp_perf_s),
+                "record_elapsed_s": np.nan if record_elapsed_s is None else float(record_elapsed_s),
+                "record_clock_text": format_record_clock(record_elapsed_s),
+                "task_epoch": int(task_epoch),
+                "measurement_source": str(measurement_source or "none"),
+                "object_label": _none_if_missing(getattr(raw_merged_object, "label", None)),
+                "object_valid": bool(getattr(raw_merged_object, "valid", False)),
+                "object_point_count": int(getattr(raw_merged_object, "merged_point_count", len(raw_points))),
+                "object_points_base": raw_points,
+                "object_centroid_base": _vec(getattr(raw_merged_object, "centroid_base", None), 3),
+                "fitted_label": _none_if_missing(getattr(shape_fitting_state, "label", None)),
+                "template_id": _none_if_missing(getattr(shape_fitting_state, "template_id", None)),
+                "shape_fitting_valid": bool(getattr(shape_fitting_state, "valid", False)),
+                "shape_fitting_initialized": bool(getattr(shape_fitting_state, "initialized", False)),
+                "shape_fitting_reason": str(getattr(shape_fitting_state, "reason", "none")),
+                "shape_fitting_scale": np.nan
+                if getattr(shape_fitting_state, "scale", None) is None
+                else float(getattr(shape_fitting_state, "scale")),
+                "template_points_base": fitted_points,
+                "template_centroid_base": _vec(getattr(shape_fitting_state, "centroid_base", None), 3),
+                "cam0_hand_points_base": _hand_debug_points(hand_debug_cam0),
+                "cam0_hand_valid_mask": _hand_debug_mask(hand_debug_cam0),
+                "cam0_palm_rotation_base": _hand_debug_rotation(hand_debug_cam0),
+                "cam1_hand_points_base": _hand_debug_points(hand_debug_cam1),
+                "cam1_hand_valid_mask": _hand_debug_mask(hand_debug_cam1),
+                "cam1_palm_rotation_base": _hand_debug_rotation(hand_debug_cam1),
+                "selected_hand_valid": bool(getattr(selected_hand, "valid", False)),
+                "selected_hand_camera": -1
+                if getattr(selected_hand, "selected_camera", None) is None
+                else int(getattr(selected_hand, "selected_camera")),
+                "selected_handedness": _none_if_missing(getattr(selected_hand, "handedness", None)),
+                "selected_palm_center_base": _vec(getattr(selected_hand, "palm_center_base", None), 3),
+                "selected_palm_normal_base": _vec(getattr(selected_hand, "palm_normal_base", None), 3),
+                "selected_wrist_base": _vec(getattr(selected_hand, "wrist_base", None), 3),
+                "selected_hand_confidence": float(getattr(selected_hand, "confidence", np.nan)),
+                "eef_pose_base": _vec(eef_pose_base, 6),
+                "object_point_base": _vec(object_point_base, 3),
+                "grasp_point_base": _vec(grasp_point_base, 3),
+            }
+        )
+
+    def save(self, *, prefix: str = "handover_3d_debug") -> Path:
+        if not self.enabled:
+            raise RuntimeError("3D debug recording is disabled.")
+        if not self.frames:
+            raise RuntimeError("No 3D debug frames are buffered.")
+
+        output_dir = Path(self.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        path = output_dir / f"{prefix}_{_timestamp_for_filename()}_session{self.session_index:03d}.npz"
+        payload = self._build_payload(path)
+        np.savez_compressed(path, **payload)
+        return path
+
+    def _build_payload(self, path: Path) -> dict[str, Any]:
+        frames = self.frames
+        variable_cloud_keys = ("object_points_base", "template_points_base")
+        string_keys = (
+            "measurement_source",
+            "object_label",
+            "fitted_label",
+            "template_id",
+            "shape_fitting_reason",
+            "selected_handedness",
+            "record_clock_text",
+        )
+        payload: dict[str, Any] = {
+            "schema_version": np.asarray(SCHEMA_VERSION, dtype=np.int32),
+            "saved_path": np.asarray(str(path)),
+            "created_at": np.asarray(datetime.now().isoformat(timespec="seconds")),
+            "frame_count": np.asarray(len(frames), dtype=np.int32),
+            "max_object_points": np.asarray(int(self.max_object_points), dtype=np.int32),
+            "max_template_points": np.asarray(int(self.max_template_points), dtype=np.int32),
+        }
+
+        keys = sorted(frames[0].keys())
+        for key in keys:
+            values = [frame[key] for frame in frames]
+            if key in variable_cloud_keys:
+                payload[f"{key}_offsets"] = _build_offsets(values)
+                payload[f"{key}_flat"] = _flatten_point_frames(values)
+            elif key in string_keys:
+                payload[key] = np.asarray(["" if value is None else str(value) for value in values])
+            else:
+                payload[key] = np.asarray(values)
+        return payload
+
+
+def _build_offsets(point_frames: list[np.ndarray]) -> np.ndarray:
+    offsets = np.zeros((len(point_frames) + 1,), dtype=np.int64)
+    cursor = 0
+    for index, points in enumerate(point_frames):
+        cursor += len(np.asarray(points, dtype=np.float32).reshape((-1, 3)))
+        offsets[index + 1] = cursor
+    return offsets
+
+
+def _flatten_point_frames(point_frames: list[np.ndarray]) -> np.ndarray:
+    if not point_frames:
+        return np.empty((0, 3), dtype=np.float32)
+    normalized = [np.asarray(points, dtype=np.float32).reshape((-1, 3)) for points in point_frames]
+    if not normalized:
+        return np.empty((0, 3), dtype=np.float32)
+    return np.concatenate(normalized, axis=0).astype(np.float32, copy=False)
+
+
+def _reconstruct_point_frames(flat_points: np.ndarray, offsets: np.ndarray) -> np.ndarray:
+    flat_points = np.asarray(flat_points, dtype=np.float32).reshape((-1, 3))
+    offsets = np.asarray(offsets, dtype=np.int64).reshape(-1)
+    frames = np.empty((max(len(offsets) - 1, 0),), dtype=object)
+    for index in range(len(frames)):
+        start = int(offsets[index])
+        end = int(offsets[index + 1])
+        frames[index] = flat_points[start:end].copy()
+    return frames
+
+
+def load_debug_3d_npz(path: str | Path) -> dict[str, Any]:
+    """Load a 3D debug recording with object arrays enabled."""
+
+    with np.load(Path(path), allow_pickle=True) as data:
+        loaded = {key: data[key] for key in data.files}
+
+    for key in ("object_points_base", "template_points_base"):
+        flat_key = f"{key}_flat"
+        offsets_key = f"{key}_offsets"
+        if flat_key in loaded and offsets_key in loaded:
+            loaded[key] = _reconstruct_point_frames(loaded[flat_key], loaded[offsets_key])
+    return loaded

@@ -54,14 +54,13 @@ class HandWorker:
         self.min_depth_m = float(depth_cfg.get("min_depth_m", 0.10))
         self.max_depth_m = float(depth_cfg.get("max_depth_m", 1.20))
         self.min_valid_keypoints = int(depth_cfg.get("min_valid_keypoints", 4))
-        self.smoothing_window_frames = int(hand_cfg.get("smoothing_window_frames", 5))
+        self.smoothing_window_frames = int(hand_cfg.get("smoothing_window_frames", 3)) # 수정 5 -> 3
         self.velocity_alpha = float(hand_cfg.get("velocity_alpha", 0.5))
+        self._detector_min_detection_confidence = float(detector_cfg.get("min_detection_confidence", 0.5))
+        self._detector_max_num_hands = int(detector_cfg.get("max_num_hands", 1))
+        self._detector_min_tracking_confidence = float(detector_cfg.get("min_tracking_confidence", 0.5))
 
-        self._hands = MP_HANDS.Hands(
-            min_detection_confidence=float(detector_cfg.get("min_detection_confidence", 0.5)),
-            max_num_hands=int(detector_cfg.get("max_num_hands", 1)),
-            min_tracking_confidence=float(detector_cfg.get("min_tracking_confidence", 0.5)),
-        )
+        self._hands = self._create_hands()
         self._recent_palm_centers: deque[np.ndarray] = deque(maxlen=max(self.smoothing_window_frames, 1))
         self._recent_palm_normals: deque[np.ndarray] = deque(maxlen=max(self.smoothing_window_frames, 1))
         self._previous_palm_rotation: np.ndarray | None = None
@@ -79,6 +78,17 @@ class HandWorker:
 
     def close(self) -> None:
         self._hands.close()
+
+    def reset(self) -> None:
+        self._recent_palm_centers.clear()
+        self._recent_palm_normals.clear()
+        self._previous_palm_rotation = None
+        self._previous_smoothed_center = None
+        self._previous_timestamp = None
+        self._smoothed_velocity = None
+        self.last_debug = None
+        self._hands.close()
+        self._hands = self._create_hands()
 
     def process_frame(self, frame_bundle: FrameBundle, frame_id: int = -1) -> HandState:
         keypoints_2d, handedness = self._detect_hand_keypoints(frame_bundle.color_image)
@@ -189,6 +199,13 @@ class HandWorker:
             frame_keypoints[point_index, 0] = int(np.clip(pixel_x, 0, image_width - 1))
             frame_keypoints[point_index, 1] = int(np.clip(pixel_y, 0, image_height - 1))
         return frame_keypoints, handedness
+
+    def _create_hands(self) -> Any:
+        return MP_HANDS.Hands(
+            min_detection_confidence=self._detector_min_detection_confidence,
+            max_num_hands=self._detector_max_num_hands,
+            min_tracking_confidence=self._detector_min_tracking_confidence,
+        )
 
     def _update_velocity(self, smoothed_center: np.ndarray, timestamp_s: float) -> np.ndarray | None:
         if self._previous_smoothed_center is None or self._previous_timestamp is None:

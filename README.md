@@ -126,12 +126,26 @@ Useful options:
 - `--open-gripper`: open gripper during startup
 - `--show-depth`: show a cam0 depth preview window
 - `--enable-fdct-depth` / `--disable-fdct-depth`: override FDCT setting from config
+- `--profile-runtime`: collect CPU/RAM/GPU/VRAM and stage timing logs for hardware sizing
 
 For the full CLI:
 
 ```bash
 python robot_control_rtde_fitting_final.py --help
 ```
+
+Runtime profiling example:
+
+```bash
+python robot_control_rtde_fitting_final.py \
+  --config configs/handover.yaml \
+  --select-mode highest_score \
+  --enable-follow \
+  --follow-z \
+  --profile-runtime
+```
+
+When profiling is enabled, press `s` to save the current profiling session under `output/runtime_profile/`. Pressing `r` or `d` resets the current unsaved profiling buffer for a new trial; quitting with `q` or `Esc` does not save unsaved profiling data.
 
 ## Runtime Flow
 
@@ -155,6 +169,7 @@ While the OpenCV windows are focused:
 
 - `f`: toggle follow mode
 - `r`: reset system to startup state
+- `d`: save the current 3D debug recording and reset
 - `s`: stop/finalize the current handover metadata and video recording
 - `q` or `Esc`: quit
 

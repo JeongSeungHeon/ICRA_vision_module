@@ -21,6 +21,20 @@ class HandRelativeFallbackDebug:
     used_filtered_hand_center: bool
     dropout_age_s: float | None
     reason: str
+    frame_id: int | None = None
+    anchor_frame_id: int | None = None
+    last_measured_frame_id: int | None = None
+    record_elapsed_s: float | None = None
+    anchor_record_elapsed_s: float | None = None
+    last_measured_record_elapsed_s: float | None = None
+    hand_center_base: tuple[float, float, float] | None = None
+    anchor_hand_position_base: tuple[float, float, float] | None = None
+    measured_object_base: tuple[float, float, float] | None = None
+    measured_grasp_base: tuple[float, float, float] | None = None
+    object_offset_base: tuple[float, float, float] | None = None
+    grasp_offset_base: tuple[float, float, float] | None = None
+    fallback_object_base: tuple[float, float, float] | None = None
+    fallback_grasp_base: tuple[float, float, float] | None = None
 
 
 class HandRelativeFallbackTracker:
@@ -33,6 +47,9 @@ class HandRelativeFallbackTracker:
         self.max_dropout_sec = max(float(fallback_cfg.get("max_dropout_sec", 1.0)), 0.0)
         self.require_hand_approach = bool(fallback_cfg.get("require_hand_approach", True))
         self.require_motion_triggered = bool(fallback_cfg.get("require_motion_triggered", True))
+        self.debug_log = bool(fallback_cfg.get("debug_log", False))
+        self.log_lock_progress = bool(fallback_cfg.get("log_lock_progress", True))
+        self.log_fallback_every_frames = max(1, int(fallback_cfg.get("log_fallback_every_frames", 1)))
 
         self._anchor_locked = False
         self._lock_streak = 0
@@ -40,6 +57,11 @@ class HandRelativeFallbackTracker:
         self._grasp_offset_base: np.ndarray | None = None
         self._anchor_hand_position_base: np.ndarray | None = None
         self._last_measured_timestamp: float | None = None
+        self._anchor_frame_id: int | None = None
+        self._last_measured_frame_id: int | None = None
+        self._anchor_record_elapsed_s: float | None = None
+        self._last_measured_record_elapsed_s: float | None = None
+        self._fallback_log_counter = 0
         self.last_debug = HandRelativeFallbackDebug(
             anchor_locked=False,
             lock_streak=0,
@@ -61,6 +83,11 @@ class HandRelativeFallbackTracker:
         self._grasp_offset_base = None
         self._anchor_hand_position_base = None
         self._last_measured_timestamp = None
+        self._anchor_frame_id = None
+        self._last_measured_frame_id = None
+        self._anchor_record_elapsed_s = None
+        self._last_measured_record_elapsed_s = None
+        self._fallback_log_counter = 0
         self.last_debug = HandRelativeFallbackDebug(
             anchor_locked=False,
             lock_streak=0,
@@ -78,6 +105,8 @@ class HandRelativeFallbackTracker:
         fusion_state: FusionState | None,
         motion_triggered: bool,
         now_timestamp: float | None = None,
+        frame_id: int | None = None,
+        record_elapsed_s: float | None = None,
     ) -> HandRelativeFallbackState:
         current_time = (
             float(now_timestamp)
@@ -89,7 +118,7 @@ class HandRelativeFallbackTracker:
         )
 
         if not self.enabled:
-            return self._invalid_state(current_time, reason="disabled")
+            return self._invalid_state(current_time, reason="disabled", frame_id=frame_id)
 
         hand_center, used_filtered_hand_center = self._resolve_hand_center(selected_hand, fusion_state)
         measured_object = self._to_array(measured_object_position_base)
@@ -108,6 +137,8 @@ class HandRelativeFallbackTracker:
 
         if measured_available:
             self._last_measured_timestamp = current_time
+            self._last_measured_frame_id = frame_id
+            self._last_measured_record_elapsed_s = record_elapsed_s
             if not self._anchor_locked and hand_approach_ok:
                 self._lock_streak += 1
                 if self._lock_streak >= self.lock_frames:
@@ -115,6 +146,28 @@ class HandRelativeFallbackTracker:
                     self._object_offset_base = measured_object - hand_center
                     self._grasp_offset_base = measured_grasp - hand_center
                     self._anchor_hand_position_base = hand_center.copy()
+                    self._anchor_frame_id = frame_id
+                    self._anchor_record_elapsed_s = record_elapsed_s
+                    self._fallback_log_counter = 0
+                    self._log(
+                        "LOCKED "
+                        f"clock={self._format_record_clock(record_elapsed_s)} "
+                        f"lock={self._lock_streak}/{self.lock_frames} "
+                        f"hand={self._format_vec(hand_center)} "
+                        f"object={self._format_vec(measured_object)} "
+                        f"grasp={self._format_vec(measured_grasp)} "
+                        f"object_offset={self._format_vec(self._object_offset_base)} "
+                        f"grasp_offset={self._format_vec(self._grasp_offset_base)}"
+                    )
+                elif self.log_lock_progress:
+                    self._log(
+                        "LOCK_PROGRESS "
+                        f"clock={self._format_record_clock(record_elapsed_s)} "
+                        f"lock={self._lock_streak}/{self.lock_frames} "
+                        f"hand_approach={hand_approach_ok} "
+                        f"hand={self._format_vec(hand_center)} "
+                        f"grasp={self._format_vec(measured_grasp)}"
+                    )
             elif not self._anchor_locked:
                 self._lock_streak = 0
             self.last_debug = HandRelativeFallbackDebug(
@@ -123,6 +176,17 @@ class HandRelativeFallbackTracker:
                 used_filtered_hand_center=used_filtered_hand_center,
                 dropout_age_s=0.0,
                 reason="measured_available" if hand_approach_ok else "hand_approach_required",
+                frame_id=frame_id,
+                anchor_frame_id=self._anchor_frame_id,
+                last_measured_frame_id=self._last_measured_frame_id,
+                record_elapsed_s=record_elapsed_s,
+                anchor_record_elapsed_s=self._anchor_record_elapsed_s,
+                last_measured_record_elapsed_s=self._last_measured_record_elapsed_s,
+                hand_center_base=self._to_tuple(hand_center),
+                measured_object_base=self._to_tuple(measured_object),
+                measured_grasp_base=self._to_tuple(measured_grasp),
+                object_offset_base=self._to_tuple(self._object_offset_base),
+                grasp_offset_base=self._to_tuple(self._grasp_offset_base),
             )
             return HandRelativeFallbackState(
                 object_position_base=None,
@@ -136,13 +200,13 @@ class HandRelativeFallbackTracker:
 
         self._lock_streak = 0
         if hand_center is None:
-            return self._invalid_state(current_time, reason="no_hand_center", used_filtered_hand_center=used_filtered_hand_center)
+            return self._invalid_state(current_time, reason="no_hand_center", used_filtered_hand_center=used_filtered_hand_center, frame_id=frame_id)
         if not self._anchor_locked or self._object_offset_base is None or self._grasp_offset_base is None:
-            return self._invalid_state(current_time, reason="anchor_not_locked", used_filtered_hand_center=used_filtered_hand_center)
+            return self._invalid_state(current_time, reason="anchor_not_locked", used_filtered_hand_center=used_filtered_hand_center, frame_id=frame_id)
         if self.require_motion_triggered and not motion_triggered:
-            return self._invalid_state(current_time, reason="motion_not_triggered", used_filtered_hand_center=used_filtered_hand_center)
+            return self._invalid_state(current_time, reason="motion_not_triggered", used_filtered_hand_center=used_filtered_hand_center, frame_id=frame_id)
         if self._last_measured_timestamp is None:
-            return self._invalid_state(current_time, reason="no_measured_history", used_filtered_hand_center=used_filtered_hand_center)
+            return self._invalid_state(current_time, reason="no_measured_history", used_filtered_hand_center=used_filtered_hand_center, frame_id=frame_id)
 
         dropout_age_s = max(current_time - float(self._last_measured_timestamp), 0.0)
         if dropout_age_s > self.max_dropout_sec:
@@ -151,16 +215,41 @@ class HandRelativeFallbackTracker:
                 reason="dropout_timeout",
                 used_filtered_hand_center=used_filtered_hand_center,
                 dropout_age_s=dropout_age_s,
+                frame_id=frame_id,
             )
 
         object_position = hand_center + self._object_offset_base
         grasp_position = hand_center + self._grasp_offset_base
+        self._fallback_log_counter += 1
+        if (self._fallback_log_counter - 1) % self.log_fallback_every_frames == 0:
+            self._log(
+                "ACTIVE "
+                f"clock={self._format_record_clock(record_elapsed_s)} "
+                f"anchor_clock={self._format_record_clock(self._anchor_record_elapsed_s)} "
+                f"last_measured_clock={self._format_record_clock(self._last_measured_record_elapsed_s)} "
+                f"dropout_age={dropout_age_s:.3f}s "
+                f"hand={self._format_vec(hand_center)} "
+                f"grasp={self._format_vec(grasp_position)} "
+                f"object={self._format_vec(object_position)} "
+                f"grasp_offset={self._format_vec(self._grasp_offset_base)}"
+            )
         self.last_debug = HandRelativeFallbackDebug(
             anchor_locked=True,
             lock_streak=self._lock_streak,
             used_filtered_hand_center=used_filtered_hand_center,
             dropout_age_s=dropout_age_s,
             reason="fallback_active",
+            frame_id=frame_id,
+            anchor_frame_id=self._anchor_frame_id,
+            last_measured_frame_id=self._last_measured_frame_id,
+            record_elapsed_s=record_elapsed_s,
+            anchor_record_elapsed_s=self._anchor_record_elapsed_s,
+            last_measured_record_elapsed_s=self._last_measured_record_elapsed_s,
+            hand_center_base=self._to_tuple(hand_center),
+            object_offset_base=self._to_tuple(self._object_offset_base),
+            grasp_offset_base=self._to_tuple(self._grasp_offset_base),
+            fallback_object_base=self._to_tuple(object_position),
+            fallback_grasp_base=self._to_tuple(grasp_position),
         )
         return HandRelativeFallbackState(
             object_position_base=self._to_tuple(object_position),
@@ -179,6 +268,7 @@ class HandRelativeFallbackTracker:
         reason: str,
         used_filtered_hand_center: bool = False,
         dropout_age_s: float | None = None,
+        frame_id: int | None = None,
     ) -> HandRelativeFallbackState:
         self.last_debug = HandRelativeFallbackDebug(
             anchor_locked=self._anchor_locked,
@@ -186,6 +276,14 @@ class HandRelativeFallbackTracker:
             used_filtered_hand_center=used_filtered_hand_center,
             dropout_age_s=dropout_age_s,
             reason=reason,
+            frame_id=frame_id,
+            anchor_frame_id=self._anchor_frame_id,
+            last_measured_frame_id=self._last_measured_frame_id,
+            anchor_record_elapsed_s=self._anchor_record_elapsed_s,
+            last_measured_record_elapsed_s=self._last_measured_record_elapsed_s,
+            anchor_hand_position_base=self._to_tuple(self._anchor_hand_position_base),
+            object_offset_base=self._to_tuple(self._object_offset_base),
+            grasp_offset_base=self._to_tuple(self._grasp_offset_base),
         )
         return HandRelativeFallbackState(
             object_position_base=None,
@@ -211,6 +309,31 @@ class HandRelativeFallbackTracker:
         if values is None:
             return None
         return tuple(float(v) for v in np.asarray(values, dtype=np.float32).reshape(3))
+
+    @staticmethod
+    def _format_frame(frame_id: int | None) -> str:
+        return "-" if frame_id is None else str(int(frame_id))
+
+    @staticmethod
+    def _format_record_clock(elapsed_s: float | None) -> str:
+        if elapsed_s is None:
+            return "REC --:--.-"
+        elapsed_s = max(float(elapsed_s), 0.0)
+        minutes = int(elapsed_s // 60.0)
+        seconds = int(elapsed_s % 60.0)
+        tenths = int((elapsed_s - int(elapsed_s)) * 10.0)
+        return f"REC {minutes:02d}:{seconds:02d}.{tenths:d}"
+
+    @staticmethod
+    def _format_vec(values: np.ndarray | tuple[float, float, float] | None) -> str:
+        if values is None:
+            return "None"
+        array = np.asarray(values, dtype=np.float32).reshape(3)
+        return f"mm=({array[0] * 1000.0:.1f},{array[1] * 1000.0:.1f},{array[2] * 1000.0:.1f})"
+
+    def _log(self, message: str) -> None:
+        if self.debug_log:
+            print(f"[HAND_FALLBACK] {message}", flush=True)
 
     @staticmethod
     def _resolve_hand_center(

@@ -1,0 +1,408 @@
+system:
+  name: dual_camera_receive_and_place
+  use_ros: false
+  sensor_fps: 30
+  task_manager_hz: 20
+  robot_control_hz: 125
+  runner_heartbeat_sec: 1.0
+  runner_loop_sleep_sec: 0.0
+
+frames:
+  base_frame: ur_base
+  tool_frame: tool0
+  height_axis:
+    name: z
+    positive_direction: up
+    description: upward/downward direction used for lift detection and hand-clearance checks
+
+cameras:
+  cam0:
+    enabled: true
+    role: right_hand_camera
+    serial: "148522072369"
+    width: 640
+    height: 480
+    fps: 30
+    depth_filters:
+      spatial:
+        enabled: false
+        magnitude: 2
+        smooth_alpha: 0.5
+        smooth_delta: 20
+      temporal:
+        enabled: false
+        smooth_alpha: 0.4
+        smooth_delta: 20
+      hole_filling:
+        enabled: false
+        mode: 1
+    intrinsics_file: python_stereo_camera_calibrate/camera_parameters/camera0_intrinsics.dat
+    extrinsics_file: camera_parameters/c0_to_robot.pckl
+    extrinsics_format: pickle_cam0_to_robot
+  cam1:
+    enabled: true
+    role: left_hand_camera
+    serial: "327122075999"
+    width: 640
+    height: 480
+    fps: 30
+    depth_filters:
+      spatial:
+        enabled: true
+        magnitude: 2
+        smooth_alpha: 0.5
+        smooth_delta: 20
+      temporal:
+        enabled: true
+        smooth_alpha: 0.2
+        smooth_delta: 20
+      hole_filling:
+        enabled: false
+        mode: 1
+    intrinsics_file: python_stereo_camera_calibrate/camera_parameters/camera1_intrinsics.dat
+    extrinsics_file: camera_parameters/rot_trans_c1.dat
+    extrinsics_format: dat_cam1_to_cam0
+
+calibration:
+  chain:
+    cam0_to_robot_base:
+      file: camera_parameters/c0_to_robot.pckl
+      format: pickle_cam0_to_robot
+      description: transform from cam0 coordinates into the robot base frame
+    cam1_to_cam0:
+      file: camera_parameters/rot_trans_c1.dat
+      format: dat_cam1_to_cam0
+      translation_unit: m
+      description: transform from cam1 coordinates into the cam0 frame
+  composition:
+    derived_transform_name: T_base_cam1
+    expression: T_base_cam1 = T_base_cam0 @ T_cam0_cam1
+    note: cam1 points are first transformed into cam0, then from cam0 into robot base
+
+perception:
+  synchronization:
+    max_pair_time_delta_sec: 0.03
+    stale_timeout_sec: 0.30
+  depth_completion:
+    fdct:
+      enabled: false
+      cameras: both
+      checkpoint: FDCT/TransCG.tar
+      device: auto
+      net_width: 320
+      net_height: 240
+      depth_min: 0.30
+      depth_max: 1.70
+      depth_norm: 1.0
+      depth_coeff: 10.0
+      inpaint: true
+      bilateral_enabled: true
+      bilateral_radius: 2
+      bilateral_sigma_space: 2.0
+      bilateral_zfar: 100.0
+      fallback_to_raw: true
+      debug_stats: false
+      debug_every: 30
+  object:
+    target_label: cup ## 의미 없음
+    confidence_threshold: 0.15
+    segmentation:
+      model_name: yoloe-26l-seg.pt
+      prompt_classes: ["cup", "wine glass"]
+      imgsz: 640
+      conf: 0.15
+      iou: 0.45
+      max_det: 100
+      device: null
+      classes: null
+      half: false
+      retina_masks: true
+      selection_mode: highest_score
+      selection_class_names: ["wine glass"] # 어떤걸로 선택할지 모호할 때 이 클래스 우선 선택
+      preprocess:
+        enabled: false
+        contrast_alpha: 1.0
+        brightness_beta: 0.0
+        gamma: 1.0
+        clahe:
+          enabled: false
+          clip_limit: 2.0
+          tile_grid_size: 8
+    point_cloud:
+      stride: 2
+      max_points: 20000
+      min_depth_m: 0.10
+      max_depth_m: 1.70
+      per_camera_voxel_size_m: 0.005
+      outlier_method: statistical
+      outlier_nb_neighbors: 20
+      outlier_std_ratio: 2.0
+      outlier_radius_m: 0.01
+      outlier_min_neighbors: 8
+      min_points_per_camera: 300
+    merged_voxel_size_m: 0.006
+  fill_level_estimation:
+    fillings_empty: false
+    roi_shrink_x: 0.18
+    roi_shrink_top: 0.08
+    roi_shrink_bottom: 0.05
+    profile_k: 3
+    rice_top_bias_px: 5
+    bottom_center_offset_px: 5
+    min_depth_m: 0.05
+    max_valid_depth_m: 1.8
+    depth_patch_half: 4
+  hand:
+    target_fps: 30
+    detector:
+      min_detection_confidence: 0.5
+      min_tracking_confidence: 0.5
+      max_num_hands: 1
+    depth_lifting:
+      patch_radius: 2
+      min_depth_m: 0.10
+      max_depth_m: 2.00
+      min_valid_keypoints: 4
+    smoothing_window_frames: 5
+    velocity_alpha: 0.5
+    min_pose_quality: 0.25
+    handedness_selection:
+      right_hand_camera: 0
+      left_hand_camera: 1
+      hysteresis_frames: 5
+      dropout_hold_frames: 12
+      confidence_drop_margin: 0.15
+      lock_after_stable_frames: 8
+      lock_hold_last_on_dropout: true
+  fusion:
+    object_centroid_alpha: 0.35
+    hand_center_alpha: 0.35
+    hand_normal_alpha: 0.50
+    max_position_jump_m: 0.20
+    stable_frames_required: 5
+  # pose_tracking:
+  #   enabled: true
+  #   anchor_camera: cam0
+  #   debug_dir: logs/foundationpose_debug
+  #   surface_sample_count: 1500
+  #   template_library:
+  #     cup:
+  #       template_id: cup_canonical
+  #       asset_path: shape_fitting/template.npy
+  #       unit_scale_m: 0.001
+  #     wine glass:
+  #       template_id: wine_glass_canonical
+  #       asset_path: shape_fitting/wine_glass.npy
+  #       unit_scale_m: 0.001
+  #   scale_estimation:
+  #     stable_frames: 5
+  #     min_points: 500
+  #     percentile_low: 5.0
+  #     percentile_high: 95.0
+  #     min_scale: 0.25
+  #     max_scale: 4.0
+  #   registration:
+  #     refine_iter: 5
+  #   tracking:
+  #     refine_iter: 2
+  #   health:
+  #     mask_iou_threshold: 0.15
+  #     depth_inlier_threshold: 0.30
+  #     depth_tolerance_m: 0.03
+  #   reinit:
+  #     low_conf_frames: 5
+  #     min_merged_points: 300
+  shape_fitting:
+    enabled: true
+    template_library:
+      cup:
+        template_id: cup_shape_fit
+        asset_path: shape_fitting/template.npy
+        unit_scale_m: 0.001
+      wine glass:
+        template_id: wine_glass_shape_fit
+        asset_path: shape_fitting/wine_glass.npy
+        unit_scale_m: 0.001
+    cluster:
+      dbscan_eps_m: 0.02
+      dbscan_min_points: 10
+      max_cluster_jump_m: 0.08
+    scale_init:
+      stable_frames: 8
+      percentile_low: 5.0
+      percentile_high: 95.0
+      min_scale: 0.5
+      max_scale: 1.8
+    tracking:
+      min_cluster_extent_m: 1.0e-5
+    icp:
+      max_points: 3500
+      max_iterations: 10
+      distance_threshold_m: 0.15
+      min_fitness: 0.02
+      translation_tolerance_m: 1.0e-5
+      max_centroid_jump_m: 0.25
+      crop:
+        enabled: true
+        height_axis_index: 2
+        target_top_fraction: 0.05
+        # source_top_fraction:
+        min_points_after_crop: 80
+        min_height_extent_m: 0.01
+    downsample:
+      voxel_size_m: 0.004
+      max_points: 6000
+  activation:
+    hand_approach_distance_threshold_m: 0.15
+    stable_frames_required: 5
+    # lift_detection:
+    #   enabled: true
+    #   threshold_m: 0.05
+    #   axis_name: z
+    #   require_hand_approach_first: true
+
+grasp:
+  fixed_orientation_format: rpy
+  fixed_orientation_base: [1.591, -0.017, 1.561]   # EEF RPY (rad) — locked throughout task
+  candidate_search_radius_from_centroid_m: 0.11 ### 0.07
+  min_hand_height_clearance_m: 0.05 ### 0.05
+  no_candidate_action: hold
+  hand_relative_fallback:
+    enabled: true
+    lock_frames: 8
+    max_dropout_sec: 3.0
+    require_hand_approach: true
+    require_motion_triggered: true
+  target_selection:
+    enabled: true
+    switch_margin: 0.01
+    hold_frames: 6
+    dropout_hold_frames: 8
+    score_previous_distance_weight: 0.10
+
+# Home pose: the robot moves here at start-up and after each task cycle.
+# Position in metres (robot base frame, project coordinates).
+# Orientation reuses grasp.fixed_orientation_base (same RPY).
+home_pose:
+  enabled: true
+  position_m: [0.3965, -0.015, 0.237]   # x, y, z
+  move_speed_mps: 0.05                 # slow, safe home motion
+  move_acceleration: 0.10
+
+placement:
+  use_initial_object_centroid: true
+  release_height_offset_m: 0.0
+  position_tolerance_m: 0.01
+
+task_manager:
+  approach_grasp_timeout_sec: 10.0
+  receive_close_dwell_sec: 0.40
+  verify_grasp_timeout_sec: 3.0     # force 센서 안정화 여유 시간 확보
+  move_to_place_timeout_sec: 10.0
+  release_dwell_sec: 0.60
+  retreat_distance_m: 0.08
+  retreat_timeout_sec: 5.0
+  missing_grasp_target_timeout_sec: 2.00
+  verify_grasp_force_only_fallback: true  # force 검증 실패 시 dwell 후 진행
+  fail_safe_auto_recover_sec: 5.0   # FAIL_SAFE 진입 후 5s 경과 시 IDLE 자동복구
+
+robot:
+  control_mode: live_follow_servo
+  live_follow:
+    enabled: true
+    control_hz: 30.0
+    min_valid_count: 3
+    target_timeout_sec: 0.5
+    follow_z: true
+    approach_axis: x
+    approach_offset_m: -0.08
+    max_xy_speed_mps: 0.08
+    max_z_speed_mps: 0.08
+    max_xy_step_m: 0.0027
+    max_z_step_m: 0.0027
+    workspace_clamp_enabled: true
+    hold_last_target_until_timeout: true
+
+  rtde:
+    robot_ip: 192.168.56.101
+    dashboard_port: 29999
+    control_hz: 125
+    watchdog_timeout_sec: 0.50
+    use_mock_fallback: true
+    force_mock: false
+    move_asynchronous: true
+    move_acceleration: 0.30
+    servo_velocity: 0.05
+    servo_acceleration: 0.20
+    servo_lookahead_time: 0.10
+    servo_gain: 300
+    stop_acceleration: 1.0
+  # 로봇 동작 속도 조절
+  motion:
+    approach_speed_mps: 0.35
+    retreat_speed_mps: 0.18
+    max_translation_step_m: 0.05
+  gripper:
+    control_mode: socket             # Use UR Robotiq daemon on port 63352 by default
+    open_command: open
+    close_command: close
+    socket_port: 63352
+    socket_timeout_sec: 2.0
+    socket_settle_time: 0.15
+    activate_on_connect: true
+    open_speed: 255
+    open_force: 255
+    close_speed: 255
+    close_force: 255
+    position_complete_threshold: 40
+    debug: true
+    output_domain: tool              # Fallback only when control_mode is not socket
+    open_digital_output: 1
+    close_digital_output: 0
+    output_high_when_active: true
+  grasp_verification:
+    method: rtde_force_current
+    use_tcp_force: true
+    use_joint_current: true
+    min_tcp_force_norm_n: 8.0
+    min_mean_joint_current_a: 0.15
+    verification_window_sec: 0.20
+    require_both_signals: false
+  frame_mapping:
+    enabled: true
+    position_signs: [-1.0, -1.0, 1.0]
+
+safety:
+  max_robot_speed_mps: 0.25
+  stale_perception_timeout_sec: 1.00   # 0.30 → 1.0 (camera ts와 wall clock 오프셋 허용)
+  min_merged_object_confidence: 0.50
+  fail_safe_action: hold              # stop → hold (회복 가능성 유지)
+  workspace_bounds_m:
+    x: [-0.60, 0.80]
+    y: [-0.30, 0.80]
+    z: [0.00, 0.80]
+  stop_on_stale_perception: false     # runner에서 wall clock timestamp로 통일 후 활성화 가능
+  stop_on_invalid_calibration: true
+  stop_on_missing_grasp_target: true
+
+# benchmark:
+#   s8:
+#     team_name: TEAM_NAME
+#     run_id: 1
+#     horizontal_reach_mm: 800.0
+#     vertical_reach_mm: 600.0
+#     repetitions: 3
+#     max_motion_time_ms: 5000
+#     target_hold_sec: 1.5
+#     output_dir: output/benchmark
+#     submission_csv_name: s8_submission_{team_name}.csv
+#     metadata_json_path: output/benchmark/metadata_{team_name}.json
+#     metadata_template_path: benchmarks/metadata_template.json
+#     init_position_tolerance_mm: 15.0
+#     init_orientation_tolerance_deg: 10.0
+#     orientation:
+#       mode: look_at_center
+#       tool_forward_axis: x+
+#       tool_up_axis: z+
+#       world_up_axis_hint: z+
+#       roll_offset_deg: 0.0

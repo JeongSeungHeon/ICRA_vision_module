@@ -1,12 +1,15 @@
 """Dual-camera grasp-target follow script adapted for UR5 RTDE control."""
 
 import argparse
+import csv
 import sys
 import time
+import pickle
 import threading
 from dataclasses import replace
 from pathlib import Path
 from collections import deque
+from datetime import datetime
 
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parent))
@@ -52,6 +55,7 @@ from system.shared_state import (
 from video_record import HandoverVideoRecorderService
 from utils.debug_3d_recorder import Debug3DRecorder
 from utils.handover_metadata import HandoverMetadataRecorder
+from utils.realsense_stream import list_realsense_serials
 from utils.runtime_profiler import RuntimeProfiler
 
 
@@ -59,6 +63,7 @@ from utils.runtime_profiler import RuntimeProfiler
 # Constants
 # =========================
 DEFAULT_CONFIG_PATH = Path("configs/handover.yaml")
+DEFAULT_CALIB_PATH = Path("camera_parameters/c0_to_robot.pckl")
 DEFAULT_WORKSPACE_MM = {
     "x": (-600.0, 800.0),
     "y": (-200.0, 800.0),
@@ -80,6 +85,7 @@ EEF_X_OFFSET_MM = -320.0
 EEF_Y_OFFSET_MM = 0.0
 
 # grasp / place behavior
+PREGRASP_X_OFFSET_MM = -120.0
 HOVER_Z_OFFSET_MM = 0
 DESCEND_EXTRA_MM = 0.0
 BACKOFF_X_MM = 120.0
@@ -108,7 +114,6 @@ VIDEO_RECORDER_PORT = 5000
 
 
 def parse_args():
-    """Parse CLI switches for perception, robot follow, debugging, and profiling."""
     parser = argparse.ArgumentParser(
         description="Run dual-camera perception, build a grasp target from hand pose + merged object cloud, and follow it with UR5 RTDE."
     )
@@ -179,11 +184,26 @@ def parse_args():
         help="Print FDCT raw/completed depth stats while running.",
     )
 
+    # 3D point options
     parser.add_argument(
         "--config",
         default=str(DEFAULT_CONFIG_PATH),
         help="YAML config used by the existing UR5 RTDE controller.",
     )
+    parser.add_argument(
+        "--calib-pkl",
+        default=None,
+        help="Path to camera-to-robot 4x4 transform pickle. Defaults to config/existing repo calibration.",
+    )
+    parser.add_argument(
+        "--point-mode",
+        choices=["median", "mean", "centroid_depth"],
+        default="median",
+        help="Representative 3D point extraction mode.",
+    )
+    parser.add_argument("--min-depth-m", type=float, default=0.05, help="Minimum valid depth.")
+    parser.add_argument("--max-valid-depth-m", type=float, default=2.0, help="Maximum valid depth.")
+    parser.add_argument("--ema-alpha", type=float, default=0.1, help="EMA smoothing factor for 3D point.")
 
     # UR5 RTDE follow options
     parser.add_argument("--enable-follow", action="store_true", help="Enable UR5 RTDE follow mode.")
@@ -278,6 +298,12 @@ def parse_args():
         help="Backward-compatible alias that keeps 3D debug recording disabled.",
     )
     parser.add_argument(
+        "--target-log-dir",
+        type=str,
+        default="logs/target_points",
+        help="Directory where per-task target point histories are saved as CSV.",
+    )
+    parser.add_argument(
         "--profile-runtime",
         action="store_true",
         help="Collect runtime CPU/RAM/GPU and per-stage timing logs. Press 's' to save the current session.",
@@ -304,19 +330,19 @@ def parse_args():
 
 
 def load_yaml_config(path):
-    """Load the YAML runtime config used by cameras, perception, safety, and RTDE."""
     with open(path, "r", encoding="utf-8") as handle:
         return yaml.safe_load(handle) or {}
 
 
 def apply_config_defaults(args, config):
-    """Fill CLI defaults from config while keeping explicit command-line values."""
     robot_cfg = config.get("robot", {})
     live_cfg = robot_cfg.get("live_follow", {})
     return_sequence_cfg = robot_cfg.get("return_sequence", {})
     rtde_cfg = robot_cfg.get("rtde", {})
     safety_cfg = config.get("safety", {})
     workspace_cfg = safety_cfg.get("workspace_bounds_m", {})
+    cameras_cfg = config.get("cameras", {})
+    cam0_cfg = cameras_cfg.get("cam0", {})
     fdct_cfg = config.get("perception", {}).get("depth_completion", {}).get("fdct", {})
 
     if args.robot_ip is None:
@@ -340,6 +366,9 @@ def apply_config_defaults(args, config):
             setattr(args, arg_name, mm_bounds)
         else:
             setattr(args, arg_name, list(DEFAULT_WORKSPACE_MM[axis_name]))
+
+    if args.calib_pkl is None:
+        args.calib_pkl = cam0_cfg.get("extrinsics_file", str(DEFAULT_CALIB_PATH))
 
     if args.fdct_depth_enabled is None:
         args.fdct_depth_enabled = bool(fdct_cfg.get("enabled", False))
@@ -367,6 +396,15 @@ def apply_config_defaults(args, config):
     return args
 
 
+# def pick_serial(serial):
+#     if serial:
+#         return serial
+#     serials = list_realsense_serials()
+#     if not serials:
+#         raise RuntimeError("No RealSense devices detected.")
+#     return serials[0]
+
+
 def render_depth(depth_image_m, max_depth_m):
     max_depth_m = max(max_depth_m, 1e-6)
     clipped = np.clip(depth_image_m, 0.0, max_depth_m)
@@ -375,7 +413,6 @@ def render_depth(depth_image_m, max_depth_m):
 
 
 def parse_fdct_camera_ids(camera_selection):
-    """Convert the FDCT camera selection string into internal camera ids."""
     selection = str(camera_selection or "none").strip().lower()
     if selection == "none":
         return set()
@@ -389,7 +426,6 @@ def parse_fdct_camera_ids(camera_selection):
 
 
 def build_fdct_depth_completer(args):
-    """Create the optional FDCT depth completer used before object point extraction."""
     if not args.fdct_depth_enabled or args.fdct_cameras == "none":
         return None
 
@@ -427,7 +463,6 @@ def _should_log_fdct_event(pipeline, key, every=30):
 
 
 def apply_fdct_depth_to_object_frames(snapshot, pipeline, args):
-    """Replace selected object-frame depth images with FDCT-completed depth."""
     completer = pipeline.get("fdct_depth_completer")
     camera_ids = pipeline.get("fdct_camera_ids", set())
     if completer is None or not camera_ids:
@@ -501,7 +536,6 @@ def mm_to_m_tuple(values):
 
 
 def compute_dynamic_eef_target(reference_xyz_mm, eef_xyz_mm):
-    """Blend the x-offset down as the tool approaches the tracked reference point."""
     reference_xyz_mm = np.asarray(reference_xyz_mm, dtype=np.float32).reshape(3)
     eef_xyz_mm = np.asarray(eef_xyz_mm, dtype=np.float32).reshape(3)
 
@@ -526,7 +560,6 @@ def compute_dynamic_eef_target(reference_xyz_mm, eef_xyz_mm):
 
 
 def get_close_range_step_mm(ref_err_xyz, max_step_mm, max_step_z_mm):
-    """Use smaller servo steps near the object for gentler final alignment."""
     dist_xy = float(np.linalg.norm(np.asarray(ref_err_xyz, dtype=np.float32)[:2]))
     if dist_xy < 95.0:
         return 5, 2.2, dist_xy
@@ -534,7 +567,6 @@ def get_close_range_step_mm(ref_err_xyz, max_step_mm, max_step_z_mm):
 
 
 def compute_close_range_ref_step_xyz(ref_err_xyz, max_step_xy, max_step_z, *, follow_z):
-    """Compute one bounded servo step, staging close XY motion on a dominant axis."""
     ref_err_xyz = np.asarray(ref_err_xyz, dtype=np.float32).reshape(3)
     ref_step_xyz = np.zeros(3, dtype=np.float32)
     dist_xy = float(np.linalg.norm(ref_err_xyz[:2]))
@@ -555,7 +587,6 @@ def compute_close_range_ref_step_xyz(ref_err_xyz, max_step_xy, max_step_z, *, fo
 
 
 def get_base_pose_target(controller):
-    """Build the fixed HOME xyz target while preserving the robot's current orientation."""
     state = controller.read_robot_state(now_timestamp=time.time())
     pose = state.actual_tcp_pose_base
     if pose is None:
@@ -567,7 +598,6 @@ def get_base_pose_target(controller):
 
 
 def make_robot_command(command_type, *, target_position_base=None, fixed_orientation_base=None, gripper_action=None, source_mode="manual"):
-    """Create the shared robot command object expected by RtdeController.step()."""
     return RobotCommandState(
         command_type=command_type,
         target_position_base=target_position_base,
@@ -581,7 +611,6 @@ def make_robot_command(command_type, *, target_position_base=None, fixed_orienta
 
 
 def send_robot_command(controller, command_type, *, target_position_base=None, fixed_orientation_base=None, gripper_action=None, source_mode="manual"):
-    """Send one robot command through the RTDE controller with a fresh timestamp."""
     command = make_robot_command(
         command_type,
         target_position_base=target_position_base,
@@ -593,7 +622,6 @@ def send_robot_command(controller, command_type, *, target_position_base=None, f
 
 
 def init_rtde(args):
-    """Connect RTDE, validate robot state, and open the gripper for task startup."""
     print(f"[INFO] Connecting to UR5 RTDE using config {args.config} ...")
     controller = RtdeController.from_config(args.config)
     if args.robot_ip:
@@ -656,8 +684,6 @@ def disconnect_rtde(controller):
 
 
 class FollowSharedState:
-    """Thread-safe task state shared by the perception loop and robot follow thread."""
-
     def __init__(self, args):
         self.args = args
         self.lock = threading.Lock()
@@ -723,7 +749,6 @@ class FollowSharedState:
         self.task_epoch = 0
 
     def set_fixed_pose_from_robot(self, controller):
-        """Capture z and orientation from the robot for follow-mode constraints."""
         state = controller.read_robot_state(now_timestamp=time.time())
         pose = state.actual_tcp_pose_base
         if pose is None:
@@ -785,7 +810,6 @@ class FollowSharedState:
         object_point_base=None,
         fitted_points_base=None,
     ):
-        """Collect recent grasp and fitted-template z samples for later place height."""
         grasp_z_mm = None
         source_point = grasp_point_base if grasp_point_base is not None else object_point_base
         if source_point is not None:
@@ -808,7 +832,6 @@ class FollowSharedState:
                 self.recent_template_bottom_z_mm_buffer.append(template_bottom_z_mm)
 
     def finalize_place_z_from_recent_samples(self):
-        """Freeze the place height estimate after grasp closes."""
         with self.lock:
             self.frozen_place_z_mm = None
             self.frozen_place_z_raw_mm = None
@@ -863,7 +886,6 @@ class FollowSharedState:
             self.follow_pause_requested = False
 
     def reset_for_restart(self, *, follow_enabled=None):
-        """Clear task-local state so the next handover starts from a clean epoch."""
         with self.lock:
             if follow_enabled is None:
                 follow_enabled = self.args.enable_follow
@@ -928,7 +950,6 @@ class FollowSharedState:
         measurement_source="measured",
         object_label=None,
     ):
-        """Update measured/fallback target state and arm follow once motion is detected."""
         if object_xyz_m is None:
             self.clear_target(reset_prediction=False, reset_arm=False)
             return
@@ -1032,7 +1053,6 @@ class FollowSharedState:
                 self.target_predictor.update(target_xyz_mm, current_perf)
 
     def _refresh_tracking_targets_locked(self, now_perf):
-        """Select the freshest control target, falling back to short-horizon prediction."""
         measurement_age_s = None
         if self.last_measured_target_t > 0.0:
             measurement_age_s = max(float(now_perf) - float(self.last_measured_target_t), 0.0)
@@ -1078,7 +1098,6 @@ class FollowSharedState:
         return measurement_age_s
 
     def get_snapshot(self, now_perf=None):
-        """Return a consistent copy of follow/task state for readers outside the lock."""
         with self.lock:
             now_perf = time.perf_counter() if now_perf is None else float(now_perf)
             measurement_age_s = self._refresh_tracking_targets_locked(now_perf)
@@ -1115,8 +1134,29 @@ class FollowSharedState:
         with self.lock:
             return self.initial_object_label
 
+    def get_follow_status_text(self):
+        snapshot = self.get_snapshot()
+        mode = "ON" if snapshot["follow_enabled"] else "OFF"
+        streak = snapshot["valid_detection_streak"]
+        trig = "ON" if snapshot["motion_triggered"] else "WAIT"
+        stopped = "YES" if snapshot["object_stopped"] else "NO"
+        home = "LOCKED" if self.home_object_locked else "SEARCH"
+        raw_target = "NONE" if snapshot["latest_target_xyz_mm"] is None else (
+            f"[{snapshot['latest_target_xyz_mm'][0]:.1f}, {snapshot['latest_target_xyz_mm'][1]:.1f}, {snapshot['latest_target_xyz_mm'][2]:.1f}]"
+        )
+        control_target = "NONE" if snapshot["control_target_xyz_mm"] is None else (
+            f"[{snapshot['control_target_xyz_mm'][0]:.1f}, {snapshot['control_target_xyz_mm'][1]:.1f}, {snapshot['control_target_xyz_mm'][2]:.1f}]"
+        )
+        prediction_age = "-" if snapshot["prediction_age_s"] is None else f"{snapshot['prediction_age_s']:.3f}s"
+
+        return [
+            f"follow: {mode} | trigger: {trig} | stopped: {stopped}",
+            f"home: {home} | streak: {streak} | src: {snapshot['target_source']} | raw: {snapshot['measurement_source']}",
+            f"raw_mm: {raw_target}",
+            f"ctrl_mm: {control_target} | pred_age: {prediction_age}",
+        ]
+
     def try_lock_home_pose(self, object_xyz_mm, pixel_xy):
-        """Lock the stable start pose used later as the delivery location."""
         if self.home_object_locked:
             return
 
@@ -1150,7 +1190,6 @@ class FollowSharedState:
                 print(f"[INFO] Home object pixel locked: {self.home_object_pixel}")
 
     def update_stop_state(self, object_xyz_mm):
-        """Detect when the object has settled after motion starts."""
         if not self.motion_triggered:
             self.object_stopped = False
             self.stop_pose_buffer.clear()
@@ -1182,7 +1221,6 @@ class FollowSharedState:
         y_tol_mm=30.0,
         z_tol_mm=30.0,
     ):
-        """Check whether the tool is close enough to close the gripper directly."""
         snapshot = self.get_snapshot()
         target_xyz = snapshot["latest_grasp_xyz_mm"]
         if target_xyz is None:
@@ -1215,8 +1253,151 @@ class FollowSharedState:
         # )
         return x_ok and y_ok and z_ok
 
+
+# class TaskTargetLogger:
+#     def __init__(self, shared_state, output_dir, sample_hz):
+#         self.shared_state = shared_state
+#         self.output_dir = Path(output_dir)
+#         self.sample_hz = max(float(sample_hz), 1e-6)
+#         self.sample_interval_s = 1.0 / self.sample_hz
+#         self.stop_event = threading.Event()
+#         self.thread = None
+
+#         self._lock = threading.Lock()
+#         self._active = False
+#         self._session_epoch = None
+#         self._session_index = 0
+#         self._sample_index = 0
+#         self._session_started_wall_time = None
+#         self._session_started_perf = None
+#         self._csv_file = None
+#         self._csv_writer = None
+#         self._csv_path = None
+#         self._completed_epochs = set()
+
+#     def start(self):
+#         if self.thread is not None:
+#             return
+#         self.thread = threading.Thread(target=self._run, daemon=True)
+#         self.thread.start()
+
+#     def stop(self):
+#         self.stop_event.set()
+#         if self.thread is not None:
+#             self.thread.join(timeout=1.0)
+#         with self._lock:
+#             self._finalize_locked("shutdown")
+
+#     def abort_session(self, reason="aborted"):
+#         with self._lock:
+#             self._finalize_locked(reason)
+
+#     def _run(self):
+#         while not self.stop_event.is_set():
+#             sample_perf = time.perf_counter()
+#             sample_wall = time.time()
+#             snapshot = self.shared_state.get_snapshot(now_perf=sample_perf)
+
+#             with self._lock:
+#                 if self._active and snapshot["task_epoch"] != self._session_epoch:
+#                     self._finalize_locked("reset")
+
+#                 can_open = (
+#                     (not self._active)
+#                     and snapshot["task_state"] == "FOLLOW"
+#                     and snapshot["last_measured_target_t"] > 0.0
+#                     and int(snapshot["task_epoch"]) not in self._completed_epochs
+#                 )
+#                 if can_open:
+#                     self._open_locked(snapshot["task_epoch"], sample_wall, sample_perf)
+
+#                 if self._active:
+#                     self._write_row_locked(sample_wall, sample_perf, snapshot)
+#                     if snapshot["task_state"] == "DONE":
+#                         self._finalize_locked("done")
+
+#             self.stop_event.wait(self.sample_interval_s)
+
+#     def _open_locked(self, task_epoch, sample_wall, sample_perf):
+#         self.output_dir.mkdir(parents=True, exist_ok=True)
+#         self._session_index += 1
+#         self._sample_index = 0
+#         self._session_epoch = int(task_epoch)
+#         self._session_started_wall_time = float(sample_wall)
+#         self._session_started_perf = float(sample_perf)
+#         timestamp = datetime.fromtimestamp(sample_wall).strftime("%Y%m%d_%H%M%S")
+#         self._csv_path = self.output_dir / f"target_points_task{self._session_index:03d}_{timestamp}.csv"
+#         self._csv_file = self._csv_path.open("w", newline="", encoding="utf-8")
+#         self._csv_writer = csv.writer(self._csv_file)
+#         self._csv_writer.writerow(
+#             [
+#                 "sample_index",
+#                 "wall_time_iso",
+#                 "elapsed_s",
+#                 "task_epoch",
+#                 "task_state",
+#                 "target_source",
+#                 "measurement_age_s",
+#                 "prediction_age_s",
+#                 "raw_target_x_mm",
+#                 "raw_target_y_mm",
+#                 "raw_target_z_mm",
+#                 "control_target_x_mm",
+#                 "control_target_y_mm",
+#                 "control_target_z_mm",
+#             ]
+#         )
+#         self._active = True
+#         print(f"[INFO] Target point logging started: {self._csv_path}")
+
+#     def _write_row_locked(self, sample_wall, sample_perf, snapshot):
+#         if self._csv_writer is None:
+#             return
+
+#         self._sample_index += 1
+#         raw_target = snapshot["latest_target_xyz_mm"]
+#         control_target = snapshot["control_target_xyz_mm"]
+#         raw_values = ["NaN", "NaN", "NaN"] if raw_target is None else [f"{float(v):.6f}" for v in raw_target]
+#         control_values = ["NaN", "NaN", "NaN"] if control_target is None else [f"{float(v):.6f}" for v in control_target]
+#         measurement_age = "NaN" if snapshot["measurement_age_s"] is None else f"{float(snapshot['measurement_age_s']):.6f}"
+#         prediction_age = "NaN" if snapshot["prediction_age_s"] is None else f"{float(snapshot['prediction_age_s']):.6f}"
+#         elapsed_s = float(sample_perf - self._session_started_perf)
+#         self._csv_writer.writerow(
+#             [
+#                 self._sample_index,
+#                 datetime.fromtimestamp(sample_wall).isoformat(timespec="milliseconds"),
+#                 f"{elapsed_s:.6f}",
+#                 snapshot["task_epoch"],
+#                 snapshot["task_state"],
+#                 snapshot["target_source"],
+#                 measurement_age,
+#                 prediction_age,
+#                 *raw_values,
+#                 *control_values,
+#             ]
+#         )
+#         self._csv_file.flush()
+
+#     def _finalize_locked(self, reason):
+#         if not self._active:
+#             return
+#         session_epoch = self._session_epoch
+#         csv_path = self._csv_path
+#         if self._csv_file is not None:
+#             self._csv_file.close()
+#         self._active = False
+#         self._session_epoch = None
+#         self._session_started_wall_time = None
+#         self._session_started_perf = None
+#         self._csv_file = None
+#         self._csv_writer = None
+#         self._csv_path = None
+#         if reason == "done" and session_epoch is not None:
+#             self._completed_epochs.add(int(session_epoch))
+#         print(f"[INFO] Target point logging finished ({reason}): {csv_path}")
+
+
 def robot_control_loop(controller, shared_state, args):
-    """Servo the UR5 toward the current control target while follow mode is active."""
     interval = 1.0 / max(float(args.control_hz), 1e-6)
     max_step_mm = MAX_XY_SPEED_MM_S / max(float(args.control_hz), 1e-6)
     max_step_z_mm = MAX_Z_SPEED_MM_S / max(float(args.control_hz), 1e-6)
@@ -1332,7 +1513,6 @@ def robot_control_loop(controller, shared_state, args):
 
 
 def wait_until_target_reached(controller, target_position_base, *, timeout_s, tolerance_m, poll_dt=0.05):
-    """Poll the robot pose until a blocking move reaches its target or times out."""
     deadline = time.time() + timeout_s
     target = np.asarray(target_position_base, dtype=np.float32).reshape(3)
 
@@ -1349,7 +1529,6 @@ def wait_until_target_reached(controller, target_position_base, *, timeout_s, to
 
 
 def move_robot_and_wait(controller, target_position_base, fixed_orientation_base, *, timeout_s, tolerance_m, source_mode):
-    """Issue one blocking position move and wait for completion."""
     send_robot_command(
         controller,
         ROBOT_CMD_MOVE_TO_POSITION,
@@ -1366,8 +1545,7 @@ def move_robot_and_wait(controller, target_position_base, fixed_orientation_base
     )
 
 
-def stop_follow_for_handoff(shared_state, timeout_s):
-    """Pause the follow thread before the main thread takes over for grasp/place."""
+def stop_follow_for_handoff(controller, shared_state, timeout_s):
     shared_state.request_follow_pause()
     released = shared_state.wait_for_follow_idle(timeout_s)
     if not released:
@@ -1378,7 +1556,6 @@ def stop_follow_for_handoff(shared_state, timeout_s):
 
 
 def move_robot_to_home_pose(controller, args):
-    """Move the robot to the configured HOME xyz before or between tasks."""
     base_target, base_orientation = get_base_pose_target(controller)
     print(
         "[INFO] Moving robot to HOME position while keeping current orientation: "
@@ -1398,7 +1575,6 @@ def move_robot_to_home_pose(controller, args):
 
 
 def configure_gripper_position_threshold_for_label(controller, label):
-    """Select a gripper completion threshold based on the initial object label."""
     if controller is None:
         return None
 
@@ -1473,14 +1649,16 @@ def reset_system_to_start_state(
     controller,
     shared_state,
     args,
+    target_logger=None,
     metadata_recorder=None,
     pipeline=None,
     video_recorder=None,
 ):
-    """Reset perception, robot pose, metadata, and recorder state for a new task."""
     print("[INFO] Reset requested: returning to startup state")
     task_start_perf = None
     discard_video_recording_for_reset(video_recorder)
+    if target_logger is not None:
+        target_logger.abort_session("reset")
     if pipeline is not None:
         shape_fitting_tracker = pipeline.get("shape_fitting_tracker")
         if shape_fitting_tracker is not None and hasattr(shape_fitting_tracker, "reset"):
@@ -1536,7 +1714,6 @@ def reset_system_to_start_state(
 
 
 def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True, metadata_recorder=None):
-    """Close the gripper and stop when force or position indicates contact."""
     if verbose:
         print("[INFO] GRIPPER CLOSE start")
 
@@ -1653,7 +1830,6 @@ def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True,
 
 
 def execute_gripper_open(controller, dwell_s=0.5, metadata_recorder=None):
-    """Open the gripper and optionally record the last-contact timestamp."""
     if metadata_recorder is not None:
         last_contact_timestamp = metadata_recorder.note_robot_last_contact()
         if last_contact_timestamp is not None:
@@ -1669,7 +1845,6 @@ def execute_gripper_open(controller, dwell_s=0.5, metadata_recorder=None):
 
 
 def save_grasp_offset(controller, shared_state):
-    """Store object-to-tool offset and freeze place-height data after grasp."""
     snap = shared_state.get_snapshot()
     obj_xyz = snap["latest_object_xyz_mm"]
     if obj_xyz is None:
@@ -1711,7 +1886,6 @@ def save_grasp_offset(controller, shared_state):
 
 
 def compute_place_target(shared_state):
-    """Compute the delivery tool target from home pose and saved grasp offset."""
     with shared_state.lock:
         home_xyz = None if shared_state.home_object_xyz_mm is None else shared_state.home_object_xyz_mm.copy()
         grasp_offset = None if shared_state.grasp_offset_xyz_mm is None else shared_state.grasp_offset_xyz_mm.copy()
@@ -1747,7 +1921,6 @@ def compute_place_target(shared_state):
 
 
 def execute_return_and_place(controller, shared_state, args, metadata_recorder=None):
-    """Run the post-grasp return, release, backoff, and HOME sequence."""
     target_eef_xyz, place_target_debug = compute_place_target(shared_state)
     if target_eef_xyz is None:
         print("[WARN] Cannot compute place target.")
@@ -1891,7 +2064,6 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
 
 
 def configure_object_worker_from_args(worker, args, prompt_classes):
-    """Apply CLI model/prompt/selection settings to an object worker."""
     effective_prompt_classes = prompt_classes if prompt_classes else list(getattr(worker.segmentation_engine, "prompt_classes", []))
     preprocess_config = dict(getattr(worker.segmentation_engine, "preprocess_config", {}) or {})
     worker.segmentation_engine = SegmentationEngine(
@@ -1913,7 +2085,6 @@ def configure_object_worker_from_args(worker, args, prompt_classes):
 
 
 def build_dual_perception_pipeline(args):
-    """Construct all camera, perception, fusion, fitting, and debug pipeline objects."""
     sensor_hub = DualSensorHub.from_config(args.config)
     sensor_hub.width = int(args.width)
     sensor_hub.height = int(args.height)
@@ -1964,7 +2135,6 @@ def build_dual_perception_pipeline(args):
 
 
 def build_fitted_merged_object(raw_merged_object, shape_fitting_state):
-    """Expose the shape-fitted template cloud through the merger state interface."""
     if not shape_fitting_state.valid:
         return replace(
             raw_merged_object,
@@ -1988,7 +2158,6 @@ def build_fitted_merged_object(raw_merged_object, shape_fitting_state):
 
 
 def project_base_point_to_cam0(point_base, intrinsics, t_cam0_base, width: int, height: int):
-    """Project one base-frame point into a camera image for overlay drawing."""
     if point_base is None or intrinsics is None:
         return None
     point = np.asarray(point_base, dtype=np.float32).reshape(3)
@@ -2009,7 +2178,6 @@ def project_base_point_to_cam0(point_base, intrinsics, t_cam0_base, width: int, 
 
 
 def project_base_points_to_cam0(points_base, intrinsics, t_cam0_base, width: int, height: int, max_points: int = 1500):
-    """Project a sampled base-frame point cloud into camera pixels for preview."""
     if points_base is None or intrinsics is None:
         return np.empty((0, 2), dtype=np.int32)
     points = np.asarray(points_base, dtype=np.float32).reshape((-1, 3))
@@ -2037,6 +2205,13 @@ def project_base_points_to_cam0(points_base, intrinsics, t_cam0_base, width: int
     if not np.any(in_bounds):
         return np.empty((0, 2), dtype=np.int32)
     return np.stack([us[in_bounds], vs[in_bounds]], axis=1)
+
+
+def format_vec3(values):
+    if values is None:
+        return "None"
+    vec = tuple(float(v) for v in values[:3])
+    return "(%.3f, %.3f, %.3f)" % vec
 
 
 def choose_point(primary, fallback=None):
@@ -2070,7 +2245,6 @@ def append_debug_3d_frame(
     eef_pose_base,
     measurement_source,
 ):
-    """Record one synchronized perception/debug frame for later 3D inspection."""
     debug_3d_recorder.append_frame(
         frame_index=int(snapshot.pair_index),
         timestamp_unix_s=current_time,
@@ -2090,7 +2264,6 @@ def append_debug_3d_frame(
 
 
 def build_runtime_profile_context(args, model_label, pipeline):
-    """Capture static run settings that should be written with profiler output."""
     return {
         "config_path": str(Path(args.config).resolve()),
         "model_label": model_label,
@@ -2127,7 +2300,6 @@ def collect_runtime_profile_metrics(
     instant_fps,
     smoothed_fps,
 ):
-    """Collect per-frame perception and timing metrics for runtime profiling."""
     object_debug_cam0 = getattr(pipeline["object_worker_cam0"], "last_debug", None)
     object_debug_cam1 = getattr(pipeline["object_worker_cam1"], "last_debug", None)
     shape_fit_debug = getattr(pipeline["shape_fitting_tracker"], "last_debug", None)
@@ -2179,17 +2351,40 @@ def discard_runtime_profile(runtime_profiler, *, reason):
     runtime_profiler.discard_current_session(reason=reason)
 
 
+def _summarize_class_names(class_names):
+    if not class_names:
+        return "-"
+    counts = {}
+    for class_name in class_names:
+        key = str(class_name)
+        counts[key] = counts.get(key, 0) + 1
+    parts = []
+    for key in sorted(counts):
+        count = counts[key]
+        parts.append(f"{key}x{count}" if count > 1 else key)
+    return ",".join(parts)
+
+
+def get_segmentation_class_summary(object_worker):
+    debug = getattr(object_worker, "last_debug", None)
+    if debug is None:
+        return "-", "-"
+    all_summary = _summarize_class_names(getattr(debug, "all_class_names", ()))
+    selected_summary = _summarize_class_names(getattr(debug, "selected_class_names", ()))
+    return all_summary, selected_summary
+
+
 def render_camera_mask_preview(
     snapshot,
     pipeline,
     object_worker,
     selected_hand,
     fusion_state,
+    grasp_target,
     display_grasp_point,
     *,
     camera_label,
 ):
-    """Render the secondary camera preview with object mask and key projected points."""
     frame_bundle = snapshot.cam0 if camera_label == "cam0" else snapshot.cam1
     image_bgr = np.asarray(frame_bundle.color_image).copy()
 
@@ -2208,7 +2403,7 @@ def render_camera_mask_preview(
         (display_grasp_point, (0, 255, 0), "grasp"),
         (hand_point, (255, 120, 0), "hand"),
     ]
-    for point_base, color_bgr, _label in draw_specs:
+    for point_base, color_bgr, label in draw_specs:
         pixel = project_base_point_to_cam0(
             point_base,
             frame_bundle.intrinsics,
@@ -2219,6 +2414,21 @@ def render_camera_mask_preview(
         if pixel is None:
             continue
         cv.circle(image_bgr, pixel, 6, color_bgr, -1, cv.LINE_AA)
+        # cv.putText(image_bgr, label, (pixel[0] + 8, pixel[1] - 8), cv.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv.LINE_AA)
+        # cv.putText(image_bgr, label, (pixel[0] + 8, pixel[1] - 8), cv.FONT_HERSHEY_SIMPLEX, 0.55, color_bgr, 1, cv.LINE_AA)
+
+    # title = f"{camera_label} view"
+    # cv.putText(image_bgr, title, (12, 28), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv.LINE_AA)
+    # cv.putText(image_bgr, title, (12, 28), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
+    # all_summary, selected_summary = get_segmentation_class_summary(object_worker)
+    # info_lines = [
+    #     f"seg all: {all_summary}",
+    #     f"seg selected: {selected_summary}",
+    # ]
+    # for line_index, text_line in enumerate(info_lines):
+    #     origin = (12, 54 + line_index * 22)
+    #     cv.putText(image_bgr, text_line, origin, cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv.LINE_AA)
+    #     cv.putText(image_bgr, text_line, origin, cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv.LINE_AA)
     return image_bgr
 
 
@@ -2233,7 +2443,6 @@ def format_record_clock(elapsed_s):
 
 
 def draw_record_clock_overlay(image_bgr, elapsed_s):
-    """Draw the task recording clock onto a preview frame."""
     clock_text = format_record_clock(elapsed_s)
     if not clock_text:
         return image_bgr
@@ -2248,14 +2457,19 @@ def render_cam0_perception_debug(
     snapshot,
     pipeline,
     merged_object,
+    raw_merged_object,
+    shape_fitting_state,
     selected_hand,
     fusion_state,
+    grasp_target,
     display_object_point,
     display_grasp_point,
+    hand_relative_fallback_state,
     shared_state,
+    model_label,
+    fps,
     record_elapsed_s=None,
 ):
-    """Render the main cam0 preview with mask, object cloud, hand, grasp, and HOME."""
     image_bgr = np.asarray(snapshot.cam0.color_image).copy()
 
     object_debug = getattr(pipeline["object_worker_cam0"], "last_debug", None)
@@ -2308,12 +2522,73 @@ def render_cam0_perception_debug(
         cv.putText(image_bgr, "HOME", (home_pixel[0] + 10, home_pixel[1] - 10), cv.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv.LINE_AA)
         cv.putText(image_bgr, "HOME", (home_pixel[0] + 10, home_pixel[1] - 10), cv.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 1, cv.LINE_AA)
 
+    shape_fit_debug = getattr(pipeline["shape_fitting_tracker"], "last_debug", None)
+    shape_fit_mode = getattr(shape_fit_debug, "tracking_mode", "-")
+    shape_fit_icp_time = getattr(shape_fit_debug, "icp_time_ms", None)
+    shape_fit_icp_fps = getattr(shape_fit_debug, "icp_fps", None)
+    shape_fit_icp_fitness = getattr(shape_fit_debug, "icp_fitness", None)
+    shape_fit_icp_rmse = getattr(shape_fit_debug, "icp_rmse", None)
+    shape_fit_icp_time_text = "-" if shape_fit_icp_time is None else f"{float(shape_fit_icp_time):.1f}ms"
+    shape_fit_icp_fps_text = "-" if shape_fit_icp_fps is None else f"{float(shape_fit_icp_fps):.1f}"
+    shape_fit_icp_fitness_text = "-" if shape_fit_icp_fitness is None else f"{float(shape_fit_icp_fitness):.3f}"
+    shape_fit_icp_rmse_text = "-" if shape_fit_icp_rmse is None else f"{float(shape_fit_icp_rmse):.4f}"
+
+    # lines = [
+    #     f"model: {model_label}",
+    #     f"fps: {fps:.1f}",
+    #     f"merged_obj={bool(merged_object.valid)} points={merged_object.merged_point_count} proj={len(merged_pixels)}",
+    #     (
+    #         "shape_fit="
+    #         f"{bool(shape_fitting_state.valid)} init={bool(shape_fitting_state.initialized)} "
+    #         f"template={shape_fitting_state.template_id or '-'} "
+    #         f"scale={'-' if shape_fitting_state.scale is None else f'{shape_fitting_state.scale:.3f}'}"
+    #     ),
+    #     (
+    #         "shape_fit_reason="
+    #         f"{shape_fitting_state.reason} raw_points={raw_merged_object.merged_point_count} "
+    #         f"fitted_points={len(np.asarray(shape_fitting_state.fitted_points_base, dtype=np.float32).reshape((-1, 3)))}"
+    #     ),
+    #     (
+    #         "shape_fit_icp="
+    #         f"mode={shape_fit_mode} "
+    #         f"time={shape_fit_icp_time_text} "
+    #         f"fps={shape_fit_icp_fps_text} "
+    #         f"fit={shape_fit_icp_fitness_text} "
+    #         f"rmse={shape_fit_icp_rmse_text}"
+    #     ),
+    #     f"hand={bool(selected_hand.valid)} cam={selected_hand.selected_camera} handed={selected_hand.handedness}",
+    #     (
+    #         "grasp_valid="
+    #         f"{bool(grasp_target.valid)} grasp={format_vec3(grasp_target.target_position_base)} "
+    #         f"grasp_hold={bool(getattr(grasp_target, 'used_temporal_hold', False))} "
+    #         f"cand_idx={int(getattr(grasp_target, 'selected_candidate_index', -1))} "
+    #         f"xy_lock={bool(getattr(grasp_target, 'xy_locked_to_centroid', False))}"
+    #     ),
+    #     (
+    #         "hand_fallback="
+    #         f"{bool(getattr(hand_relative_fallback_state, 'valid', False))} "
+    #         f"obj={format_vec3(getattr(hand_relative_fallback_state, 'object_position_base', None))} "
+    #         f"grasp={format_vec3(getattr(hand_relative_fallback_state, 'grasp_position_base', None))} "
+    #         f"age={'-' if getattr(hand_relative_fallback_state, 'dropout_age_s', None) is None else f'{float(hand_relative_fallback_state.dropout_age_s):.3f}s'} "
+    #         f"reason={getattr(hand_relative_fallback_state, 'reason', None)}"
+    #     ),
+    #     f"object={format_vec3(object_point)}",
+    #     f"hand={format_vec3(hand_point)}",
+    # ]
+    # cam0_all_summary, cam0_selected_summary = get_segmentation_class_summary(pipeline["object_worker_cam0"])
+    # lines.append(f"cam0 seg all={cam0_all_summary}")
+    # lines.append(f"cam0 seg selected={cam0_selected_summary}")
+    # lines.extend(shared_state.get_follow_status_text())
+    #
+    # for line_index, text_line in enumerate(lines):
+    #     origin = (12, 28 + line_index * 24)
+    #     cv.putText(image_bgr, text_line, origin, cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv.LINE_AA)
+    #     cv.putText(image_bgr, text_line, origin, cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv.LINE_AA)
     image_bgr = draw_record_clock_overlay(image_bgr, record_elapsed_s)
     return image_bgr
 
 
 def main():
-    """Run the full dual-camera handover loop and handle keyboard controls."""
     args = parse_args()
     config = load_yaml_config(args.config)
     args = apply_config_defaults(args, config)
@@ -2347,6 +2622,7 @@ def main():
 
     controller = None
     shared_state = FollowSharedState(args)
+    target_logger = None
     metadata_recorder = HandoverMetadataRecorder()
     video_recorder = None
     control_thread = None
@@ -2549,7 +2825,7 @@ def main():
                 if controller is not None and shared_state.should_start_pregrasp(controller):
                     print("[INFO] DIRECT GRASP trigger")
                     shared_state.stop_follow()
-                    if stop_follow_for_handoff(shared_state, args.follow_handoff_timeout_s):
+                    if stop_follow_for_handoff(controller, shared_state, args.follow_handoff_timeout_s):
                         initial_threshold_label = shared_state.get_initial_object_label()
                         threshold_label = initial_threshold_label or merged_object.label or fitted_merged_object.label
                         print(
@@ -2592,11 +2868,17 @@ def main():
                     snapshot,
                     pipeline,
                     fitted_merged_object,
+                    merged_object,
+                    shape_fitting_state,
                     selected_hand,
                     fusion_state,
+                    grasp_target,
                     object_point_base,
                     grasp_point_base,
+                    hand_relative_fallback_state,
                     shared_state,
+                    model_label,
+                    smoothed_fps,
                     record_elapsed_s=record_elapsed_s,
                 )
                 cam1_preview = render_camera_mask_preview(
@@ -2605,6 +2887,7 @@ def main():
                     pipeline["object_worker_cam1"],
                     selected_hand,
                     fusion_state,
+                    grasp_target,
                     grasp_point_base,
                     camera_label="cam1",
                 )
@@ -2647,6 +2930,7 @@ def main():
                         controller,
                         shared_state,
                         args,
+                        target_logger=target_logger,
                         metadata_recorder=metadata_recorder,
                         pipeline=pipeline,
                         video_recorder=video_recorder,
@@ -2675,6 +2959,7 @@ def main():
                         controller,
                         shared_state,
                         args,
+                        target_logger=target_logger,
                         metadata_recorder=metadata_recorder,
                         pipeline=pipeline,
                         video_recorder=video_recorder,
@@ -2707,6 +2992,8 @@ def main():
         shared_state.stop_event.set()
         if control_thread is not None:
             control_thread.join(timeout=1.0)
+        if target_logger is not None:
+            target_logger.stop()
         safe_stop_rtde(controller)
         disconnect_rtde(controller)
         try:

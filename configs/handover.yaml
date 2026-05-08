@@ -1,406 +1,503 @@
 system:
-  name: dual_camera_receive_and_place
-  use_ros: false
+  # 카메라별 fps가 비어 있을 때 DualSensorHub가 쓰는 기본 센서 FPS입니다.
   sensor_fps: 30
-  task_manager_hz: 20
-  robot_control_hz: 125
-  runner_heartbeat_sec: 1.0
-  runner_loop_sleep_sec: 0.0
 
 frames:
-  base_frame: ur_base
-  tool_frame: tool0
   height_axis:
+    # 리프트 감지, hand clearance, grasp 후보 필터링에서 높이로 볼 robot base 축입니다.
     name: z
+    # height_axis의 양의 방향을 위쪽으로 해석할지 정합니다.
     positive_direction: up
-    description: upward/downward direction used for lift detection and hand-clearance checks
 
 cameras:
   cam0:
-    enabled: true
-    role: right_hand_camera
+    # DualSensorHub가 cam0 RealSense 장치를 열 때 사용할 serial입니다.
     serial: "148522072369"
+    # cam0 color/depth stream 폭입니다. 실행 인자 --width가 있으면 런타임에 override됩니다.
     width: 640
+    # cam0 color/depth stream 높이입니다. 실행 인자 --height가 있으면 런타임에 override됩니다.
     height: 480
+    # cam0 stream FPS입니다. 실행 인자 --fps가 있으면 런타임에 override됩니다.
     fps: 30
     depth_filters:
       spatial:
+        # RealSense spatial depth filter 사용 여부입니다.
         enabled: false
+        # spatial filter 강도입니다.
         magnitude: 2
+        # spatial filter smoothing alpha입니다.
         smooth_alpha: 0.5
+        # spatial filter edge 보존 delta입니다.
         smooth_delta: 20
       temporal:
+        # RealSense temporal depth filter 사용 여부입니다.
         enabled: false
+        # temporal filter smoothing alpha입니다.
         smooth_alpha: 0.4
+        # temporal filter delta입니다.
         smooth_delta: 20
       hole_filling:
+        # RealSense depth hole filling 사용 여부입니다.
         enabled: false
+        # hole filling mode 값입니다.
         mode: 1
-    intrinsics_file: python_stereo_camera_calibrate/camera_parameters/camera0_intrinsics.dat
-    extrinsics_file: camera_parameters/c0_to_robot.pckl
-    extrinsics_format: pickle_cam0_to_robot
   cam1:
-    enabled: true
-    role: left_hand_camera
+    # DualSensorHub가 cam1 RealSense 장치를 열 때 사용할 serial입니다.
     serial: "327122075999"
+    # cam1 color/depth stream 폭입니다. cam0와 같아야 하며 --width로 override됩니다.
     width: 640
+    # cam1 color/depth stream 높이입니다. cam0와 같아야 하며 --height로 override됩니다.
     height: 480
+    # cam1 stream FPS입니다. cam0와 같아야 하며 --fps로 override됩니다.
     fps: 30
     depth_filters:
       spatial:
+        # cam1 spatial depth filter 사용 여부입니다.
         enabled: true
+        # spatial filter 강도입니다.
         magnitude: 2
+        # spatial filter smoothing alpha입니다.
         smooth_alpha: 0.5
+        # spatial filter edge 보존 delta입니다.
         smooth_delta: 20
       temporal:
+        # cam1 temporal depth filter 사용 여부입니다.
         enabled: true
+        # temporal filter smoothing alpha입니다.
         smooth_alpha: 0.2
+        # temporal filter delta입니다.
         smooth_delta: 20
       hole_filling:
+        # cam1 depth hole filling 사용 여부입니다.
         enabled: false
+        # hole filling mode 값입니다.
         mode: 1
-    intrinsics_file: python_stereo_camera_calibrate/camera_parameters/camera1_intrinsics.dat
-    extrinsics_file: camera_parameters/rot_trans_c1.dat
-    extrinsics_format: dat_cam1_to_cam0
 
 calibration:
   chain:
     cam0_to_robot_base:
+      # cam0 좌표계를 robot base 좌표계로 변환하는 4x4 transform pickle입니다.
       file: camera_parameters/c0_to_robot.pckl
-      format: pickle_cam0_to_robot
-      description: transform from cam0 coordinates into the robot base frame
     cam1_to_cam0:
+      # cam1 좌표계를 cam0 좌표계로 변환하는 transform 파일입니다.
       file: camera_parameters/rot_trans_c1.dat
-      format: dat_cam1_to_cam0
+      # cam1_to_cam0 파일의 translation 단위입니다.
       translation_unit: m
-      description: transform from cam1 coordinates into the cam0 frame
-  composition:
-    derived_transform_name: T_base_cam1
-    expression: T_base_cam1 = T_base_cam0 @ T_cam0_cam1
-    note: cam1 points are first transformed into cam0, then from cam0 into robot base
 
 perception:
   synchronization:
+    # cam0/cam1 frame pair로 허용할 최대 timestamp 차이입니다.
     max_pair_time_delta_sec: 0.03
+    # fusion 단계에서 object/hand state가 오래됐는지 판단하는 timeout입니다.
     stale_timeout_sec: 0.30
+
   depth_completion:
     fdct:
+      # 실행 인자로 지정하지 않았을 때 FDCT depth completion을 사용할지 정합니다.
       enabled: false
+      # FDCT를 적용할 카메라 선택입니다. cam0, cam1, both, none 중 하나입니다.
       cameras: both
+      # FDCT checkpoint 경로입니다.
       checkpoint: FDCT/TransCG.tar
+      # FDCT 실행 device입니다. auto, cpu, cuda 등을 사용할 수 있습니다.
       device: auto
+      # FDCT 네트워크 입력 폭입니다.
       net_width: 320
+      # FDCT 네트워크 입력 높이입니다.
       net_height: 240
+      # FDCT 전처리에서 유효 depth 최소값입니다.
       depth_min: 0.30
+      # FDCT 전처리에서 유효 depth 최대값입니다.
       depth_max: 1.70
+      # FDCT 입력 depth normalize scale입니다.
       depth_norm: 1.0
+      # FDCT 입력 depth coefficient입니다.
       depth_coeff: 10.0
+      # invalid depth 영역을 inpaint해서 FDCT에 넣을지 정합니다.
       inpaint: true
+      # FDCT 출력 depth에 bilateral filter를 후처리로 적용할지 정합니다.
       bilateral_enabled: true
+      # bilateral filter radius입니다.
       bilateral_radius: 2
+      # bilateral filter 공간 sigma입니다.
       bilateral_sigma_space: 2.0
+      # bilateral filter에서 far depth cutoff로 쓰는 값입니다.
       bilateral_zfar: 100.0
+      # FDCT 실패 시 원본 RealSense depth로 계속 진행할지 정합니다.
       fallback_to_raw: true
+      # FDCT raw/completed depth 통계를 출력할지 정합니다.
       debug_stats: false
+      # FDCT 경고/통계를 몇 번마다 출력할지 정합니다.
       debug_every: 30
+
   object:
-    target_label: cup ## 의미 없음
+    # segmentation label이 없을 때 ObjectState에 넣을 fallback label입니다.
+    target_label: cup
+    # 선택된 segmentation confidence가 이 값 미만이면 object를 invalid 처리합니다.
     confidence_threshold: 0.15
     segmentation:
+      # YOLOE segmentation weights/model 이름입니다. 실행 인자 --model이 있으면 override됩니다.
       model_name: yoloe-26l-seg.pt
+      # YOLOE text prompt class 목록입니다. 실행 인자 --prompt가 있으면 override됩니다.
       prompt_classes: ["cup", "wine glass"]
+      # segmentation inference image size입니다. 실행 인자 --imgsz가 있으면 override됩니다.
       imgsz: 640
+      # YOLOE inference confidence threshold입니다. 실행 인자 --conf가 있으면 override됩니다.
       conf: 0.15
+      # NMS IoU threshold입니다. 실행 인자 --iou가 있으면 override됩니다.
       iou: 0.45
+      # frame당 최대 detection 수입니다. 실행 인자 --max-det가 있으면 override됩니다.
       max_det: 100
+      # Ultralytics device 문자열입니다. null이면 자동 선택입니다.
       device: null
+      # class id 필터입니다. null이면 prompt 결과 전체를 사용합니다.
       classes: null
+      # FP16 inference 사용 여부입니다.
       half: false
+      # Ultralytics retina mask 옵션입니다.
       retina_masks: true
-      selection_mode: highest_score
-      selection_class_names: ["wine glass"] # 어떤걸로 선택할지 모호할 때 이 클래스 우선 선택
+      # 특정 class를 우선 선택해야 할 때 사용할 class 이름 목록입니다.
+      selection_class_names: ["wine glass"]
       preprocess:
+        # segmentation 입력 영상 전처리 사용 여부입니다.
         enabled: false
+        # 대비 보정 계수입니다.
         contrast_alpha: 1.0
+        # 밝기 보정 offset입니다.
         brightness_beta: 0.0
+        # gamma correction 값입니다.
         gamma: 1.0
         clahe:
+          # CLAHE 적용 여부입니다.
           enabled: false
+          # CLAHE clip limit입니다.
           clip_limit: 2.0
+          # CLAHE tile grid 한 변 크기입니다.
           tile_grid_size: 8
     point_cloud:
+      # object mask 안의 depth pixel을 몇 pixel 간격으로 샘플링할지 정합니다.
       stride: 2
+      # 카메라별 object point cloud 최대 point 수입니다.
       max_points: 20000
+      # object point cloud 생성 시 유효 depth 최소값입니다.
       min_depth_m: 0.10
+      # object point cloud 생성 시 유효 depth 최대값입니다.
       max_depth_m: 1.70
+      # 카메라별 cloud downsample voxel size입니다.
       per_camera_voxel_size_m: 0.005
+      # outlier 제거 방식입니다.
       outlier_method: statistical
+      # statistical outlier 제거에 사용할 이웃 개수입니다.
       outlier_nb_neighbors: 20
+      # statistical outlier 제거 표준편차 비율입니다.
       outlier_std_ratio: 2.0
+      # radius outlier 제거 반경입니다.
       outlier_radius_m: 0.01
+      # radius 안 최소 이웃 수입니다.
       outlier_min_neighbors: 8
+      # 카메라별 point 수가 이보다 적으면 object를 invalid 처리합니다.
       min_points_per_camera: 300
+    # cam0/cam1 병합 후 downsample voxel size입니다.
     merged_voxel_size_m: 0.006
+
   fill_level_estimation:
-    fillings_empty: false
+    # 내용물이 비어 있다고 강제할지 정합니다.
+    fillings_empty: true
+    # container mask ROI의 좌우 shrink 비율입니다.
     roi_shrink_x: 0.18
+    # ROI 상단 shrink 비율입니다.
     roi_shrink_top: 0.08
+    # ROI 하단 shrink 비율입니다.
     roi_shrink_bottom: 0.05
+    # vertical profile smoothing/neighbor 크기입니다.
     profile_k: 3
+    # 내용물 상단 위치 추정 보정 pixel입니다.
     rice_top_bias_px: 5
+    # 바닥 중심 pixel 추정 보정값입니다.
     bottom_center_offset_px: 5
+    # fill 계산에 사용할 최소 depth입니다.
     min_depth_m: 0.05
+    # fill 계산에 사용할 최대 depth입니다.
     max_valid_depth_m: 1.8
+    # 특정 pixel depth를 읽을 때 주변 patch 반경의 절반 크기입니다.
     depth_patch_half: 4
+
   hand:
-    target_fps: 30
     detector:
+      # MediaPipe hand detection 최소 confidence입니다.
       min_detection_confidence: 0.5
+      # MediaPipe hand tracking 최소 confidence입니다.
       min_tracking_confidence: 0.5
+      # 카메라별 검출할 최대 손 개수입니다.
       max_num_hands: 1
     depth_lifting:
+      # hand keypoint 주변 depth patch 반경입니다.
       patch_radius: 2
+      # hand keypoint를 3D로 lift할 때 유효 depth 최소값입니다.
       min_depth_m: 0.10
+      # hand keypoint를 3D로 lift할 때 유효 depth 최대값입니다.
       max_depth_m: 2.00
+      # hand pose를 valid로 볼 최소 3D keypoint 개수입니다.
       min_valid_keypoints: 4
+    # palm center/normal 이동평균 window frame 수입니다.
     smoothing_window_frames: 5
+    # 손 velocity EMA alpha입니다.
     velocity_alpha: 0.5
+    # palm pose quality가 이 값 미만이면 hand를 invalid 처리합니다.
     min_pose_quality: 0.25
     handedness_selection:
-      right_hand_camera: 0
-      left_hand_camera: 1
+      # 오른손 후보로 볼 카메라 id입니다.
+      right_hand_camera: 1
+      # 왼손 후보로 볼 카메라 id입니다.
+      left_hand_camera: 0
+      # 선택 카메라를 바꾸기 전 challenger가 유지되어야 하는 frame 수입니다.
       hysteresis_frames: 5
-      dropout_hold_frames: 12
+      # 현재 선택 hand가 잠깐 사라졌을 때 유지할 frame 수입니다.
+      dropout_hold_frames: 4
+      # challenger로 전환하기 위한 confidence margin입니다.
       confidence_drop_margin: 0.15
+      # 같은 카메라가 이 frame 수만큼 연속 선택되면 이후 해당 카메라로 고정합니다.
+      lock_after_stable_frames: 4
+      # lock 이후 손이 잠깐 invalid가 되어도 마지막 selected hand를 유지합니다.
+      lock_hold_last_on_dropout: true
+
   fusion:
-    object_centroid_alpha: 0.35
-    hand_center_alpha: 0.35
+    # object centroid EMA alpha입니다. 수정 0.35  -> 0.6
+    object_centroid_alpha: 0.6
+    # hand center EMA alpha입니다. 수정 0.35 -> 0.6
+    hand_center_alpha: 0.6
+    # hand normal EMA alpha입니다.
     hand_normal_alpha: 0.50
+    # position jump가 이보다 크면 smoothing state를 재초기화합니다.
     max_position_jump_m: 0.20
+    # hand approach/activation을 확정할 연속 frame 수입니다.
     stable_frames_required: 5
-  # pose_tracking:
-  #   enabled: true
-  #   anchor_camera: cam0
-  #   debug_dir: logs/foundationpose_debug
-  #   surface_sample_count: 1500
-  #   template_library:
-  #     cup:
-  #       template_id: cup_canonical
-  #       asset_path: shape_fitting/template.npy
-  #       unit_scale_m: 0.001
-  #     wine glass:
-  #       template_id: wine_glass_canonical
-  #       asset_path: shape_fitting/wine_glass.npy
-  #       unit_scale_m: 0.001
-  #   scale_estimation:
-  #     stable_frames: 5
-  #     min_points: 500
-  #     percentile_low: 5.0
-  #     percentile_high: 95.0
-  #     min_scale: 0.25
-  #     max_scale: 4.0
-  #   registration:
-  #     refine_iter: 5
-  #   tracking:
-  #     refine_iter: 2
-  #   health:
-  #     mask_iou_threshold: 0.15
-  #     depth_inlier_threshold: 0.30
-  #     depth_tolerance_m: 0.03
-  #   reinit:
-  #     low_conf_frames: 5
-  #     min_merged_points: 300
+
   shape_fitting:
+    # template 기반 shape fitting/ICP 사용 여부입니다.
     enabled: true
     template_library:
       cup:
+        # cup template 식별자입니다.
         template_id: cup_shape_fit
+        # cup canonical point cloud 파일입니다.
         asset_path: shape_fitting/template.npy
+        # template point 단위를 meter로 바꾸는 scale입니다.
         unit_scale_m: 0.001
       wine glass:
+        # wine glass template 식별자입니다.
         template_id: wine_glass_shape_fit
+        # wine glass canonical point cloud 파일입니다.
         asset_path: shape_fitting/wine_glass.npy
+        # template point 단위를 meter로 바꾸는 scale입니다.
         unit_scale_m: 0.001
     cluster:
+      # DBSCAN cluster 반경입니다.
       dbscan_eps_m: 0.02
+      # DBSCAN core point 최소 이웃 수입니다.
       dbscan_min_points: 10
+      # 선택 cluster centroid가 이전 frame 대비 허용되는 최대 jump입니다.
       max_cluster_jump_m: 0.08
     scale_init:
+      # scale 초기화에 필요한 안정 frame 수입니다.
       stable_frames: 8
+      # object extent 계산 lower percentile입니다.
       percentile_low: 5.0
+      # object extent 계산 upper percentile입니다.
       percentile_high: 95.0
+      # template scale 최소값입니다.
       min_scale: 0.5
+      # template scale 최대값입니다.
       max_scale: 1.8
     tracking:
+      # cluster extent가 이보다 작으면 tracking invalid 처리합니다.
       min_cluster_extent_m: 1.0e-5
     icp:
+      # ICP 입력에 사용할 최대 point 수입니다.
       max_points: 3500
+      # ICP 최대 iteration 수입니다.
       max_iterations: 10
+      # ICP correspondence 최대 거리입니다.
       distance_threshold_m: 0.15
+      # ICP 결과를 valid로 볼 최소 fitness입니다.
       min_fitness: 0.02
+      # ICP 수렴 translation tolerance입니다.
       translation_tolerance_m: 1.0e-5
+      # ICP 결과 centroid jump 허용값입니다.
       max_centroid_jump_m: 0.25
       crop:
+        # ICP 전에 target/source cloud 상단 일부를 crop할지 정합니다.
         enabled: true
+        # crop 기준 높이 축 index입니다. 0=x, 1=y, 2=z입니다.
         height_axis_index: 2
+        # target cloud에서 crop할 상단 fraction입니다.
         target_top_fraction: 0.05
-        # source_top_fraction:
+        # crop 후 최소 point 수입니다.
         min_points_after_crop: 80
+        # crop을 적용할 최소 높이 extent입니다.
         min_height_extent_m: 0.01
     downsample:
+      # fitted output cloud downsample voxel size입니다.
       voxel_size_m: 0.004
+      # fitted output cloud 최대 point 수입니다.
       max_points: 6000
+
   activation:
+    # hand와 object 거리로 접근 상태를 판단하는 threshold입니다.
     hand_approach_distance_threshold_m: 0.15
+    # object lift/activation 안정화에 필요한 frame 수입니다.
     stable_frames_required: 5
-    # lift_detection:
-    #   enabled: true
-    #   threshold_m: 0.05
-    #   axis_name: z
-    #   require_hand_approach_first: true
 
 grasp:
+  # fixed_orientation_base 해석 형식입니다.
   fixed_orientation_format: rpy
-  fixed_orientation_base: [1.591, -0.017, 1.561]   # EEF RPY (rad) — locked throughout task
-  candidate_search_radius_from_centroid_m: 0.11 ### 0.07
-  min_hand_height_clearance_m: 0.05 ### 0.05
+  # grasp target state와 RtdeController home orientation에 쓰는 고정 EEF orientation 값입니다.
+  fixed_orientation_base: [1.591, -0.017, 1.561]
+  # object centroid 주변 grasp 후보 search radius입니다.
+  candidate_search_radius_from_centroid_m: 0.11
+  # 손 높이와 grasp 후보 사이 최소 clearance입니다.
+  min_hand_height_clearance_m: 0.05
+  # 후보가 없을 때 이전 target을 hold할지 invalid로 둘지 정합니다.
   no_candidate_action: hold
   hand_relative_fallback:
+    # object 측정 dropout 때 hand-relative fallback을 사용할지 정합니다.
     enabled: true
-    lock_frames: 8
+    # hand/object 상대 위치를 lock하기 전 필요한 frame 수입니다.
+    lock_frames: 4
+    # 측정이 끊겨도 fallback을 유지할 최대 시간입니다.
     max_dropout_sec: 3.0
+    # fallback lock에 hand approach 상태를 요구할지 정합니다.
     require_hand_approach: true
+    # fallback lock에 motion trigger 상태를 요구할지 정합니다.
     require_motion_triggered: true
+    # hand-relative fallback lock/active 여부를 콘솔에 출력합니다.
+    debug_log: true
+    # lock_frames가 채워지는 과정을 frame마다 출력합니다.
+    log_lock_progress: true
+    # fallback active 로그를 몇 frame마다 출력할지 정합니다. 1이면 매 fallback frame 출력입니다.
+    log_fallback_every_frames: 1
   target_selection:
+    # temporal target selection/hold를 사용할지 정합니다.
     enabled: true
+    # 새 후보로 전환하기 위한 score margin입니다.
     switch_margin: 0.01
+    # 기존 후보를 유지할 최대 frame 수입니다.
     hold_frames: 6
+    # 후보 dropout 시 이전 grasp target을 유지할 frame 수입니다.
     dropout_hold_frames: 8
+    # 이전 후보와의 거리 penalty 가중치입니다.
     score_previous_distance_weight: 0.10
 
-# Home pose: the robot moves here at start-up and after each task cycle.
-# Position in metres (robot base frame, project coordinates).
-# Orientation reuses grasp.fixed_orientation_base (same RPY).
 home_pose:
+  # RtdeController.move_home을 사용할 때 home pose 기능을 켤지 정합니다.
   enabled: true
-  position_m: [0.3965, -0.015, 0.237]   # x, y, z
-  move_speed_mps: 0.05                 # slow, safe home motion
+  # RtdeController.move_home용 home position입니다.
+  position_m: [0.3965, -0.015, 0.237]
+  # RtdeController.move_home용 이동 속도입니다.
+  move_speed_mps: 0.05
+  # RtdeController.move_home용 acceleration입니다.
   move_acceleration: 0.10
 
-placement:
-  use_initial_object_centroid: true
-  release_height_offset_m: 0.0
-  position_tolerance_m: 0.01
-
-task_manager:
-  approach_grasp_timeout_sec: 10.0
-  receive_close_dwell_sec: 0.40
-  verify_grasp_timeout_sec: 3.0     # force 센서 안정화 여유 시간 확보
-  move_to_place_timeout_sec: 10.0
-  release_dwell_sec: 0.60
-  retreat_distance_m: 0.08
-  retreat_timeout_sec: 5.0
-  missing_grasp_target_timeout_sec: 2.00
-  verify_grasp_force_only_fallback: true  # force 검증 실패 시 dwell 후 진행
-  fail_safe_auto_recover_sec: 5.0   # FAIL_SAFE 진입 후 5s 경과 시 IDLE 자동복구
-
 robot:
-  control_mode: live_follow_servo
+  return_sequence:
+    # gripper release 후 x backoff 전에 robot base +Z 방향으로 올릴 거리입니다.
+    post_release_z_offset_m: -0.03
+
   live_follow:
-    enabled: true
+    # robot_control_loop servo 주기입니다. 실행 인자 --control-hz가 있으면 override됩니다.
     control_hz: 30.0
-    min_valid_count: 3
-    target_timeout_sec: 0.5
+    # z축까지 follow할지 정합니다. 실행 인자 --follow-z/--no-follow-z가 있으면 override됩니다.
     follow_z: true
-    approach_axis: x
-    approach_offset_m: -0.08
-    max_xy_speed_mps: 0.08
-    max_z_speed_mps: 0.08
-    max_xy_step_m: 0.0027
-    max_z_step_m: 0.0027
-    workspace_clamp_enabled: true
-    hold_last_target_until_timeout: true
 
   rtde:
+    # UR robot IP입니다. 실행 인자 --robot-ip가 있으면 override됩니다.
     robot_ip: 192.168.56.101
+    # UR dashboard port입니다.
     dashboard_port: 29999
+    # RTDE controller 내부 control 주기입니다.
     control_hz: 125
+    # command watchdog timeout입니다.
     watchdog_timeout_sec: 0.50
+    # RTDE 연결 실패 또는 라이브러리 없음 때 mock mode로 fallback할지 정합니다.
     use_mock_fallback: true
+    # 실제 robot 연결 대신 mock mode를 강제할지 정합니다.
     force_mock: false
+    # moveL을 async로 실행할지 정합니다.
     move_asynchronous: true
+    # moveL acceleration입니다.
     move_acceleration: 0.30
+    # servoL velocity parameter입니다.
     servo_velocity: 0.05
+    # servoL acceleration parameter입니다.
     servo_acceleration: 0.20
+    # servoL lookahead_time입니다.
     servo_lookahead_time: 0.10
+    # servoL gain입니다.
     servo_gain: 300
+    # stopL/stop motion acceleration입니다.
     stop_acceleration: 1.0
-  # 로봇 동작 속도 조절
   motion:
+    # RtdeController blocking move 기본 속도입니다.
     approach_speed_mps: 0.35
+    # RtdeController retreat 이동 속도입니다.
     retreat_speed_mps: 0.18
-    max_translation_step_m: 0.05
   gripper:
-    control_mode: socket             # Use UR Robotiq daemon on port 63352 by default
+    # Robotiq gripper 제어 방식입니다. socket이면 UR Robotiq daemon을 사용합니다.
+    control_mode: socket
+    # gripper open 명령 문자열입니다.
     open_command: open
+    # gripper close 명령 문자열입니다.
     close_command: close
+    # Robotiq socket daemon port입니다.
     socket_port: 63352
+    # gripper socket timeout입니다.
     socket_timeout_sec: 2.0
+    # gripper socket command 후 안정화 대기입니다.
     socket_settle_time: 0.15
+    # gripper socket 연결 시 activate 명령을 보낼지 정합니다.
     activate_on_connect: true
+    # gripper open speed입니다.
     open_speed: 255
+    # gripper open force입니다.
     open_force: 255
+    # gripper close speed입니다.
     close_speed: 255
+    # gripper close force입니다.
     close_force: 255
+    # close 중 gripper position이 이 값 이상이면 완료로 봅니다.
     position_complete_threshold: 40
+    # gripper/RTDE debug log 출력 여부입니다.
     debug: true
-    output_domain: tool              # Fallback only when control_mode is not socket
+    # socket mode가 아닐 때 digital output domain입니다.
+    output_domain: tool
+    # socket mode가 아닐 때 open에 사용할 digital output index입니다.
     open_digital_output: 1
+    # socket mode가 아닐 때 close에 사용할 digital output index입니다.
     close_digital_output: 0
+    # digital output 활성 상태를 high로 둘지 정합니다.
     output_high_when_active: true
   grasp_verification:
-    method: rtde_force_current
+    # grasp 검증에 TCP force를 사용할지 정합니다.
     use_tcp_force: true
+    # grasp 검증에 joint current를 사용할지 정합니다.
     use_joint_current: true
+    # grasp/contact로 볼 TCP force norm 최소값입니다.
     min_tcp_force_norm_n: 8.0
+    # grasp로 볼 평균 joint current 최소값입니다.
     min_mean_joint_current_a: 0.15
-    verification_window_sec: 0.20
+    # force와 current 조건을 둘 다 만족해야 하는지 정합니다.
     require_both_signals: false
   frame_mapping:
+    # project 좌표와 UR base 좌표 사이 sign mapping 적용 여부입니다.
     enabled: true
+    # position mapping에 곱할 x/y/z sign입니다.
     position_signs: [-1.0, -1.0, 1.0]
 
 safety:
-  max_robot_speed_mps: 0.25
-  stale_perception_timeout_sec: 1.00   # 0.30 → 1.0 (camera ts와 wall clock 오프셋 허용)
-  min_merged_object_confidence: 0.50
-  fail_safe_action: hold              # stop → hold (회복 가능성 유지)
   workspace_bounds_m:
+    # robot base X clamp 범위입니다. 실행 인자 --workspace-x가 있으면 override됩니다.
     x: [-0.60, 0.80]
+    # robot base Y clamp 범위입니다. 실행 인자 --workspace-y가 있으면 override됩니다.
     y: [-0.30, 0.80]
+    # robot base Z clamp 범위입니다. 실행 인자 --workspace-z가 있으면 override됩니다.
     z: [0.00, 0.80]
-  stop_on_stale_perception: false     # runner에서 wall clock timestamp로 통일 후 활성화 가능
-  stop_on_invalid_calibration: true
-  stop_on_missing_grasp_target: true
-
-benchmark:
-  s8:
-    team_name: TEAM_NAME
-    run_id: 1
-    horizontal_reach_mm: 800.0
-    vertical_reach_mm: 600.0
-    repetitions: 3
-    max_motion_time_ms: 5000
-    target_hold_sec: 1.5
-    output_dir: output/benchmark
-    submission_csv_name: s8_submission_{team_name}.csv
-    metadata_json_path: output/benchmark/metadata_{team_name}.json
-    metadata_template_path: benchmarks/metadata_template.json
-    init_position_tolerance_mm: 15.0
-    init_orientation_tolerance_deg: 10.0
-    orientation:
-      mode: look_at_center
-      tool_forward_axis: x+
-      tool_up_axis: z+
-      world_up_axis_hint: z+
-      roll_offset_deg: 0.0
