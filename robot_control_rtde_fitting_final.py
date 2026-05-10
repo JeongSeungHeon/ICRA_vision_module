@@ -93,8 +93,6 @@ PLACE_Z_MIN_VALID_SAMPLES = 3
 GRIPPER_FORCE_STOP_DELTA_N = 100000
 GRIPPER_FORCE_STOP_MIN_ELAPSED_S = 0.12
 DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD = 200
-WINE_GLASS_GRIPPER_POSITION_COMPLETE_THRESHOLD = 120
-CUP_GRIPPER_POSITION_COMPLETE_THRESHOLD = 75
 BASE_POSE = {
     "x": 208.0,
     "y": 102.0,
@@ -1397,27 +1395,43 @@ def move_robot_to_home_pose(controller, args):
     print("[INFO] HOME pose reached")
 
 
+def normalize_object_label(label):
+    """Normalize segmentation labels for config lookup."""
+    return "" if label is None else str(label).strip().lower()
+
+
+def resolve_gripper_position_threshold(gripper_cfg, label):
+    """Resolve gripper close completion threshold from config by object label."""
+    gripper_cfg = dict(gripper_cfg or {})
+    default_threshold = int(
+        gripper_cfg.get("position_complete_threshold", DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD)
+    )
+    threshold_by_label = gripper_cfg.get("position_complete_threshold_by_label", {})
+    if not isinstance(threshold_by_label, dict):
+        return default_threshold
+
+    normalized_label = normalize_object_label(label)
+    for configured_label, configured_threshold in threshold_by_label.items():
+        if normalize_object_label(configured_label) == normalized_label:
+            return int(configured_threshold)
+    return default_threshold
+
+
 def configure_gripper_position_threshold_for_label(controller, label):
     """Select a gripper completion threshold based on the initial object label."""
     if controller is None:
         return None
 
-    if not hasattr(controller, "_default_gripper_position_complete_threshold"):
-        controller._default_gripper_position_complete_threshold = int(
-            controller.config.get("robot", {})
-            .get("gripper", {})
-            .get("position_complete_threshold", DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD)
-        )
-
-    normalized_label = "" if label is None else str(label).strip().lower()
-    if normalized_label == "wine glass":
-        position_threshold = WINE_GLASS_GRIPPER_POSITION_COMPLETE_THRESHOLD
-    elif normalized_label == "cup":
-        position_threshold = CUP_GRIPPER_POSITION_COMPLETE_THRESHOLD
-    else:
-        position_threshold = int(controller._default_gripper_position_complete_threshold)
+    controller_config = getattr(controller, "config", {}) or {}
+    gripper_cfg = (
+        controller_config
+        .get("robot", {})
+        .get("gripper", {})
+    )
+    position_threshold = resolve_gripper_position_threshold(gripper_cfg, label)
 
     controller.gripper_position_complete_threshold = int(position_threshold)
+    normalized_label = normalize_object_label(label)
     print(
         "[INFO] Gripper position threshold configured: "
         f"label={normalized_label or 'unknown'}, threshold={int(position_threshold)}"
