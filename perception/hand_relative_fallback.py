@@ -134,12 +134,13 @@ class HandRelativeFallbackTracker:
                 )
             )
         )
+        motion_trigger_ok = bool(not self.require_motion_triggered or motion_triggered)
 
         if measured_available:
             self._last_measured_timestamp = current_time
             self._last_measured_frame_id = frame_id
             self._last_measured_record_elapsed_s = record_elapsed_s
-            if not self._anchor_locked and hand_approach_ok:
+            if not self._anchor_locked and hand_approach_ok and motion_trigger_ok:
                 self._lock_streak += 1
                 if self._lock_streak >= self.lock_frames:
                     self._anchor_locked = True
@@ -165,17 +166,23 @@ class HandRelativeFallbackTracker:
                         f"clock={self._format_record_clock(record_elapsed_s)} "
                         f"lock={self._lock_streak}/{self.lock_frames} "
                         f"hand_approach={hand_approach_ok} "
+                        f"motion_triggered={motion_trigger_ok} "
                         f"hand={self._format_vec(hand_center)} "
                         f"grasp={self._format_vec(measured_grasp)}"
                     )
             elif not self._anchor_locked:
                 self._lock_streak = 0
+            reason = "measured_available"
+            if not hand_approach_ok:
+                reason = "hand_approach_required"
+            elif not motion_trigger_ok:
+                reason = "motion_trigger_required"
             self.last_debug = HandRelativeFallbackDebug(
                 anchor_locked=self._anchor_locked,
                 lock_streak=self._lock_streak,
                 used_filtered_hand_center=used_filtered_hand_center,
                 dropout_age_s=0.0,
-                reason="measured_available" if hand_approach_ok else "hand_approach_required",
+                reason=reason,
                 frame_id=frame_id,
                 anchor_frame_id=self._anchor_frame_id,
                 last_measured_frame_id=self._last_measured_frame_id,

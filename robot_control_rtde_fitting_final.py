@@ -1505,6 +1505,12 @@ def reset_system_to_start_state(
         if object_merger is not None and hasattr(object_merger, "reset_initial_centroid"):
             object_merger.reset_initial_centroid()
 
+        for object_worker_key in ("object_worker_cam0", "object_worker_cam1"):
+            object_worker = pipeline.get(object_worker_key)
+            if object_worker is not None and hasattr(object_worker, "reset"):
+                object_worker.reset()
+        print("[INFO] Object workers reset. Temporal class locks will be reacquired.")
+
         for hand_worker_key in ("hand_worker_cam0", "hand_worker_cam1"):
             hand_worker = pipeline.get(hand_worker_key)
             if hand_worker is not None and hasattr(hand_worker, "reset"):

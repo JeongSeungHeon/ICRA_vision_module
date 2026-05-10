@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ from system.shared_state import ObjectState
 from utils.realsense_stream import FrameBundle
 
 DEFAULT_CONFIG_PATH = Path("configs/handover.yaml")
+DEFAULT_CLASS_LOCK_FRAMES = 15
 
 
 @dataclass
@@ -35,6 +37,34 @@ class ObjectWorkerDebug:
     points_camera: np.ndarray
     points_base: np.ndarray
     colors_rgb: np.ndarray
+    locked_label: str | None = None
+    label_history: tuple[str, ...] = ()
+
+
+class TemporalClassLocker:
+    """Lock a segmented class once the same label is stable for several frames."""
+
+    def __init__(self, stable_frames: int = DEFAULT_CLASS_LOCK_FRAMES) -> None:
+        self.stable_frames = max(int(stable_frames), 1)
+        self.history: deque[str] = deque(maxlen=self.stable_frames)
+        self.locked_label: str | None = None
+
+    def update(self, label: str | None, segmented: bool) -> str | None:
+        if self.locked_label is not None:
+            return self.locked_label
+
+        if segmented and label:
+            normalized_label = str(label)
+            self.history.append(normalized_label)
+            if len(self.history) == self.stable_frames and len(set(self.history)) == 1:
+                self.locked_label = normalized_label
+                return self.locked_label
+
+        return label
+
+    def reset(self) -> None:
+        self.history.clear()
+        self.locked_label = None
 
 
 class ObjectWorker:
@@ -69,6 +99,7 @@ class ObjectWorker:
         self.outlier_radius_m = float(point_cfg.get("outlier_radius_m", 0.01))
         self.outlier_min_neighbors = int(point_cfg.get("outlier_min_neighbors", 8))
         self.min_points_per_camera = int(point_cfg.get("min_points_per_camera", 300))
+        self.class_locker = TemporalClassLocker(DEFAULT_CLASS_LOCK_FRAMES)
         self.last_debug: ObjectWorkerDebug | None = None
 
     @classmethod
@@ -126,6 +157,7 @@ class ObjectWorker:
             and len(points_base) >= self.min_points_per_camera
             and confidence >= self.confidence_threshold
         )
+        label = self.class_locker.update(label, segmented=bool(object_detected))
         centroid_base = None
         if object_detected and summary["point_count"] > 0:
             centroid_base = tuple(float(value) for value in summary["centroid_xyz"])
@@ -152,6 +184,8 @@ class ObjectWorker:
             points_camera=np.asarray(points_camera, dtype=np.float32),
             points_base=np.asarray(points_base, dtype=np.float32),
             colors_rgb=np.asarray(colors_rgb, dtype=np.uint8),
+            locked_label=self.class_locker.locked_label,
+            label_history=tuple(self.class_locker.history),
         )
         return state
 
@@ -159,6 +193,10 @@ class ObjectWorker:
         frame_bundle = sensor_hub.get_latest_cam0() if self.camera_id == 0 else sensor_hub.get_latest_cam1()
         sensor_state = sensor_hub.get_latest_sensor_state(self.camera_id)
         return self.process_frame(frame_bundle, frame_id=sensor_state.frame_id)
+
+    def reset(self) -> None:
+        self.class_locker.reset()
+        self.last_debug = None
 
     def _postprocess_points(self, points_base: np.ndarray, colors_rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         processed_points = np.asarray(points_base, dtype=np.float32).reshape((-1, 3))
@@ -217,6 +255,7 @@ class ObjectWorkerCam1(ObjectWorker):
 __all__ = [
     "DEFAULT_CONFIG_PATH",
     "ObjectWorkerDebug",
+    "TemporalClassLocker",
     "ObjectWorker",
     "ObjectWorkerCam0",
     "ObjectWorkerCam1",
