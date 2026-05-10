@@ -139,7 +139,7 @@ perception:
       # YOLOE segmentation weights/model 이름입니다. 실행 인자 --model이 있으면 override됩니다.
       model_name: yoloe-26l-seg.pt
       # YOLOE text prompt class 목록입니다. 실행 인자 --prompt가 있으면 override됩니다.
-      prompt_classes: ["cup", "wine glass"]
+      prompt_classes: ["cup", "wine glass", "box-shaped snack"]
       # segmentation inference image size입니다. 실행 인자 --imgsz가 있으면 override됩니다.
       imgsz: 640
       # YOLOE inference confidence threshold입니다. 실행 인자 --conf가 있으면 override됩니다.
@@ -157,7 +157,7 @@ perception:
       # Ultralytics retina mask 옵션입니다.
       retina_masks: true
       # 특정 class를 우선 선택해야 할 때 사용할 class 이름 목록입니다.
-      selection_class_names: ["wine glass"]
+      selection_class_names: ["wine glass", "box-shaped snack"]
       preprocess:
         # segmentation 입력 영상 전처리 사용 여부입니다.
         enabled: false
