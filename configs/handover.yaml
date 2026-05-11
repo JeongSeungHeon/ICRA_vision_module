@@ -298,6 +298,15 @@ perception:
         asset_path: shape_fitting/poteau.npy
         # template point 단위를 meter로 바꾸는 scale입니다.
         unit_scale_m: 0.001
+        z_rotation:
+          # box-shaped snack에만 Z축 yaw 후보 탐색을 적용합니다.
+          enabled: true
+          # yaw 후보 최소 각도입니다.
+          min_deg: -90.0
+          # yaw 후보 최대 각도입니다.
+          max_deg: 90.0
+          # yaw 후보 간격입니다.
+          step_deg: 5.0
     cluster:
       # DBSCAN cluster 반경입니다.
       dbscan_eps_m: 0.02

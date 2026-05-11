@@ -2171,6 +2171,7 @@ def collect_runtime_profile_metrics(
         "shape_fit_icp_time_ms": getattr(shape_fit_debug, "icp_time_ms", None),
         "shape_fit_icp_fitness": getattr(shape_fit_debug, "icp_fitness", None),
         "shape_fit_icp_rmse": getattr(shape_fit_debug, "icp_rmse", None),
+        "shape_fit_z_rotation_deg": getattr(shape_fit_debug, "z_rotation_deg", None),
         "selected_hand_valid": bool(getattr(selected_hand, "valid", False)),
         "selected_hand_camera": getattr(selected_hand, "selected_camera", None),
         "fusion_object_fresh": bool(getattr(fusion_state, "object_fresh", False)),

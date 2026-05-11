@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -146,6 +147,20 @@ def _apply_similarity_pose(
     scaled = centered * float(uniform_scale)
     rotated = scaled @ np.asarray(rotation, dtype=np.float64).reshape((3, 3)).T
     return rotated + np.asarray(target_center, dtype=np.float64).reshape((1, 3))
+
+
+def _z_axis_rotation_matrix(angle_deg: float) -> np.ndarray:
+    angle_rad = math.radians(float(angle_deg))
+    cos_angle = math.cos(angle_rad)
+    sin_angle = math.sin(angle_rad)
+    return np.asarray(
+        [
+            [cos_angle, -sin_angle, 0.0],
+            [sin_angle, cos_angle, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
 
 
 def _transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
@@ -336,6 +351,10 @@ class ShapeTemplateModel:
     canonical_points: np.ndarray
     source_extent_xyz: np.ndarray
     bowl_height_fraction: float | None
+    z_rotation_enabled: bool
+    z_rotation_min_deg: float
+    z_rotation_max_deg: float
+    z_rotation_step_deg: float
 
 
 @dataclass
@@ -371,6 +390,7 @@ class ShapeFittingDebug:
     icp_source_points: int
     icp_target_points: int
     icp_iterations_used: int
+    z_rotation_deg: float | None
 
 
 class ShapeFittingTracker:
@@ -434,6 +454,7 @@ class ShapeFittingTracker:
         self._extent_buffer: list[np.ndarray] = []
         self._frozen_scale: float | None = None
         self._frozen_rotation = np.eye(3, dtype=np.float64)
+        self._frozen_z_rotation_deg: float | None = None
         self._current_template_points = np.empty((0, 3), dtype=np.float32)
         self._initialized = False
 
@@ -467,6 +488,7 @@ class ShapeFittingTracker:
             icp_source_points=0,
             icp_target_points=0,
             icp_iterations_used=0,
+            z_rotation_deg=None,
         )
 
     @classmethod
@@ -480,6 +502,8 @@ class ShapeFittingTracker:
         self._tracked_cluster_centroid = None
         self._extent_buffer = []
         self._frozen_scale = None
+        self._frozen_rotation = np.eye(3, dtype=np.float64)
+        self._frozen_z_rotation_deg = None
         self._current_template_points = np.empty((0, 3), dtype=np.float32)
         self._initialized = False
 
@@ -665,42 +689,104 @@ class ShapeFittingTracker:
             uniform_scale = _estimate_uniform_scale(template_extent, median_target_extent, self.min_scale, self.max_scale)
 
         initial_center = np.mean(target_points, axis=0)
-        initialized_points = _apply_similarity_pose(
-            template.canonical_points,
-            uniform_scale=uniform_scale,
-            rotation=self._frozen_rotation,
-            target_center=initial_center,
-        )
+        candidate_degrees = self._z_rotation_candidate_degrees(template)
+        best_score: tuple[float, float, float] | None = None
+        best_rotation = np.eye(3, dtype=np.float64)
+        best_z_rotation_deg = 0.0
+        best_initialized_points = np.empty((0, 3), dtype=np.float64)
+        best_icp_time_ms = 0.0
+        best_icp_fitness = 0.0
+        best_icp_rmse = float("inf")
+        best_icp_translation_m = 0.0
+        best_icp_source_points = 0
+        best_icp_target_points = 0
+        best_icp_iterations_used = 0
 
-        icp_start = time.perf_counter()
-        icp_transform, icp_fitness, icp_rmse, icp_translation_m, icp_source_points, icp_target_points, icp_iterations_used = self._run_translation_only_icp(
-            initialized_points,
-            target_points,
-            height_axis_index=self.icp_crop_height_axis_index,
-        )
-        icp_time_ms = (time.perf_counter() - icp_start) * 1000.0
-        initialized_points = _transform_points(initialized_points, icp_transform)
+        for z_rotation_deg in candidate_degrees:
+            candidate_rotation = _z_axis_rotation_matrix(z_rotation_deg)
+            candidate_points = _apply_similarity_pose(
+                template.canonical_points,
+                uniform_scale=uniform_scale,
+                rotation=candidate_rotation,
+                target_center=initial_center,
+            )
+
+            icp_start = time.perf_counter()
+            (
+                icp_transform,
+                icp_fitness,
+                icp_rmse,
+                icp_translation_m,
+                icp_source_points,
+                icp_target_points,
+                icp_iterations_used,
+            ) = self._run_translation_only_icp(
+                candidate_points,
+                target_points,
+                height_axis_index=self.icp_crop_height_axis_index,
+            )
+            icp_time_ms = (time.perf_counter() - icp_start) * 1000.0
+            initialized_points = _transform_points(candidate_points, icp_transform)
+            finite_rmse = icp_rmse if np.isfinite(icp_rmse) else float("inf")
+            score = (float(icp_fitness), -float(finite_rmse), -float(icp_translation_m))
+            if best_score is None or score > best_score:
+                best_score = score
+                best_rotation = candidate_rotation
+                best_z_rotation_deg = float(z_rotation_deg)
+                best_initialized_points = initialized_points
+                best_icp_time_ms = icp_time_ms
+                best_icp_fitness = icp_fitness
+                best_icp_rmse = icp_rmse
+                best_icp_translation_m = icp_translation_m
+                best_icp_source_points = icp_source_points
+                best_icp_target_points = icp_target_points
+                best_icp_iterations_used = icp_iterations_used
 
         self._frozen_scale = uniform_scale
-        self._current_template_points = initialized_points.astype(np.float32)
+        self._frozen_rotation = best_rotation
+        self._frozen_z_rotation_deg = best_z_rotation_deg if template.z_rotation_enabled else None
+        self._current_template_points = best_initialized_points.astype(np.float32)
         self._initialized = True
         self._set_debug(
             label=template.label,
             template_id=template.template_id,
             raw_point_count=0,
             cluster_point_count=len(target_points),
-            output_point_count=len(initialized_points),
+            output_point_count=len(best_initialized_points),
             reason="ok",
             tracking_mode="init",
-            icp_time_ms=icp_time_ms,
-            icp_fitness=icp_fitness,
-            icp_rmse=icp_rmse,
-            icp_translation_m=icp_translation_m,
-            icp_source_points=icp_source_points,
-            icp_target_points=icp_target_points,
-            icp_iterations_used=icp_iterations_used,
+            icp_time_ms=best_icp_time_ms,
+            icp_fitness=best_icp_fitness,
+            icp_rmse=best_icp_rmse,
+            icp_translation_m=best_icp_translation_m,
+            icp_source_points=best_icp_source_points,
+            icp_target_points=best_icp_target_points,
+            icp_iterations_used=best_icp_iterations_used,
+            z_rotation_deg=self._frozen_z_rotation_deg,
         )
-        return initialized_points.astype(np.float32)
+        return best_initialized_points.astype(np.float32)
+
+    def _z_rotation_candidate_degrees(self, template: ShapeTemplateModel) -> list[float]:
+        if not template.z_rotation_enabled:
+            return [0.0]
+
+        min_deg = float(template.z_rotation_min_deg)
+        max_deg = float(template.z_rotation_max_deg)
+        if not np.isfinite(min_deg) or not np.isfinite(max_deg):
+            return [0.0]
+        if min_deg > max_deg:
+            min_deg, max_deg = max_deg, min_deg
+
+        step_deg = abs(float(template.z_rotation_step_deg))
+        if not np.isfinite(step_deg) or step_deg <= 0.0:
+            step_deg = 5.0
+
+        candidates = list(np.arange(min_deg, max_deg + (0.5 * step_deg), step_deg, dtype=np.float64))
+        candidates = [float(np.clip(candidate, min_deg, max_deg)) for candidate in candidates]
+        candidates.append(max_deg)
+        if min_deg <= 0.0 <= max_deg and not any(abs(candidate) <= 1e-9 for candidate in candidates):
+            candidates.append(0.0)
+        return sorted(set(round(candidate, 9) for candidate in candidates))
 
     def _run_translation_only_icp(
         self,
@@ -859,6 +945,13 @@ class ShapeFittingTracker:
             bowl_height_fraction = None
             if normalized_label == "wine glass":
                 bowl_height_fraction = _estimate_template_bowl_height_fraction(canonical_points)
+            z_rotation_cfg = entry.get("z_rotation", {}) or {}
+            if isinstance(z_rotation_cfg, bool):
+                z_rotation_cfg = {"enabled": z_rotation_cfg}
+            z_rotation_enabled = bool(z_rotation_cfg.get("enabled", False))
+            z_rotation_min_deg = float(z_rotation_cfg.get("min_deg", 0.0))
+            z_rotation_max_deg = float(z_rotation_cfg.get("max_deg", 0.0))
+            z_rotation_step_deg = float(z_rotation_cfg.get("step_deg", 5.0))
             templates[str(label)] = ShapeTemplateModel(
                 label=str(label),
                 template_id=str(entry.get("template_id", label)),
@@ -867,6 +960,10 @@ class ShapeFittingTracker:
                 canonical_points=canonical_points,
                 source_extent_xyz=_compute_robust_extent(canonical_points, 0.0, 100.0),
                 bowl_height_fraction=bowl_height_fraction,
+                z_rotation_enabled=z_rotation_enabled,
+                z_rotation_min_deg=z_rotation_min_deg,
+                z_rotation_max_deg=z_rotation_max_deg,
+                z_rotation_step_deg=z_rotation_step_deg,
             )
         return templates
 
@@ -887,10 +984,13 @@ class ShapeFittingTracker:
         icp_source_points: int = 0,
         icp_target_points: int = 0,
         icp_iterations_used: int = 0,
+        z_rotation_deg: float | None = None,
     ) -> None:
         icp_fps = None
         if icp_time_ms is not None and np.isfinite(icp_time_ms) and icp_time_ms > 0.0:
             icp_fps = 1000.0 / float(icp_time_ms)
+        if z_rotation_deg is None and self._active_template is not None and self._active_template.z_rotation_enabled:
+            z_rotation_deg = self._frozen_z_rotation_deg
         self.last_debug = ShapeFittingDebug(
             label=label,
             template_id=template_id,
@@ -910,6 +1010,7 @@ class ShapeFittingTracker:
             icp_source_points=int(icp_source_points),
             icp_target_points=int(icp_target_points),
             icp_iterations_used=int(icp_iterations_used),
+            z_rotation_deg=None if z_rotation_deg is None else float(z_rotation_deg),
         )
 
     def _make_state(
