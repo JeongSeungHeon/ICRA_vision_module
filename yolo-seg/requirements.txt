@@ -1,0 +1,6 @@
+numpy>=1.24
+opencv-python>=4.9
+pyrealsense2==2.55.1.6486
+torch>=2.4
+torchvision>=0.19
+ultralytics>=8.4.23

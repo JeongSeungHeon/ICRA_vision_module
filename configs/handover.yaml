@@ -295,7 +295,7 @@ perception:
         # box-shaped snack template 식별자입니다.
         template_id: box_snack_shape_fit
         # box-shaped snack canonical point cloud 파일입니다.
-        asset_path: shape_fitting/box_snack.npy
+        asset_path: shape_fitting/poteau.npy
         # template point 단위를 meter로 바꾸는 scale입니다.
         unit_scale_m: 0.001
     cluster:

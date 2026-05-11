@@ -62,6 +62,8 @@ class HandRelativeFallbackTracker:
         self._anchor_record_elapsed_s: float | None = None
         self._last_measured_record_elapsed_s: float | None = None
         self._fallback_log_counter = 0
+        self._anchor_wait_log_counter = 0
+        self._last_anchor_wait_reason: str | None = None
         self.last_debug = HandRelativeFallbackDebug(
             anchor_locked=False,
             lock_streak=0,
@@ -88,6 +90,8 @@ class HandRelativeFallbackTracker:
         self._anchor_record_elapsed_s = None
         self._last_measured_record_elapsed_s = None
         self._fallback_log_counter = 0
+        self._anchor_wait_log_counter = 0
+        self._last_anchor_wait_reason = None
         self.last_debug = HandRelativeFallbackDebug(
             anchor_locked=False,
             lock_streak=0,
@@ -150,8 +154,10 @@ class HandRelativeFallbackTracker:
                     self._anchor_frame_id = frame_id
                     self._anchor_record_elapsed_s = record_elapsed_s
                     self._fallback_log_counter = 0
+                    self._anchor_wait_log_counter = 0
+                    self._last_anchor_wait_reason = None
                     self._log(
-                        "LOCKED "
+                        "ANCHOR_LOCKED "
                         f"clock={self._format_record_clock(record_elapsed_s)} "
                         f"lock={self._lock_streak}/{self.lock_frames} "
                         f"hand={self._format_vec(hand_center)} "
@@ -161,14 +167,15 @@ class HandRelativeFallbackTracker:
                         f"grasp_offset={self._format_vec(self._grasp_offset_base)}"
                     )
                 elif self.log_lock_progress:
-                    self._log(
-                        "LOCK_PROGRESS "
-                        f"clock={self._format_record_clock(record_elapsed_s)} "
-                        f"lock={self._lock_streak}/{self.lock_frames} "
-                        f"hand_approach={hand_approach_ok} "
-                        f"motion_triggered={motion_trigger_ok} "
-                        f"hand={self._format_vec(hand_center)} "
-                        f"grasp={self._format_vec(measured_grasp)}"
+                    self._log_anchor_wait(
+                        "measured_available",
+                        record_elapsed_s=record_elapsed_s,
+                        hand_center=hand_center,
+                        measured_object=measured_object,
+                        measured_grasp=measured_grasp,
+                        hand_approach_ok=hand_approach_ok,
+                        motion_trigger_ok=motion_trigger_ok,
+                        force=True,
                     )
             elif not self._anchor_locked:
                 self._lock_streak = 0
@@ -177,6 +184,16 @@ class HandRelativeFallbackTracker:
                 reason = "hand_approach_required"
             elif not motion_trigger_ok:
                 reason = "motion_trigger_required"
+            if not self._anchor_locked and reason != "measured_available":
+                self._log_anchor_wait(
+                    reason,
+                    record_elapsed_s=record_elapsed_s,
+                    hand_center=hand_center,
+                    measured_object=measured_object,
+                    measured_grasp=measured_grasp,
+                    hand_approach_ok=hand_approach_ok,
+                    motion_trigger_ok=motion_trigger_ok,
+                )
             self.last_debug = HandRelativeFallbackDebug(
                 anchor_locked=self._anchor_locked,
                 lock_streak=self._lock_streak,
@@ -200,16 +217,41 @@ class HandRelativeFallbackTracker:
                 grasp_position_base=None,
                 anchor_hand_position_base=None if self._anchor_hand_position_base is None else self._to_tuple(self._anchor_hand_position_base),
                 dropout_age_s=0.0,
-                reason="measured_available",
+                reason=reason,
                 timestamp=current_time,
                 valid=False,
             )
 
         self._lock_streak = 0
         if hand_center is None:
+            if not self._anchor_locked:
+                self._log_anchor_wait(
+                    "no_hand_center",
+                    record_elapsed_s=record_elapsed_s,
+                    hand_center=hand_center,
+                    measured_object=measured_object,
+                    measured_grasp=measured_grasp,
+                    hand_approach_ok=hand_approach_ok,
+                    motion_trigger_ok=motion_trigger_ok,
+                )
             return self._invalid_state(current_time, reason="no_hand_center", used_filtered_hand_center=used_filtered_hand_center, frame_id=frame_id)
         if not self._anchor_locked or self._object_offset_base is None or self._grasp_offset_base is None:
-            return self._invalid_state(current_time, reason="anchor_not_locked", used_filtered_hand_center=used_filtered_hand_center, frame_id=frame_id)
+            if measured_object is None:
+                reason = "no_measured_object"
+            elif measured_grasp is None:
+                reason = "no_measured_grasp"
+            else:
+                reason = "anchor_not_locked"
+            self._log_anchor_wait(
+                reason,
+                record_elapsed_s=record_elapsed_s,
+                hand_center=hand_center,
+                measured_object=measured_object,
+                measured_grasp=measured_grasp,
+                hand_approach_ok=hand_approach_ok,
+                motion_trigger_ok=motion_trigger_ok,
+            )
+            return self._invalid_state(current_time, reason=reason, used_filtered_hand_center=used_filtered_hand_center, frame_id=frame_id)
         if self.require_motion_triggered and not motion_triggered:
             return self._invalid_state(current_time, reason="motion_not_triggered", used_filtered_hand_center=used_filtered_hand_center, frame_id=frame_id)
         if self._last_measured_timestamp is None:
@@ -341,6 +383,45 @@ class HandRelativeFallbackTracker:
     def _log(self, message: str) -> None:
         if self.debug_log:
             print(f"[HAND_FALLBACK] {message}", flush=True)
+
+    def _log_anchor_wait(
+        self,
+        reason: str,
+        *,
+        record_elapsed_s: float | None,
+        hand_center: np.ndarray | None,
+        measured_object: np.ndarray | None,
+        measured_grasp: np.ndarray | None,
+        hand_approach_ok: bool,
+        motion_trigger_ok: bool,
+        force: bool = False,
+    ) -> None:
+        if not self.debug_log or self._anchor_locked:
+            return
+
+        reason_changed = reason != self._last_anchor_wait_reason
+        if reason_changed:
+            self._last_anchor_wait_reason = reason
+            self._anchor_wait_log_counter = 0
+        self._anchor_wait_log_counter += 1
+
+        should_log = force or reason_changed or (
+            (self._anchor_wait_log_counter - 1) % self.log_fallback_every_frames == 0
+        )
+        if not should_log:
+            return
+
+        self._log(
+            "ANCHOR_WAIT "
+            f"clock={self._format_record_clock(record_elapsed_s)} "
+            f"reason={reason} "
+            f"lock={self._lock_streak}/{self.lock_frames} "
+            f"hand_approach={hand_approach_ok} "
+            f"motion_triggered={motion_trigger_ok} "
+            f"hand={self._format_vec(hand_center)} "
+            f"object={self._format_vec(measured_object)} "
+            f"grasp={self._format_vec(measured_grasp)}"
+        )
 
     @staticmethod
     def _resolve_hand_center(

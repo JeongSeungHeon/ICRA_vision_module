@@ -157,7 +157,16 @@ class ObjectWorker:
             and len(points_base) >= self.min_points_per_camera
             and confidence >= self.confidence_threshold
         )
+        previous_locked_label = self.class_locker.locked_label
         label = self.class_locker.update(label, segmented=bool(object_detected))
+        if previous_locked_label is None and self.class_locker.locked_label is not None:
+            print(
+                "[CLASS_LOCK] "
+                f"cam{self.camera_id} frame={int(frame_id)} "
+                f"locked_label={self.class_locker.locked_label} "
+                f"stable_frames={self.class_locker.stable_frames}",
+                flush=True,
+            )
         centroid_base = None
         if object_detected and summary["point_count"] > 0:
             centroid_base = tuple(float(value) for value in summary["centroid_xyz"])

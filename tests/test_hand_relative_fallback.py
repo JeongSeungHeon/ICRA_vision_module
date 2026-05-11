@@ -26,11 +26,12 @@ class _Dummy:
 
 
 _stub_module("cv2")
-_stub_module("calibration.extrinsics", load_transform_chain=lambda *args, **kwargs: None)
+_stub_module("calibration.extrinsics", TransformChain=_Dummy, load_transform_chain=lambda *args, **kwargs: None)
 _stub_module(
     "object_pt_extraction.segmentation_engine",
     SegmentationEngine=_Dummy,
     parse_prompt_classes=lambda *args, **kwargs: [],
+    select_instances=lambda instances, mode="all_instances", class_names=None: list(instances),
 )
 _stub_module(
     "perception.fdct_depth_completion",
@@ -45,12 +46,11 @@ _stub_module("perception.grasp_target", GraspTargetPlanner=_Dummy)
 _stub_module("perception.hand_selector", HandSelector=_Dummy)
 _stub_module("perception.hand_worker", HandWorkerCam0=_Dummy, HandWorkerCam1=_Dummy)
 _stub_module("perception.object_merger", ObjectMerger=_Dummy)
-_stub_module("perception.object_worker", ObjectWorkerCam0=_Dummy, ObjectWorkerCam1=_Dummy)
 _stub_module("perception.shape_fitting_tracker", ShapeFittingTracker=_Dummy)
 _stub_module("robot.rtde_controller", RtdeController=_Dummy)
 _stub_module("system.dual_sensor_hub", DualSensorHub=_Dummy)
 _stub_module("utils.handover_metadata", HandoverMetadataRecorder=_Dummy)
-_stub_module("utils.realsense_stream", list_realsense_serials=lambda: [])
+_stub_module("utils.realsense_stream", FrameBundle=SimpleNamespace, list_realsense_serials=lambda: [])
 _stub_module("video_record", HandoverVideoRecorderService=_Dummy)
 
 from perception.hand_relative_fallback import HandRelativeFallbackTracker
@@ -58,7 +58,7 @@ from robot_control_rtde_fitting_final import FollowSharedState, robot_control_lo
 from system.shared_state import FusionState, SelectedHandState
 
 
-def make_fallback_config(require_motion_triggered=True) -> dict:
+def make_fallback_config(require_motion_triggered=True, debug_log=False, log_fallback_every_frames=1) -> dict:
     return {
         "grasp": {
             "hand_relative_fallback": {
@@ -67,6 +67,8 @@ def make_fallback_config(require_motion_triggered=True) -> dict:
                 "max_dropout_sec": 1.0,
                 "require_hand_approach": True,
                 "require_motion_triggered": bool(require_motion_triggered),
+                "debug_log": bool(debug_log),
+                "log_fallback_every_frames": int(log_fallback_every_frames),
             }
         }
     }
@@ -198,7 +200,7 @@ class HandRelativeFallbackTests(unittest.TestCase):
             now_timestamp=1.10,
         )
         self.assertFalse(fallback_state.valid)
-        self.assertEqual(fallback_state.reason, "anchor_not_locked")
+        self.assertEqual(fallback_state.reason, "no_measured_object")
 
         for frame_idx in range(5):
             tracker.process(
@@ -221,6 +223,55 @@ class HandRelativeFallbackTests(unittest.TestCase):
         self.assertTrue(fallback_state.valid)
         np.testing.assert_allclose(fallback_state.object_position_base, measured_object, atol=1e-6)
         np.testing.assert_allclose(fallback_state.grasp_position_base, measured_grasp, atol=1e-6)
+
+    def test_reports_missing_measured_grasp_before_anchor_lock(self) -> None:
+        tracker = HandRelativeFallbackTracker(make_fallback_config())
+        hand = make_selected_hand()
+        fusion = make_fusion_state()
+
+        state = tracker.process(
+            measured_object_position_base=(0.40, 0.20, 0.50),
+            measured_grasp_position_base=None,
+            selected_hand=hand,
+            fusion_state=fusion,
+            motion_triggered=True,
+            now_timestamp=1.0,
+        )
+
+        self.assertFalse(state.valid)
+        self.assertEqual(state.reason, "no_measured_grasp")
+        self.assertEqual(tracker.last_debug.reason, "no_measured_grasp")
+
+    def test_debug_log_reports_anchor_wait_reason_and_anchor_lock(self) -> None:
+        tracker = HandRelativeFallbackTracker(make_fallback_config(debug_log=True))
+        hand = make_selected_hand()
+        fusion = make_fusion_state()
+        measured_object = (0.40, 0.20, 0.50)
+        measured_grasp = (0.42, 0.22, 0.53)
+
+        with patch("builtins.print") as mock_print:
+            tracker.process(
+                measured_object_position_base=measured_object,
+                measured_grasp_position_base=measured_grasp,
+                selected_hand=hand,
+                fusion_state=fusion,
+                motion_triggered=False,
+                now_timestamp=1.0,
+            )
+            for frame_idx in range(5):
+                tracker.process(
+                    measured_object_position_base=measured_object,
+                    measured_grasp_position_base=measured_grasp,
+                    selected_hand=hand,
+                    fusion_state=fusion,
+                    motion_triggered=True,
+                    now_timestamp=1.1 + frame_idx * 0.01,
+                )
+
+        printed_lines = [" ".join(str(part) for part in call.args) for call in mock_print.call_args_list]
+        self.assertTrue(any("ANCHOR_WAIT" in line and "reason=motion_trigger_required" in line for line in printed_lines))
+        self.assertTrue(any("ANCHOR_WAIT" in line and "reason=measured_available" in line for line in printed_lines))
+        self.assertTrue(any("ANCHOR_LOCKED" in line for line in printed_lines))
 
     def test_anchor_can_lock_without_motion_trigger_when_not_required(self) -> None:
         tracker = HandRelativeFallbackTracker(make_fallback_config(require_motion_triggered=False))
@@ -275,7 +326,7 @@ class HandRelativeFallbackTests(unittest.TestCase):
             now_timestamp=2.10,
         )
         self.assertFalse(fallback_state.valid)
-        self.assertEqual(fallback_state.reason, "anchor_not_locked")
+        self.assertEqual(fallback_state.reason, "no_measured_object")
 
     def test_fallback_reconstructs_from_hand_offset(self) -> None:
         tracker = HandRelativeFallbackTracker(make_fallback_config())
