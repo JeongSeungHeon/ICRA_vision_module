@@ -284,6 +284,8 @@ perception:
         asset_path: shape_fitting/template.npy
         # template point 단위를 meter로 바꾸는 scale입니다.
         unit_scale_m: 0.001
+        # cup도 template local x/y/z 축별 scale을 따로 적용합니다.
+        scale_mode: axis_xyz
       wine glass:
         # wine glass template 식별자입니다.
         template_id: wine_glass_shape_fit
@@ -291,6 +293,8 @@ perception:
         asset_path: shape_fitting/wine_glass.npy
         # template point 단위를 meter로 바꾸는 scale입니다.
         unit_scale_m: 0.001
+        # wine glass도 template local x/y/z 축별 scale을 따로 적용합니다.
+        scale_mode: axis_xyz
       box-shaped snack:
         # box-shaped snack template 식별자입니다.
         template_id: box_snack_shape_fit
@@ -486,11 +490,26 @@ robot:
     close_force: 255
     # close 중 gripper position이 이 값 이상이면 완료로 봅니다.
     position_complete_threshold: 40
-    # object label별 gripper close 완료 position threshold입니다.
-    position_complete_threshold_by_label:
-      cup: 75
-      wine glass: 40
-      box-shaped snack: 140
+    # grasp 직전 fitted template의 grasp z 단면 폭/지름으로 close 완료 position threshold를 계산합니다.
+    position_threshold_geometry:
+      # true이면 object label이 아니라 template 단면 geometry 기반 threshold를 사용합니다.
+      enabled: true
+      # threshold 계산식의 보정 폭입니다. 단위는 cm입니다.
+      alpha_cm: -0.2
+      # threshold 계산식의 gripper 최대 opening 상수입니다. 단위는 cm입니다.
+      formula_opening_cm: 9.0
+      # grasp z 주변 template point를 고를 단면 두께입니다.
+      slice_band_m: 0.005
+      # band slice를 유효하게 볼 최소 point 수입니다.
+      min_slice_points: 8
+      # band point가 부족할 때 z가 가까운 point를 이 개수만큼 사용합니다.
+      fallback_nearest_points: 64
+      # PCA 긴 변/짧은 변 비율이 이 값 이상이면 직사각 단면으로 보고 짧은 변을 폭으로 씁니다.
+      anisotropic_ratio: 1.25
+      # 계산된 position threshold 하한입니다.
+      clamp_min: 0
+      # 계산된 position threshold 상한입니다.
+      clamp_max: 255
     # gripper/RTDE debug log 출력 여부입니다.
     debug: true
     # socket mode가 아닐 때 digital output domain입니다.

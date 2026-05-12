@@ -1400,30 +1400,192 @@ def move_robot_to_home_pose(controller, args):
     print("[INFO] HOME pose reached")
 
 
-def normalize_object_label(label):
-    """Normalize segmentation labels for config lookup."""
-    return "" if label is None else str(label).strip().lower()
-
-
-def resolve_gripper_position_threshold(gripper_cfg, label):
-    """Resolve gripper close completion threshold from config by object label."""
+def resolve_default_gripper_position_threshold(gripper_cfg):
+    """Resolve the fallback gripper close completion threshold."""
     gripper_cfg = dict(gripper_cfg or {})
-    default_threshold = int(
+    return int(
         gripper_cfg.get("position_complete_threshold", DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD)
     )
-    threshold_by_label = gripper_cfg.get("position_complete_threshold_by_label", {})
-    if not isinstance(threshold_by_label, dict):
-        return default_threshold
-
-    normalized_label = normalize_object_label(label)
-    for configured_label, configured_threshold in threshold_by_label.items():
-        if normalize_object_label(configured_label) == normalized_label:
-            return int(configured_threshold)
-    return default_threshold
 
 
-def configure_gripper_position_threshold_for_label(controller, label):
-    """Select a gripper completion threshold based on the initial object label."""
+def _gripper_geometry_cfg(gripper_cfg):
+    gripper_cfg = dict(gripper_cfg or {})
+    geometry_cfg = gripper_cfg.get("position_threshold_geometry", {})
+    return dict(geometry_cfg) if isinstance(geometry_cfg, dict) else {}
+
+
+def _estimate_xy_max_diameter_m(points_xy, max_points=128):
+    points_xy = np.asarray(points_xy, dtype=np.float64).reshape((-1, 2))
+    if len(points_xy) == 0:
+        return None
+    if len(points_xy) > int(max_points):
+        sample_indices = np.linspace(0, len(points_xy) - 1, int(max_points), dtype=np.int32)
+        points_xy = points_xy[sample_indices]
+    if len(points_xy) == 1:
+        return 0.0
+    deltas = points_xy[:, None, :] - points_xy[None, :, :]
+    distances = np.sqrt(np.sum(deltas * deltas, axis=2))
+    return float(np.max(distances))
+
+
+def _estimate_pca_section_widths_m(points_xy):
+    points_xy = np.asarray(points_xy, dtype=np.float64).reshape((-1, 2))
+    if len(points_xy) < 2:
+        return None
+    centered = points_xy - np.mean(points_xy, axis=0, keepdims=True)
+    covariance = centered.T @ centered / max(len(centered) - 1, 1)
+    if not np.all(np.isfinite(covariance)):
+        return None
+    eigvals, eigvecs = np.linalg.eigh(covariance)
+    order = np.argsort(eigvals)[::-1]
+    basis = eigvecs[:, order]
+    projected = centered @ basis
+    extents = np.ptp(projected, axis=0)
+    if len(extents) < 2 or not np.all(np.isfinite(extents)):
+        return None
+    long_width = float(np.max(extents))
+    short_width = float(np.min(extents))
+    return short_width, long_width
+
+
+def _select_template_slice_points(fitted_points_base, grasp_point_base, geometry_cfg):
+    if fitted_points_base is None:
+        return None, "missing_geometry"
+    points = np.asarray(fitted_points_base, dtype=np.float64).reshape((-1, 3))
+    if len(points) == 0 or grasp_point_base is None:
+        return None, "missing_geometry"
+
+    grasp = np.asarray(grasp_point_base, dtype=np.float64).reshape(-1)
+    if len(grasp) < 3 or not np.isfinite(grasp[:3]).all():
+        return None, "missing_grasp"
+    z_values = points[:, 2]
+    finite_mask = np.isfinite(z_values) & np.isfinite(points[:, 0]) & np.isfinite(points[:, 1])
+    points = points[finite_mask]
+    if len(points) == 0:
+        return None, "missing_geometry"
+
+    grasp_z = float(grasp[2])
+    slice_band_m = max(float(geometry_cfg.get("slice_band_m", 0.005)), 0.0)
+    min_slice_points = max(int(geometry_cfg.get("min_slice_points", 8)), 1)
+    half_band_m = 0.5 * slice_band_m
+    if half_band_m > 0.0:
+        z_delta = np.abs(points[:, 2] - grasp_z)
+        slice_points = points[z_delta <= half_band_m]
+    else:
+        slice_points = np.empty((0, 3), dtype=np.float64)
+
+    if len(slice_points) >= min_slice_points:
+        return slice_points, "band"
+
+    fallback_count = max(int(geometry_cfg.get("fallback_nearest_points", 64)), min_slice_points)
+    nearest_count = min(fallback_count, len(points))
+    if nearest_count <= 0:
+        return None, "missing_geometry"
+    nearest_indices = np.argsort(np.abs(points[:, 2] - grasp_z))[:nearest_count]
+    nearest_points = points[nearest_indices]
+    if len(nearest_points) < min_slice_points:
+        return None, "insufficient_slice_points"
+    return nearest_points, "nearest_z"
+
+
+def estimate_gripper_template_width_cm(fitted_points_base, grasp_point_base, gripper_cfg):
+    """Estimate template width/diameter at the grasp z position in centimeters."""
+    geometry_cfg = _gripper_geometry_cfg(gripper_cfg)
+    slice_points, slice_source = _select_template_slice_points(
+        fitted_points_base,
+        grasp_point_base,
+        geometry_cfg,
+    )
+    if slice_points is None:
+        return None, {
+            "reason": slice_source,
+            "slice_source": slice_source,
+            "slice_point_count": 0,
+        }
+
+    points_xy = slice_points[:, :2]
+    diameter_m = _estimate_xy_max_diameter_m(points_xy)
+    pca_widths = _estimate_pca_section_widths_m(points_xy)
+    width_mode = "diameter"
+    width_m = diameter_m
+    anisotropic_ratio = max(float(geometry_cfg.get("anisotropic_ratio", 1.25)), 1.0)
+    if pca_widths is not None:
+        short_width_m, long_width_m = pca_widths
+        if short_width_m > 1e-9 and long_width_m / short_width_m >= anisotropic_ratio:
+            width_m = short_width_m
+            width_mode = "pca_short_axis"
+
+    if width_m is None or not np.isfinite(width_m):
+        return None, {
+            "reason": "invalid_width",
+            "slice_source": slice_source,
+            "slice_point_count": int(len(slice_points)),
+        }
+
+    width_cm = float(width_m * 100.0)
+    return width_cm, {
+        "reason": "ok",
+        "slice_source": slice_source,
+        "slice_point_count": int(len(slice_points)),
+        "width_mode": width_mode,
+        "width_cm": width_cm,
+    }
+
+
+def resolve_gripper_position_threshold_from_geometry(gripper_cfg, fitted_points_base, grasp_point_base):
+    """Resolve gripper close completion threshold from fitted template geometry."""
+    gripper_cfg = dict(gripper_cfg or {})
+    default_threshold = resolve_default_gripper_position_threshold(gripper_cfg)
+    geometry_cfg = _gripper_geometry_cfg(gripper_cfg)
+    if not bool(geometry_cfg.get("enabled", True)):
+        return default_threshold, {
+            "reason": "disabled",
+            "threshold_float": float(default_threshold),
+            "threshold": int(default_threshold),
+            "fallback_threshold": int(default_threshold),
+        }
+
+    width_cm, debug = estimate_gripper_template_width_cm(
+        fitted_points_base,
+        grasp_point_base,
+        gripper_cfg,
+    )
+    if width_cm is None:
+        debug.update(
+            {
+                "threshold_float": float(default_threshold),
+                "threshold": int(default_threshold),
+                "fallback_threshold": int(default_threshold),
+            }
+        )
+        return default_threshold, debug
+
+    formula_opening_cm = float(geometry_cfg.get("formula_opening_cm", 9.0))
+    if not np.isfinite(formula_opening_cm) or formula_opening_cm <= 1e-9:
+        formula_opening_cm = 9.0
+    alpha_cm = float(geometry_cfg.get("alpha_cm", 0.1))
+    threshold_float = (formula_opening_cm - (float(width_cm) + alpha_cm)) * 255.0 / formula_opening_cm
+    clamp_min = float(geometry_cfg.get("clamp_min", 0.0))
+    clamp_max = float(geometry_cfg.get("clamp_max", 255.0))
+    if clamp_min > clamp_max:
+        clamp_min, clamp_max = clamp_max, clamp_min
+    threshold_clamped = float(np.clip(threshold_float, clamp_min, clamp_max))
+    threshold = int(np.floor(threshold_clamped + 0.5 + 1e-9))
+    debug.update(
+        {
+            "alpha_cm": alpha_cm,
+            "formula_opening_cm": formula_opening_cm,
+            "threshold_float": threshold_float,
+            "threshold_clamped_float": threshold_clamped,
+            "threshold": threshold,
+            "fallback_threshold": int(default_threshold),
+        }
+    )
+    return threshold, debug
+
+
+def configure_gripper_position_threshold_from_geometry(controller, fitted_points_base, grasp_point_base):
+    """Select a gripper completion threshold from the fitted template grasp section."""
     if controller is None:
         return None
 
@@ -1433,13 +1595,28 @@ def configure_gripper_position_threshold_for_label(controller, label):
         .get("robot", {})
         .get("gripper", {})
     )
-    position_threshold = resolve_gripper_position_threshold(gripper_cfg, label)
+    position_threshold, debug = resolve_gripper_position_threshold_from_geometry(
+        gripper_cfg,
+        fitted_points_base,
+        grasp_point_base,
+    )
 
     controller.gripper_position_complete_threshold = int(position_threshold)
-    normalized_label = normalize_object_label(label)
+    reason = debug.get("reason", "unknown")
+    width_cm = debug.get("width_cm")
+    width_text = "n/a" if width_cm is None else f"{float(width_cm):.3f}cm"
+    threshold_float = float(debug.get("threshold_float", position_threshold))
+    threshold_clamped = float(debug.get("threshold_clamped_float", position_threshold))
     print(
-        "[INFO] Gripper position threshold configured: "
-        f"label={normalized_label or 'unknown'}, threshold={int(position_threshold)}"
+        "[INFO] Gripper position threshold configured from geometry: "
+        f"threshold_float={threshold_float:.3f}, "
+        f"threshold_clamped={threshold_clamped:.3f}, "
+        f"threshold={int(position_threshold)}, "
+        f"width={width_text}, "
+        f"mode={debug.get('width_mode', 'fallback')}, "
+        f"slice_source={debug.get('slice_source', 'n/a')}, "
+        f"slice_points={int(debug.get('slice_point_count', 0))}, "
+        f"reason={reason}"
     )
     return int(position_threshold)
 
@@ -2583,18 +2760,10 @@ def main():
                     print("[INFO] DIRECT GRASP trigger")
                     shared_state.stop_follow()
                     if stop_follow_for_handoff(shared_state, args.follow_handoff_timeout_s):
-                        initial_threshold_label = shared_state.get_initial_object_label()
-                        threshold_label = initial_threshold_label or merged_object.label or fitted_merged_object.label
-                        print(
-                            "[INFO] Using grasp threshold label: "
-                            f"cached_initial={initial_threshold_label}, "
-                            f"merged={merged_object.label}, "
-                            f"fitted={fitted_merged_object.label}, "
-                            f"selected={threshold_label}"
-                        )
-                        configure_gripper_position_threshold_for_label(
+                        configure_gripper_position_threshold_from_geometry(
                             controller,
-                            threshold_label,
+                            shape_fitting_state.fitted_points_base,
+                            grasp_point_base,
                         )
                         grasp_ok = execute_gripper_close(
                             controller,
