@@ -298,6 +298,8 @@ perception:
         asset_path: shape_fitting/poteau.npy
         # template point 단위를 meter로 바꾸는 scale입니다.
         unit_scale_m: 0.001
+        # box-shaped snack은 template local x/y/z 축별 scale을 따로 적용합니다.
+        scale_mode: axis_xyz
         z_rotation:
           # box-shaped snack에만 Z축 yaw 후보 탐색을 적용합니다.
           enabled: true
@@ -315,6 +317,8 @@ perception:
       # 선택 cluster centroid가 이전 frame 대비 허용되는 최대 jump입니다.
       max_cluster_jump_m: 0.08
     scale_init:
+      # 기본 template scale 방식입니다. uniform 또는 axis_xyz를 사용할 수 있습니다.
+      mode: uniform
       # scale 초기화에 필요한 안정 frame 수입니다.
       stable_frames: 8
       # object extent 계산 lower percentile입니다.
@@ -387,7 +391,7 @@ grasp:
     # fallback lock에 motion trigger 상태를 요구할지 정합니다.
     require_motion_triggered: true
     # hand-relative fallback lock/active 여부를 콘솔에 출력합니다.
-    debug_log: true
+    debug_log: false
     # lock_frames가 채워지는 과정을 frame마다 출력합니다.
     log_lock_progress: true
     # fallback active 로그를 몇 frame마다 출력할지 정합니다. 1이면 매 fallback frame 출력입니다.
@@ -485,8 +489,8 @@ robot:
     # object label별 gripper close 완료 position threshold입니다.
     position_complete_threshold_by_label:
       cup: 75
-      wine glass: 120
-      box-shaped snack: 40
+      wine glass: 40
+      box-shaped snack: 140
     # gripper/RTDE debug log 출력 여부입니다.
     debug: true
     # socket mode가 아닐 때 digital output domain입니다.

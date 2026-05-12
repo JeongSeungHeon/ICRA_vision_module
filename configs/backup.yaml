@@ -354,7 +354,7 @@ robot:
     open_force: 255
     close_speed: 255
     close_force: 255
-    position_complete_threshold: 40
+    position_complete_threshold: 100
     debug: true
     output_domain: tool              # Fallback only when control_mode is not socket
     open_digital_output: 1

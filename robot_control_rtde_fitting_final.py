@@ -253,6 +253,11 @@ def parse_args():
         help="Enable in-memory 3D debug recording. Press 'd' to save and reset.",
     )
     parser.add_argument(
+        "--save-image",
+        action="store_true",
+        help="With --3d-debug, include raw color/depth frames in saved 3D debug recordings.",
+    )
+    parser.add_argument(
         "--debug-3d-dir",
         type=str,
         default="output/debug_3d",
@@ -2106,6 +2111,8 @@ def append_debug_3d_frame(
         grasp_point_base=grasp_point_base,
         eef_pose_base=eef_pose_base,
         measurement_source=measurement_source,
+        hand_selector_debug=getattr(pipeline["hand_selector"], "last_debug", None),
+        snapshot=snapshot if debug_3d_recorder.save_images else None,
     )
 
 
@@ -2374,15 +2381,20 @@ def main():
     active_task_epoch = None
     task_record_start_perf = None
     debug_3d_enabled = bool(args.debug_3d) and not bool(args.disable_debug_3d_recording)
+    if args.save_image and not debug_3d_enabled:
+        print("[WARN] --save-image requires --3d-debug; raw image/depth capture is disabled.")
     debug_3d_recorder = None
     if debug_3d_enabled:
         debug_3d_recorder = Debug3DRecorder(
             output_dir=args.debug_3d_dir,
             enabled=True,
+            save_images=bool(args.save_image),
             max_object_points=args.debug_3d_max_object_points,
             max_template_points=args.debug_3d_max_template_points,
         )
         print(f"[INFO] 3D debug recorder armed. Press 'd' to save to {args.debug_3d_dir} and reset.")
+        if debug_3d_recorder.save_images:
+            print("[INFO] 3D debug recorder will include raw color/depth frames.")
 
     try:
         video_recorder = HandoverVideoRecorderService(
@@ -2725,6 +2737,8 @@ def main():
 
     finally:
         runtime_profiler.close()
+        if debug_3d_recorder is not None:
+            debug_3d_recorder.close()
         shared_state.stop_event.set()
         if control_thread is not None:
             control_thread.join(timeout=1.0)

@@ -37,6 +37,9 @@ _HEIGHT_AXIS_TO_INDEX = {
     "y": 1,
     "z": 2,
 }
+SCALE_MODE_UNIFORM = "uniform"
+SCALE_MODE_AXIS_XYZ = "axis_xyz"
+VALID_SCALE_MODES = {SCALE_MODE_UNIFORM, SCALE_MODE_AXIS_XYZ}
 TEMPLATE_PROFILE_BINS = 40
 TEMPLATE_PROFILE_SMOOTHING_BINS = 5
 TOP_WIDTH_FRACTION_FOR_REFERENCE = 0.15
@@ -132,19 +135,58 @@ def _estimate_uniform_scale(source_extent: np.ndarray, target_extent: np.ndarray
     return float(np.clip(uniform_scale, min_scale, max_scale))
 
 
+def _estimate_axis_scale(
+    source_extent: np.ndarray,
+    target_extent: np.ndarray,
+    min_scale: float,
+    max_scale: float,
+    *,
+    fallback_scale: float = 1.0,
+) -> np.ndarray:
+    source_extent = np.asarray(source_extent, dtype=np.float64).reshape(3)
+    target_extent = np.asarray(target_extent, dtype=np.float64).reshape(3)
+    fallback_scale = float(np.clip(float(fallback_scale), min_scale, max_scale))
+    scale_xyz = np.full((3,), fallback_scale, dtype=np.float64)
+
+    finite_source = np.isfinite(source_extent)
+    finite_target = np.isfinite(target_extent)
+    source_order = np.argsort(np.where(finite_source, source_extent, np.inf))
+    target_order = np.argsort(np.where(finite_target, target_extent, np.inf))
+
+    for source_axis, target_axis in zip(source_order, target_order):
+        source_value = float(source_extent[source_axis])
+        target_value = float(target_extent[target_axis])
+        if source_value > 1e-6 and target_value > 1e-6 and np.isfinite(source_value) and np.isfinite(target_value):
+            scale_xyz[int(source_axis)] = target_value / source_value
+
+    return np.clip(scale_xyz, min_scale, max_scale).astype(np.float64)
+
+
 def _apply_similarity_pose(
     points: np.ndarray,
-    uniform_scale: float,
     rotation: np.ndarray,
     target_center: np.ndarray,
+    *,
+    uniform_scale: float | None = None,
+    scale_xyz: np.ndarray | tuple[float, float, float] | None = None,
+    scale_basis: np.ndarray | None = None,
+    scale_center: np.ndarray | None = None,
 ) -> np.ndarray:
     points = np.asarray(points, dtype=np.float64).reshape((-1, 3))
     if len(points) == 0:
         return points
 
-    centroid = np.mean(points, axis=0, keepdims=True)
-    centered = points - centroid
-    scaled = centered * float(uniform_scale)
+    if scale_xyz is None:
+        scale_value = 1.0 if uniform_scale is None else float(uniform_scale)
+        centroid = np.mean(points, axis=0, keepdims=True)
+        scaled = (points - centroid) * scale_value
+    else:
+        scale_arr = np.asarray(scale_xyz, dtype=np.float64).reshape(3)
+        basis = np.eye(3, dtype=np.float64) if scale_basis is None else np.asarray(scale_basis, dtype=np.float64).reshape((3, 3))
+        center = np.mean(points, axis=0) if scale_center is None else np.asarray(scale_center, dtype=np.float64).reshape(3)
+        points_local = (points - center.reshape(1, 3)) @ basis
+        scaled = (points_local * scale_arr.reshape(1, 3)) @ basis.T
+        scaled = scaled - np.mean(scaled, axis=0, keepdims=True)
     rotated = scaled @ np.asarray(rotation, dtype=np.float64).reshape((3, 3)).T
     return rotated + np.asarray(target_center, dtype=np.float64).reshape((1, 3))
 
@@ -348,6 +390,7 @@ class ShapeTemplateModel:
     template_id: str
     asset_path: Path
     unit_scale_m: float
+    scale_mode: str
     canonical_points: np.ndarray
     source_extent_xyz: np.ndarray
     bowl_height_fraction: float | None
@@ -365,6 +408,8 @@ class ShapeFittingState:
     fitted_points_base: np.ndarray
     centroid_base: tuple[float, float, float] | None
     scale: float | None
+    scale_xyz: tuple[float, float, float] | None
+    scale_mode: str
     bowl_height_fraction: float | None
     initialized: bool
     reason: str
@@ -380,6 +425,8 @@ class ShapeFittingDebug:
     scale_buffer_count: int
     initialized: bool
     scale: float | None
+    scale_xyz: tuple[float, float, float] | None
+    scale_mode: str
     reason: str
     tracking_mode: str
     icp_time_ms: float | None
@@ -429,6 +476,7 @@ class ShapeFittingTracker:
         self.scale_high_q = float(scale_cfg.get("percentile_high", 95.0))
         self.min_scale = float(scale_cfg.get("min_scale", 0.5))
         self.max_scale = float(scale_cfg.get("max_scale", 1.8))
+        self._default_scale_mode = self._normalize_scale_mode(scale_cfg.get("mode", SCALE_MODE_UNIFORM))
 
         self.output_voxel_size_m = float(downsample_cfg.get("voxel_size_m", 0.004))
         self.output_max_points = int(downsample_cfg.get("max_points", 6000))
@@ -453,6 +501,10 @@ class ShapeFittingTracker:
         self._tracked_cluster_centroid: np.ndarray | None = None
         self._extent_buffer: list[np.ndarray] = []
         self._frozen_scale: float | None = None
+        self._frozen_scale_xyz: np.ndarray | None = None
+        self._frozen_scale_mode = SCALE_MODE_UNIFORM
+        self._frozen_scale_basis: np.ndarray | None = None
+        self._frozen_scale_center: np.ndarray | None = None
         self._frozen_rotation = np.eye(3, dtype=np.float64)
         self._frozen_z_rotation_deg: float | None = None
         self._current_template_points = np.empty((0, 3), dtype=np.float32)
@@ -465,6 +517,8 @@ class ShapeFittingTracker:
             fitted_points_base=np.empty((0, 3), dtype=np.float32),
             centroid_base=None,
             scale=None,
+            scale_xyz=None,
+            scale_mode=SCALE_MODE_UNIFORM,
             bowl_height_fraction=None,
             initialized=False,
             reason="uninitialized",
@@ -478,6 +532,8 @@ class ShapeFittingTracker:
             scale_buffer_count=0,
             initialized=False,
             scale=None,
+            scale_xyz=None,
+            scale_mode=SCALE_MODE_UNIFORM,
             reason="uninitialized",
             tracking_mode="uninitialized",
             icp_time_ms=None,
@@ -502,6 +558,10 @@ class ShapeFittingTracker:
         self._tracked_cluster_centroid = None
         self._extent_buffer = []
         self._frozen_scale = None
+        self._frozen_scale_xyz = None
+        self._frozen_scale_mode = SCALE_MODE_UNIFORM
+        self._frozen_scale_basis = None
+        self._frozen_scale_center = None
         self._frozen_rotation = np.eye(3, dtype=np.float64)
         self._frozen_z_rotation_deg = None
         self._current_template_points = np.empty((0, 3), dtype=np.float32)
@@ -607,13 +667,16 @@ class ShapeFittingTracker:
             return state
 
         assert self._frozen_scale is not None
+        assert self._frozen_scale_xyz is not None
         current_template_points = np.asarray(self._current_template_points, dtype=np.float64).reshape((-1, 3))
         current_centroid = np.mean(current_template_points, axis=0)
         scaled_points = _apply_similarity_pose(
             template.canonical_points,
-            uniform_scale=self._frozen_scale,
             rotation=self._frozen_rotation,
             target_center=current_centroid,
+            scale_xyz=self._frozen_scale_xyz,
+            scale_basis=self._frozen_scale_basis,
+            scale_center=self._frozen_scale_center,
         )
 
         icp_start = time.perf_counter()
@@ -676,8 +739,12 @@ class ShapeFittingTracker:
     def _initialize_template(self, template: ShapeTemplateModel, target_points: np.ndarray) -> np.ndarray:
         median_target_extent = np.median(np.asarray(self._extent_buffer, dtype=np.float64), axis=0)
         template_obb = _build_oriented_bbox(template.canonical_points)
+        scale_mode = self._scale_mode_for_template(template)
         if template_obb is None:
             uniform_scale = 1.0
+            scale_xyz = np.ones((3,), dtype=np.float64)
+            scale_basis = None
+            scale_center = None
         else:
             template_extent = _compute_oriented_robust_extent(
                 template.canonical_points,
@@ -687,6 +754,20 @@ class ShapeFittingTracker:
                 100.0,
             )
             uniform_scale = _estimate_uniform_scale(template_extent, median_target_extent, self.min_scale, self.max_scale)
+            if scale_mode == SCALE_MODE_AXIS_XYZ:
+                scale_xyz = _estimate_axis_scale(
+                    template_extent,
+                    median_target_extent,
+                    self.min_scale,
+                    self.max_scale,
+                    fallback_scale=uniform_scale,
+                )
+                scale_basis = np.asarray(template_obb.R, dtype=np.float64).reshape((3, 3))
+                scale_center = np.asarray(template_obb.center, dtype=np.float64).reshape(3)
+            else:
+                scale_xyz = np.full((3,), uniform_scale, dtype=np.float64)
+                scale_basis = None
+                scale_center = None
 
         initial_center = np.mean(target_points, axis=0)
         candidate_degrees = self._z_rotation_candidate_degrees(template)
@@ -706,9 +787,11 @@ class ShapeFittingTracker:
             candidate_rotation = _z_axis_rotation_matrix(z_rotation_deg)
             candidate_points = _apply_similarity_pose(
                 template.canonical_points,
-                uniform_scale=uniform_scale,
                 rotation=candidate_rotation,
                 target_center=initial_center,
+                scale_xyz=scale_xyz,
+                scale_basis=scale_basis,
+                scale_center=scale_center,
             )
 
             icp_start = time.perf_counter()
@@ -742,7 +825,11 @@ class ShapeFittingTracker:
                 best_icp_target_points = icp_target_points
                 best_icp_iterations_used = icp_iterations_used
 
-        self._frozen_scale = uniform_scale
+        self._frozen_scale = float(np.median(scale_xyz))
+        self._frozen_scale_xyz = np.asarray(scale_xyz, dtype=np.float64).reshape(3)
+        self._frozen_scale_mode = scale_mode
+        self._frozen_scale_basis = None if scale_basis is None else np.asarray(scale_basis, dtype=np.float64).reshape((3, 3))
+        self._frozen_scale_center = None if scale_center is None else np.asarray(scale_center, dtype=np.float64).reshape(3)
         self._frozen_rotation = best_rotation
         self._frozen_z_rotation_deg = best_z_rotation_deg if template.z_rotation_enabled else None
         self._current_template_points = best_initialized_points.astype(np.float32)
@@ -931,6 +1018,21 @@ class ShapeFittingTracker:
         axis_name = getattr(merged_object, "height_axis_name", None)
         return int(_HEIGHT_AXIS_TO_INDEX.get(str(axis_name).lower(), self.icp_crop_height_axis_index))
 
+    @staticmethod
+    def _normalize_scale_mode(value: Any) -> str:
+        mode = str(value or SCALE_MODE_UNIFORM).strip().lower()
+        return mode if mode in VALID_SCALE_MODES else SCALE_MODE_UNIFORM
+
+    def _scale_mode_for_template(self, template: ShapeTemplateModel | None) -> str:
+        if template is not None:
+            return self._normalize_scale_mode(template.scale_mode)
+        return self._normalize_scale_mode(getattr(self, "_default_scale_mode", SCALE_MODE_UNIFORM))
+
+    def _debug_scale_mode(self) -> str:
+        if self._initialized:
+            return self._normalize_scale_mode(self._frozen_scale_mode)
+        return self._scale_mode_for_template(self._active_template)
+
     def _resolve_template(self, label: str | None) -> ShapeTemplateModel | None:
         if not label:
             return None
@@ -952,11 +1054,14 @@ class ShapeFittingTracker:
             z_rotation_min_deg = float(z_rotation_cfg.get("min_deg", 0.0))
             z_rotation_max_deg = float(z_rotation_cfg.get("max_deg", 0.0))
             z_rotation_step_deg = float(z_rotation_cfg.get("step_deg", 5.0))
+            default_scale_mode = getattr(self, "_default_scale_mode", SCALE_MODE_UNIFORM)
+            scale_mode = ShapeFittingTracker._normalize_scale_mode(entry.get("scale_mode", default_scale_mode))
             templates[str(label)] = ShapeTemplateModel(
                 label=str(label),
                 template_id=str(entry.get("template_id", label)),
                 asset_path=asset_path,
                 unit_scale_m=float(entry.get("unit_scale_m", 1.0)),
+                scale_mode=scale_mode,
                 canonical_points=canonical_points,
                 source_extent_xyz=_compute_robust_extent(canonical_points, 0.0, 100.0),
                 bowl_height_fraction=bowl_height_fraction,
@@ -991,6 +1096,7 @@ class ShapeFittingTracker:
             icp_fps = 1000.0 / float(icp_time_ms)
         if z_rotation_deg is None and self._active_template is not None and self._active_template.z_rotation_enabled:
             z_rotation_deg = self._frozen_z_rotation_deg
+        scale_xyz = None if self._frozen_scale_xyz is None else tuple(float(v) for v in self._frozen_scale_xyz)
         self.last_debug = ShapeFittingDebug(
             label=label,
             template_id=template_id,
@@ -1000,6 +1106,8 @@ class ShapeFittingTracker:
             scale_buffer_count=len(self._extent_buffer),
             initialized=bool(self._initialized),
             scale=None if self._frozen_scale is None else float(self._frozen_scale),
+            scale_xyz=scale_xyz,
+            scale_mode=self._debug_scale_mode(),
             reason=str(reason),
             tracking_mode=str(tracking_mode),
             icp_time_ms=None if icp_time_ms is None else float(icp_time_ms),
@@ -1029,6 +1137,7 @@ class ShapeFittingTracker:
         )
         centroid_arr = None if centroid is None else np.asarray(centroid, dtype=np.float32).reshape(3)
         centroid_tuple = None if centroid_arr is None else tuple(float(v) for v in centroid_arr)
+        scale_xyz = None if self._frozen_scale_xyz is None else tuple(float(v) for v in self._frozen_scale_xyz)
         state = ShapeFittingState(
             valid=bool(valid),
             label=None if template is None else template.label,
@@ -1036,6 +1145,8 @@ class ShapeFittingTracker:
             fitted_points_base=fitted_points_arr,
             centroid_base=centroid_tuple,
             scale=None if self._frozen_scale is None else float(self._frozen_scale),
+            scale_xyz=scale_xyz,
+            scale_mode=self._scale_mode_for_template(template),
             bowl_height_fraction=None if template is None else template.bowl_height_fraction,
             initialized=bool(self._initialized),
             reason=str(reason),
