@@ -98,7 +98,19 @@ DEFAULT_GRIPPER_POSITION_STALL_ENABLED = True
 DEFAULT_GRIPPER_POSITION_STALL_STABLE_READS = 3
 DEFAULT_GRIPPER_POSITION_STALL_TOLERANCE = 1
 DEFAULT_GRIPPER_POSITION_STALL_MIN_ELAPSED_S = 0.12
-RELEASE_PARAMETER_MM = 20.0
+RELEASE_PARAMETER_MM = 80.0
+DEFAULT_TACTILE_PORT = "/dev/ttyACM0"
+DEFAULT_TACTILE_NUM_MAGS = 5
+DEFAULT_TACTILE_BASELINE_SAMPLES = 5
+DEFAULT_TACTILE_STARTUP_DELAY_S = 1.0
+DEFAULT_TACTILE_CONTACT_NORM_THRESHOLD = 30.0
+DEFAULT_TACTILE_EXTRA_GRASP_POS = 10
+DEFAULT_TACTILE_RELEASE_DELTA_THRESHOLD = 50.0
+DEFAULT_TACTILE_RELEASE_REF_DELAY_S = 0.3
+DEFAULT_TACTILE_RELEASE_TIMEOUT_S = 1.0
+DEFAULT_TACTILE_RELEASE_DESCENT_STEP_MM = 2.0
+DEFAULT_TACTILE_RELEASE_DESCENT_POLL_DT_S = 0.03
+DEFAULT_TACTILE_AUTO_BASELINE_RESET_AFTER_OPEN_S = 1.5
 BASE_POSE = {
     "x": 208.0,
     "y": 102.0,
@@ -334,6 +346,17 @@ def parse_args():
         default=5.0,
         help="Print a short runtime profiling summary every N seconds. Use 0 to disable.",
     )
+    parser.add_argument(
+        "--debug-tactile",
+        action="store_true",
+        help="Show a live AnySkin tactile visualization window when robot.tactile.enabled is true.",
+    )
+    parser.add_argument(
+        "--debug-tactile-scaling",
+        type=float,
+        default=10.0,
+        help="Scaling factor for --debug-tactile visualization vectors/circles.",
+    )
     return parser.parse_args()
 
 
@@ -348,6 +371,7 @@ def apply_config_defaults(args, config):
     robot_cfg = config.get("robot", {})
     live_cfg = robot_cfg.get("live_follow", {})
     return_sequence_cfg = robot_cfg.get("return_sequence", {})
+    tactile_cfg = robot_cfg.get("tactile", {})
     rtde_cfg = robot_cfg.get("rtde", {})
     safety_cfg = config.get("safety", {})
     workspace_cfg = safety_cfg.get("workspace_bounds_m", {})
@@ -405,6 +429,60 @@ def apply_config_defaults(args, config):
     args.fdct_debug_every = max(1, int(fdct_cfg.get("debug_every", 30)))
     args.fdct_fallback_to_raw = bool(fdct_cfg.get("fallback_to_raw", True))
     args.fdct_debug_stats = bool(args.fdct_debug_stats or fdct_cfg.get("debug_stats", False))
+
+    args.tactile_enabled = bool(tactile_cfg.get("enabled", False))
+    args.tactile_port = str(tactile_cfg.get("port", DEFAULT_TACTILE_PORT))
+    args.tactile_num_mags = max(1, int(tactile_cfg.get("num_mags", DEFAULT_TACTILE_NUM_MAGS)))
+    args.tactile_baseline_samples = max(
+        1,
+        int(tactile_cfg.get("baseline_samples", DEFAULT_TACTILE_BASELINE_SAMPLES)),
+    )
+    args.tactile_startup_delay_s = max(
+        0.0,
+        float(tactile_cfg.get("startup_delay_s", DEFAULT_TACTILE_STARTUP_DELAY_S)),
+    )
+    args.tactile_contact_norm_threshold = max(
+        0.0,
+        float(tactile_cfg.get("contact_norm_threshold", DEFAULT_TACTILE_CONTACT_NORM_THRESHOLD)),
+    )
+    args.tactile_extra_grasp_pos = max(
+        0,
+        int(tactile_cfg.get("extra_grasp_pos", DEFAULT_TACTILE_EXTRA_GRASP_POS)),
+    )
+    args.tactile_release_delta_threshold = max(
+        0.0,
+        float(tactile_cfg.get("release_delta_threshold", DEFAULT_TACTILE_RELEASE_DELTA_THRESHOLD)),
+    )
+    args.tactile_release_ref_delay_s = max(
+        0.0,
+        float(tactile_cfg.get("release_ref_delay_s", DEFAULT_TACTILE_RELEASE_REF_DELAY_S)),
+    )
+    args.tactile_release_timeout_s = max(
+        0.0,
+        float(tactile_cfg.get("release_timeout_s", DEFAULT_TACTILE_RELEASE_TIMEOUT_S)),
+    )
+    args.tactile_release_descent_min_z_mm = max(
+        HOME_PLACE_MIN_Z_MM,
+        float(tactile_cfg.get("release_descent_min_z_mm", HOME_PLACE_MIN_Z_MM)),
+    )
+    args.tactile_release_descent_step_mm = max(
+        0.1,
+        float(tactile_cfg.get("release_descent_step_mm", DEFAULT_TACTILE_RELEASE_DESCENT_STEP_MM)),
+    )
+    args.tactile_release_descent_poll_dt_s = max(
+        0.0,
+        float(tactile_cfg.get("release_descent_poll_dt_s", DEFAULT_TACTILE_RELEASE_DESCENT_POLL_DT_S)),
+    )
+    args.tactile_auto_baseline_reset_after_open_s = max(
+        0.0,
+        float(
+            tactile_cfg.get(
+                "auto_baseline_reset_after_open_s",
+                DEFAULT_TACTILE_AUTO_BASELINE_RESET_AFTER_OPEN_S,
+            )
+        ),
+    )
+    args.tactile_debug = bool(tactile_cfg.get("debug", True))
 
     return args
 
@@ -521,6 +599,288 @@ def apply_fdct_depth_to_object_frames(snapshot, pipeline, args):
             print(f"[FDCT] cam{camera_id} elapsed={result.elapsed_ms:.1f}ms {stats}")
 
     return object_frames[0], object_frames[1]
+
+
+class AnySkinTactileManager:
+    """Small AnySkin reader used only when robot.tactile.enabled is true."""
+
+    def __init__(self, args):
+        self.enabled = bool(getattr(args, "tactile_enabled", False))
+        self.port = str(getattr(args, "tactile_port", DEFAULT_TACTILE_PORT))
+        self.num_mags = max(1, int(getattr(args, "tactile_num_mags", DEFAULT_TACTILE_NUM_MAGS)))
+        self.baseline_samples = max(1, int(getattr(args, "tactile_baseline_samples", DEFAULT_TACTILE_BASELINE_SAMPLES)))
+        self.startup_delay_s = max(0.0, float(getattr(args, "tactile_startup_delay_s", DEFAULT_TACTILE_STARTUP_DELAY_S)))
+        self.contact_norm_threshold = max(
+            0.0,
+            float(getattr(args, "tactile_contact_norm_threshold", DEFAULT_TACTILE_CONTACT_NORM_THRESHOLD)),
+        )
+        self.debug = bool(getattr(args, "tactile_debug", True))
+        self.stream = None
+        self.baseline = None
+        self.latest = np.zeros(self.num_mags * 3, dtype=np.float32)
+        self.latest_norm = 0.0
+        self.last_error = None
+        self.status = "disabled"
+        self.release_reference_norm = None
+        self.release_delta_norm = None
+        self.release_status = "off"
+
+    def start(self):
+        if not self.enabled:
+            return
+        try:
+            from anyskin import AnySkinProcess
+        except Exception as exc:
+            raise RuntimeError(
+                "robot.tactile.enabled is true, but the anyskin package could not be imported. "
+                "Install AnySkin dependencies or set robot.tactile.enabled: false."
+            ) from exc
+
+        try:
+            self.stream = AnySkinProcess(num_mags=self.num_mags, port=self.port)
+            self.stream.start()
+            if self.startup_delay_s > 0.0:
+                time.sleep(self.startup_delay_s)
+            self.reset_baseline()
+            self.status = "ready"
+            if self.debug:
+                print(f"[Tactile] AnySkin stream started on {self.port} ({self.num_mags} mags).")
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.status = "error"
+            self.close()
+            raise RuntimeError(f"Failed to start AnySkin tactile reader on {self.port}: {exc}") from exc
+
+    def reset_baseline(self):
+        if self.stream is None:
+            return False
+        try:
+            baseline_data = self.stream.get_data(num_samples=self.baseline_samples)
+            baseline_data = np.asarray(baseline_data, dtype=np.float32)
+            if baseline_data.ndim != 2 or baseline_data.shape[1] < self.num_mags * 3 + 1:
+                raise RuntimeError(f"Unexpected AnySkin baseline shape: {baseline_data.shape}")
+            self.baseline = np.mean(baseline_data[:, 1 : 1 + self.num_mags * 3], axis=0)
+            self.latest = np.zeros(self.num_mags * 3, dtype=np.float32)
+            self.latest_norm = 0.0
+            self.last_error = None
+            if self.debug:
+                print("[Tactile] Baseline reset.")
+            return True
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.status = "read_error"
+            print(f"[WARN] Tactile baseline reset failed: {exc}")
+            return False
+
+    def read(self):
+        if not self.enabled or self.stream is None:
+            return self.latest
+        if self.baseline is None:
+            self.reset_baseline()
+        try:
+            sensor_data = self.stream.get_data(num_samples=1)[0]
+            sensor_data = np.asarray(sensor_data, dtype=np.float32)[1 : 1 + self.num_mags * 3]
+            if sensor_data.shape[0] != self.num_mags * 3:
+                raise RuntimeError(f"Unexpected AnySkin sample length: {sensor_data.shape[0]}")
+            self.latest = sensor_data - self.baseline
+            self.latest_norm = float(np.linalg.norm(self.latest))
+            self.last_error = None
+            if self.status == "read_error":
+                self.status = "ready"
+            return self.latest
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.status = "read_error"
+            print(f"[WARN] Tactile read failed: {exc}")
+            return self.latest
+
+    def total_norm(self):
+        self.read()
+        return float(self.latest_norm)
+
+    def set_release_reference(self, reference_norm):
+        self.release_reference_norm = None if reference_norm is None else float(reference_norm)
+        self.release_delta_norm = None
+        self.release_status = "armed" if reference_norm is not None else "off"
+
+    def update_release_delta(self, current_norm):
+        if self.release_reference_norm is None:
+            self.release_delta_norm = None
+            return None
+        self.release_delta_norm = abs(float(current_norm) - float(self.release_reference_norm))
+        return self.release_delta_norm
+
+    def close(self):
+        stream = self.stream
+        self.stream = None
+        if stream is None:
+            return
+        try:
+            stream.pause_streaming()
+        except Exception:
+            pass
+        try:
+            stream.join()
+        except Exception:
+            pass
+        self.status = "closed"
+        if self.debug:
+            print("[Tactile] AnySkin stream stopped.")
+
+
+class TactileDebugWindow:
+    """Pygame tactile visualization driven by the shared AnySkin manager."""
+
+    CHIP_LOCATIONS = np.array(
+        [
+            [455, 453],
+            [275, 451],
+            [624, 455],
+            [451, 292],
+            [454, 613],
+        ],
+        dtype=np.float32,
+    )
+    CHIP_XY_ROTATIONS = np.array([-np.pi / 2, -np.pi / 2, np.pi, np.pi / 2, 0.0], dtype=np.float32)
+
+    def __init__(self, tactile_manager, *, scaling=10.0):
+        self.tactile_manager = tactile_manager
+        self.scaling = max(float(scaling), 1e-6)
+        self.enabled = False
+        self.closed = False
+        self.pygame = None
+        self.window = None
+        self.background_surface = None
+        self.font_large = None
+        self.font_medium = None
+        self.font_small = None
+        self.clock = None
+
+    def start(self):
+        if self.tactile_manager is None or not bool(getattr(self.tactile_manager, "enabled", False)):
+            print("[WARN] --debug-tactile requested but robot.tactile.enabled is false; tactile window disabled.")
+            return False
+        try:
+            import pygame
+        except Exception as exc:
+            raise RuntimeError("--debug-tactile requires pygame to be installed.") from exc
+
+        self.pygame = pygame
+        pygame.init()
+        desired_width = 900
+        bg_image_path = Path(__file__).resolve().parent / "eFlesh" / "visualizer" / "flesh.png"
+        if bg_image_path.exists():
+            bg_image = pygame.image.load(str(bg_image_path))
+            image_width, image_height = bg_image.get_size()
+            desired_height = int(desired_width * image_height / max(image_width, 1))
+            bg_image = pygame.transform.scale(bg_image, (desired_width, desired_height))
+        else:
+            desired_height = 900
+            bg_image = None
+            print(f"[WARN] Tactile debug background image not found: {bg_image_path}")
+
+        self.window = pygame.display.set_mode((desired_width, desired_height), pygame.SRCALPHA)
+        pygame.display.set_caption("AnySkin Tactile Debug")
+        self.background_surface = pygame.Surface(self.window.get_size(), pygame.SRCALPHA)
+        self.background_surface.fill((234, 237, 232, 255))
+        if bg_image is not None:
+            self.background_surface.blit(bg_image, (0, 0))
+        self.font_large = pygame.font.Font(None, 64)
+        self.font_medium = pygame.font.Font(None, 34)
+        self.font_small = pygame.font.Font(None, 26)
+        self.clock = pygame.time.Clock()
+        self.enabled = True
+        print("[Tactile] Debug visualization window opened. Press 'b' in the window to reset baseline.")
+        return True
+
+    def update(self):
+        if not self.enabled or self.closed:
+            return
+        pygame = self.pygame
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.close()
+                return
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_b:
+                self.tactile_manager.reset_baseline()
+
+        tactile_data = np.asarray(self.tactile_manager.latest, dtype=np.float32).copy()
+        expected_values = int(getattr(self.tactile_manager, "num_mags", DEFAULT_TACTILE_NUM_MAGS)) * 3
+        if tactile_data.size < expected_values:
+            padded = np.zeros((expected_values,), dtype=np.float32)
+            padded[: tactile_data.size] = tactile_data
+            tactile_data = padded
+        tactile_data = tactile_data[:expected_values]
+
+        self.window.blit(self.background_surface, (0, 0))
+        self._draw_tactile_data(tactile_data)
+        pygame.display.update()
+        self.clock.tick(60)
+
+    def _draw_text(self, text, pos, font, color=(20, 20, 20)):
+        surface = font.render(str(text), True, color)
+        self.window.blit(surface, pos)
+
+    def _draw_tactile_data(self, tactile_data):
+        pygame = self.pygame
+        num_mags = int(getattr(self.tactile_manager, "num_mags", DEFAULT_TACTILE_NUM_MAGS))
+        data = tactile_data.reshape(num_mags, 3).copy()
+        data[:, :2] *= -1
+        data_mag = np.linalg.norm(data, axis=1)
+        total_norm = float(np.linalg.norm(data.flatten()))
+
+        contact_threshold = float(
+            getattr(self.tactile_manager, "contact_norm_threshold", DEFAULT_TACTILE_CONTACT_NORM_THRESHOLD)
+        )
+        contact_color = (0, 120, 0) if total_norm >= contact_threshold else (200, 0, 0)
+        contact_text = "Contact" if total_norm >= contact_threshold else "No Contact"
+        self._draw_text(contact_text, (30, 30), self.font_large, contact_color)
+        self._draw_text("b: reset baseline", (30, 90), self.font_small, (70, 70, 70))
+        self._draw_text(
+            f"norm={total_norm:.2f} status={getattr(self.tactile_manager, 'release_status', 'off')}",
+            (30, 118),
+            self.font_small,
+            (20, 20, 20),
+        )
+
+        chip_locations = self.CHIP_LOCATIONS[:num_mags]
+        chip_rotations = self.CHIP_XY_ROTATIONS[:num_mags]
+        for magid, chip_location in enumerate(chip_locations):
+            chip_xy = chip_location.astype(int)
+            z_val = float(data[magid, 2])
+            radius = max(2, int(abs(z_val) / self.scaling))
+            width = 2 if z_val < 0 else 0
+            pygame.draw.circle(self.window, (255, 0, 0), chip_xy, radius, width)
+
+            rot = float(chip_rotations[magid])
+            rotation_mat = np.array(
+                [
+                    [np.cos(rot), -np.sin(rot)],
+                    [np.sin(rot), np.cos(rot)],
+                ],
+                dtype=np.float32,
+            )
+            data_xy = rotation_mat @ data[magid, :2]
+            arrow_end = (
+                int(chip_xy[0] + data_xy[0] / self.scaling),
+                int(chip_xy[1] + data_xy[1] / self.scaling),
+            )
+            pygame.draw.line(self.window, (0, 255, 0), chip_xy, arrow_end, 8)
+            pygame.draw.circle(self.window, (20, 20, 20), chip_xy, 5)
+            self._draw_text(f"M{magid} {data_mag[magid]:.1f}", (chip_xy[0] - 38, chip_xy[1] - 42), self.font_small)
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.enabled = False
+        if self.pygame is not None:
+            try:
+                self.pygame.display.quit()
+            except Exception:
+                pass
+        print("[Tactile] Debug visualization window closed.")
+
 
 def clamp_value(v, low, high):
     return max(low, min(high, v))
@@ -1771,6 +2131,31 @@ def configure_gripper_position_threshold_from_geometry(
     return int(position_threshold)
 
 
+def reset_gripper_position_threshold_to_config_default(controller):
+    """Use the static gripper threshold fallback without vision/template geometry."""
+    if controller is None:
+        return None
+
+    controller_config = getattr(controller, "config", {}) or {}
+    gripper_cfg = (
+        controller_config
+        .get("robot", {})
+        .get("gripper", {})
+    )
+    position_threshold = int(
+        gripper_cfg.get(
+            "position_complete_threshold",
+            DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD,
+        )
+    )
+    controller.gripper_position_complete_threshold = int(position_threshold)
+    print(
+        "[INFO] Tactile mode enabled; skipping vision/template gripper threshold geometry. "
+        f"Using static fallback position threshold={int(position_threshold)}."
+    )
+    return int(position_threshold)
+
+
 def start_task_video_recording(video_recorder, task_ready_timestamp):
     if video_recorder is None:
         return
@@ -1815,6 +2200,32 @@ def discard_video_recording_for_reset(video_recorder):
         print("[WARN] Video recorder has no live frame after reset; next task recording will wait for the next frame.")
 
 
+def reset_tactile_state_for_system_reset(tactile_manager):
+    if tactile_manager is None or not bool(getattr(tactile_manager, "enabled", False)):
+        return False
+
+    num_mags = max(1, int(getattr(tactile_manager, "num_mags", DEFAULT_TACTILE_NUM_MAGS)))
+    tactile_manager.release_reference_norm = None
+    tactile_manager.release_delta_norm = None
+    tactile_manager.release_status = "reset_cleared"
+    tactile_manager.latest = np.zeros(num_mags * 3, dtype=np.float32)
+    tactile_manager.latest_norm = 0.0
+    tactile_manager.last_error = None
+
+    baseline_reset = False
+    if hasattr(tactile_manager, "reset_baseline"):
+        baseline_reset = bool(tactile_manager.reset_baseline())
+
+    tactile_manager.release_reference_norm = None
+    tactile_manager.release_delta_norm = None
+    tactile_manager.release_status = "reset_ready" if baseline_reset else "reset_cleared"
+    print(
+        "[Tactile] Reset state for system reset: "
+        f"baseline_reset={baseline_reset}, ref cleared, delta cleared."
+    )
+    return baseline_reset
+
+
 def reset_system_to_start_state(
     controller,
     shared_state,
@@ -1822,6 +2233,7 @@ def reset_system_to_start_state(
     metadata_recorder=None,
     pipeline=None,
     video_recorder=None,
+    tactile_manager=None,
 ):
     """Reset perception, robot pose, metadata, and recorder state for a new task."""
     print("[INFO] Reset requested: returning to startup state")
@@ -1864,6 +2276,7 @@ def reset_system_to_start_state(
             hand_relative_fallback.reset()
 
     if controller is None:
+        reset_tactile_state_for_system_reset(tactile_manager)
         shared_state.reset_for_restart(follow_enabled=False)
         return
 
@@ -1874,6 +2287,7 @@ def reset_system_to_start_state(
 
     execute_gripper_open(controller, dwell_s=args.gripper_release_dwell_s)
     move_robot_to_home_pose(controller, args)
+    reset_tactile_state_for_system_reset(tactile_manager)
 
     shared_state.reset_for_restart(follow_enabled=args.enable_follow)
     shared_state.set_fixed_pose_from_robot(controller)
@@ -1887,7 +2301,66 @@ def reset_system_to_start_state(
     return task_start_perf
 
 
-def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True, metadata_recorder=None):
+def stop_gripper_motion_safely(controller, reason):
+    if not hasattr(controller, "stop_gripper_motion"):
+        return
+    try:
+        controller.stop_gripper_motion()
+    except Exception as exc:
+        print(f"[WARN] Failed to stop gripper after {reason}: {exc}")
+
+
+def note_robot_first_contact(metadata_recorder):
+    if metadata_recorder is None:
+        return
+    first_contact_timestamp = metadata_recorder.note_robot_first_contact()
+    if first_contact_timestamp is not None:
+        print(f"[INFO] Robot first contact timestamp={first_contact_timestamp}")
+
+
+def print_tactile_frame_log(tactile_manager, *, stage, stage_time_s=None, **fields):
+    if tactile_manager is None or not bool(getattr(tactile_manager, "enabled", False)):
+        return
+
+    num_mags = max(1, int(getattr(tactile_manager, "num_mags", DEFAULT_TACTILE_NUM_MAGS)))
+    tactile_data = np.asarray(getattr(tactile_manager, "latest", []), dtype=np.float32).flatten()
+    expected_values = num_mags * 3
+    if tactile_data.size < expected_values:
+        padded = np.zeros((expected_values,), dtype=np.float32)
+        padded[: tactile_data.size] = tactile_data
+        tactile_data = padded
+    tactile_data = tactile_data[:expected_values].reshape(num_mags, 3)
+
+    time_text = "-" if stage_time_s is None else f"{float(stage_time_s):.3f}"
+    ref_norm = getattr(tactile_manager, "release_reference_norm", None)
+    ref_text = "-" if ref_norm is None else f"{float(ref_norm):.3f}"
+    delta_norm = getattr(tactile_manager, "release_delta_norm", None)
+    delta_text = "-" if delta_norm is None else f"{float(delta_norm):.3f}"
+    status = str(getattr(tactile_manager, "release_status", "off"))
+    norm = float(getattr(tactile_manager, "latest_norm", 0.0))
+    field_text = " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
+    # mag_text = " ".join(
+    #     f"M{idx}=({values[0]:.3f},{values[1]:.3f},{values[2]:.3f})"
+    #     for idx, values in enumerate(tactile_data)
+    # )
+    print(
+        "[TACTILE_FRAME] "
+        f"stage={stage} stage_time_s={time_text} norm={norm:.3f} ref={ref_text} "
+        f"delta={delta_text} status={status} {field_text}",
+        flush=True,
+    )
+
+
+def execute_gripper_close(
+    controller,
+    timeout_s=2.0,
+    poll_dt=0.05,
+    verbose=True,
+    metadata_recorder=None,
+    tactile_manager=None,
+    tactile_contact_threshold=None,
+    tactile_extra_grasp_pos=None,
+):
     """Close the gripper and stop when force or position indicates contact."""
     if verbose:
         print("[INFO] GRIPPER CLOSE start")
@@ -1919,6 +2392,23 @@ def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True,
     stall_cfg = resolve_gripper_position_stall_detection_config(controller)
     last_position_value = None
     stable_position_reads = 0
+    tactile_enabled = tactile_manager is not None and bool(getattr(tactile_manager, "enabled", False))
+    tactile_contact_threshold = (
+        DEFAULT_TACTILE_CONTACT_NORM_THRESHOLD
+        if tactile_contact_threshold is None
+        else float(tactile_contact_threshold)
+    )
+    tactile_extra_grasp_pos = (
+        DEFAULT_TACTILE_EXTRA_GRASP_POS
+        if tactile_extra_grasp_pos is None
+        else max(0, int(tactile_extra_grasp_pos))
+    )
+    tactile_contact_detected = False
+    tactile_contact_position = None
+    tactile_extra_target_position = None
+    if tactile_enabled:
+        tactile_manager.release_status = "close_monitoring"
+
     while time.time() < deadline:
         state = controller.read_robot_state(now_timestamp=time.time())
         force_norm = state.tcp_force_norm_n
@@ -1942,11 +2432,15 @@ def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True,
         position_triggered = False
         position_stall_triggered = False
         position_value_int = None
+        closed_position_int = 255
         if hasattr(controller, "get_gripper_close_state"):
             try:
                 gripper_close_state = controller.get_gripper_close_state()
                 if gripper_close_state is not None:
                     position_value = gripper_close_state.get("position")
+                    closed_position = gripper_close_state.get("closed_position")
+                    if closed_position is not None:
+                        closed_position_int = int(closed_position)
                     if position_value is not None:
                         position_value_int = int(position_value)
                         position_threshold = int(getattr(controller, "gripper_position_complete_threshold", DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD))
@@ -1967,7 +2461,69 @@ def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True,
                 if verbose:
                     print(f"[WARN] Failed to read gripper close state: {exc}")
 
+        tactile_norm = None
+        tactile_triggered = False
+        tactile_extra_done = False
+        if tactile_enabled:
+            tactile_norm = tactile_manager.total_norm()
+            print_tactile_frame_log(
+                tactile_manager,
+                stage="gripper_close",
+                stage_time_s=elapsed,
+                gripper_pos=position_value_int,
+            )
+            if not tactile_contact_detected and tactile_norm >= tactile_contact_threshold:
+                tactile_contact_detected = True
+                tactile_triggered = True
+                tactile_contact_position = position_value_int
+                if position_value_int is None:
+                    stop_gripper_motion_safely(controller, "tactile trigger without gripper position")
+                    note_robot_first_contact(metadata_recorder)
+                    tactile_manager.release_status = "close_tactile_stop"
+                    print(
+                        "[INFO] Tactile contact detected during close "
+                        f"(norm={tactile_norm:.3f} >= {tactile_contact_threshold:.3f}); "
+                        "gripper position unavailable, stopping close."
+                    )
+                    return True
+
+                tactile_extra_target_position = min(
+                    int(position_value_int) + int(tactile_extra_grasp_pos),
+                    int(closed_position_int),
+                )
+                tactile_manager.release_status = "close_extra"
+                print(
+                    "[INFO] Tactile contact detected during close: "
+                    f"norm={tactile_norm:.3f}, contact_pos={position_value_int}, "
+                    f"extra={tactile_extra_grasp_pos}, target_pos={tactile_extra_target_position}."
+                )
+
+            if tactile_contact_detected and tactile_extra_target_position is not None:
+                tactile_extra_done = (
+                    position_value_int is not None
+                    and int(position_value_int) >= int(tactile_extra_target_position)
+                )
+                if tactile_extra_done:
+                    stop_gripper_motion_safely(controller, "tactile extra close")
+                    note_robot_first_contact(metadata_recorder)
+                    tactile_manager.release_status = "close_done"
+                    print(
+                        "[INFO] Tactile extra close target reached. "
+                        f"position={position_value_int}, target={tactile_extra_target_position}. "
+                        "Stopping gripper close and finishing grasp stage."
+                    )
+                    return True
+                if position_triggered:
+                    position_triggered = False
+
         if verbose:
+            tactile_text = ""
+            if tactile_enabled:
+                tactile_text = (
+                    f", tactile_norm={tactile_norm}, "
+                    f"tactile_triggered={tactile_triggered}, "
+                    f"tactile_target={tactile_extra_target_position}"
+                )
             print(
                 "[GRIPPER] "
                 f"force_norm={state.tcp_force_norm_n}, "
@@ -1979,17 +2535,11 @@ def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True,
                 f"position_stall_triggered={position_stall_triggered}, "
                 f"stable_position_reads={stable_position_reads}, "
                 f"gripper_state={gripper_close_state}"
+                f"{tactile_text}"
             )
         if force_triggered:
-            if hasattr(controller, "stop_gripper_motion"):
-                try:
-                    controller.stop_gripper_motion()
-                except Exception as exc:
-                    print(f"[WARN] Failed to stop gripper after force trigger: {exc}")
-            if metadata_recorder is not None:
-                first_contact_timestamp = metadata_recorder.note_robot_first_contact()
-                if first_contact_timestamp is not None:
-                    print(f"[INFO] Robot first contact timestamp={first_contact_timestamp}")
+            stop_gripper_motion_safely(controller, "force trigger")
+            note_robot_first_contact(metadata_recorder)
             delta_str = "n/a" if force_delta is None else f"{force_delta:.3f}"
             print(
                 f"[INFO] Force rise detected during close (abs={float(force_norm):.3f} N, delta={delta_str} N). "
@@ -1997,15 +2547,8 @@ def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True,
             )
             return True
         if position_triggered:
-            if hasattr(controller, "stop_gripper_motion"):
-                try:
-                    controller.stop_gripper_motion()
-                except Exception as exc:
-                    print(f"[WARN] Failed to stop gripper after position trigger: {exc}")
-            if metadata_recorder is not None:
-                first_contact_timestamp = metadata_recorder.note_robot_first_contact()
-                if first_contact_timestamp is not None:
-                    print(f"[INFO] Robot first contact timestamp={first_contact_timestamp}")
+            stop_gripper_motion_safely(controller, "position trigger")
+            note_robot_first_contact(metadata_recorder)
             position_threshold = int(
                 getattr(controller, "gripper_position_complete_threshold", DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD)
             )
@@ -2014,15 +2557,10 @@ def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True,
             )
             return True
         if position_stall_triggered:
-            if hasattr(controller, "stop_gripper_motion"):
-                try:
-                    controller.stop_gripper_motion()
-                except Exception as exc:
-                    print(f"[WARN] Failed to stop gripper after position stall trigger: {exc}")
-            if metadata_recorder is not None:
-                first_contact_timestamp = metadata_recorder.note_robot_first_contact()
-                if first_contact_timestamp is not None:
-                    print(f"[INFO] Robot first contact timestamp={first_contact_timestamp}")
+            stop_gripper_motion_safely(controller, "position stall trigger")
+            note_robot_first_contact(metadata_recorder)
+            if tactile_enabled and tactile_contact_detected:
+                tactile_manager.release_status = "close_stall_after_contact"
             print(
                 "[INFO] Gripper position stalled "
                 f"(position={position_value_int}, stable_reads={stable_position_reads}, "
@@ -2032,11 +2570,9 @@ def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True,
             return True
         time.sleep(poll_dt)
 
-    if hasattr(controller, "stop_gripper_motion"):
-        try:
-            controller.stop_gripper_motion()
-        except Exception:
-            pass
+    stop_gripper_motion_safely(controller, "close timeout")
+    if tactile_enabled:
+        tactile_manager.release_status = "close_timeout"
     print("[WARN] Grasp could not be verified from RTDE force/current.")
     return False
 
@@ -2055,6 +2591,185 @@ def execute_gripper_open(controller, dwell_s=0.5, metadata_recorder=None):
     )
     time.sleep(max(dwell_s, 0.0))
     return True
+
+
+def capture_tactile_release_reference(tactile_manager, delay_s=0.0):
+    """Capture the held-object tactile norm used to gate release timing."""
+    if tactile_manager is None or not bool(getattr(tactile_manager, "enabled", False)):
+        return None
+    delay_s = max(0.0, float(delay_s))
+    if delay_s > 0.0:
+        tactile_manager.release_status = "ref_delay"
+        time.sleep(delay_s)
+    reference_norm = tactile_manager.total_norm()
+    tactile_manager.set_release_reference(reference_norm)
+    print_tactile_frame_log(tactile_manager, stage="release_reference", stage_time_s=0.0)
+    print(f"[Tactile] Release reference captured: norm={reference_norm:.3f}")
+    return reference_norm
+
+
+def wait_for_tactile_release_trigger(tactile_manager, *, delta_threshold, timeout_s, poll_dt=0.03):
+    """Wait at PLACE until tactile delta indicates release timing, with timeout fallback."""
+    if tactile_manager is None or not bool(getattr(tactile_manager, "enabled", False)):
+        return False
+
+    delta_threshold = max(0.0, float(delta_threshold))
+    timeout_s = max(0.0, float(timeout_s))
+    deadline = time.time() + timeout_s
+    loop_start = time.time()
+    tactile_manager.release_status = "waiting_release"
+
+    while True:
+        current_norm = tactile_manager.total_norm()
+        delta_norm = tactile_manager.update_release_delta(current_norm)
+        print_tactile_frame_log(
+            tactile_manager,
+            stage="release_wait",
+            stage_time_s=time.time() - loop_start,
+        )
+        if delta_norm is not None and delta_norm > delta_threshold:
+            tactile_manager.release_status = "release_triggered"
+            print(
+                "[Tactile] Release trigger detected: "
+                f"norm={current_norm:.3f}, ref={tactile_manager.release_reference_norm:.3f}, "
+                f"delta={delta_norm:.3f} > {delta_threshold:.3f}."
+            )
+            return True
+        if time.time() >= deadline:
+            tactile_manager.release_status = "release_timeout"
+            delta_text = "n/a" if delta_norm is None else f"{delta_norm:.3f}"
+            print(
+                "[Tactile] Release trigger timeout; opening gripper normally. "
+                f"last_norm={current_norm:.3f}, delta={delta_text}, threshold={delta_threshold:.3f}."
+            )
+            return False
+        time.sleep(max(0.0, poll_dt))
+
+
+def execute_tactile_release_descent(
+    controller,
+    tactile_manager,
+    fixed_orientation_base,
+    start_pose_mm,
+    args,
+):
+    """Descend in -Z until tactile release trigger or the configured lower bound."""
+    start_x, start_y, start_z = [float(v) for v in start_pose_mm[:3]]
+    min_z_mm = max(
+        HOME_PLACE_MIN_Z_MM,
+        float(getattr(args, "tactile_release_descent_min_z_mm", HOME_PLACE_MIN_Z_MM)),
+    )
+    step_mm = max(
+        0.1,
+        float(getattr(args, "tactile_release_descent_step_mm", DEFAULT_TACTILE_RELEASE_DESCENT_STEP_MM)),
+    )
+    poll_dt = max(
+        0.0,
+        float(getattr(args, "tactile_release_descent_poll_dt_s", DEFAULT_TACTILE_RELEASE_DESCENT_POLL_DT_S)),
+    )
+    delta_threshold = max(
+        0.0,
+        float(getattr(args, "tactile_release_delta_threshold", DEFAULT_TACTILE_RELEASE_DELTA_THRESHOLD)),
+    )
+    current_z = max(start_z, min_z_mm)
+    descent_start = time.time()
+    tactile_manager.release_status = "release_descending"
+
+    print(
+        "[Tactile] Release descent start: "
+        f"start=({start_x:.1f}, {start_y:.1f}, {start_z:.1f}), "
+        f"min_z={min_z_mm:.1f}, step={step_mm:.1f}, "
+        f"delta_threshold={delta_threshold:.3f}."
+    )
+
+    def check_trigger():
+        current_norm = tactile_manager.total_norm()
+        delta_norm = tactile_manager.update_release_delta(current_norm)
+        print_tactile_frame_log(
+            tactile_manager,
+            stage="release_descent",
+            stage_time_s=time.time() - descent_start,
+            z_mm=f"{current_z:.1f}",
+        )
+        if delta_norm is not None and delta_norm > delta_threshold:
+            tactile_manager.release_status = "release_triggered"
+            print(
+                "[Tactile] Release trigger detected during descent: "
+                f"norm={current_norm:.3f}, ref={tactile_manager.release_reference_norm:.3f}, "
+                f"delta={delta_norm:.3f} > {delta_threshold:.3f}."
+            )
+            return True
+        return False
+
+    if check_trigger():
+        safe_stop_rtde(controller)
+        return {
+            "triggered": True,
+            "timed_out": False,
+            "reached_min_z": False,
+            "release_pose_mm": (start_x, start_y, current_z),
+        }
+
+    while current_z > min_z_mm + 1e-6:
+        next_z = max(min_z_mm, current_z - step_mm)
+        ok = move_robot_and_wait(
+            controller,
+            mm_to_m_tuple([start_x, start_y, next_z]),
+            fixed_orientation_base,
+            timeout_s=args.move_timeout_s,
+            tolerance_m=args.position_tolerance_m,
+            source_mode="tactile_release_descent",
+        )
+        current_z = next_z
+        if not ok:
+            tactile_manager.release_status = "release_descent_move_timeout"
+            safe_stop_rtde(controller)
+            print(
+                "[WARN] Tactile release descent move timed out; opening gripper at current target. "
+                f"z={current_z:.1f}."
+            )
+            return {
+                "triggered": False,
+                "timed_out": True,
+                "reached_min_z": False,
+                "release_pose_mm": (start_x, start_y, current_z),
+            }
+
+        if poll_dt > 0.0:
+            time.sleep(poll_dt)
+        if check_trigger():
+            safe_stop_rtde(controller)
+            return {
+                "triggered": True,
+                "timed_out": False,
+                "reached_min_z": False,
+                "release_pose_mm": (start_x, start_y, current_z),
+            }
+
+    tactile_manager.release_status = "release_min_z_open"
+    safe_stop_rtde(controller)
+    print(
+        "[Tactile] Release descent reached min z without trigger; opening gripper. "
+        f"z={current_z:.1f}, min_z={min_z_mm:.1f}."
+    )
+    return {
+        "triggered": False,
+        "timed_out": False,
+        "reached_min_z": True,
+        "release_pose_mm": (start_x, start_y, current_z),
+    }
+
+
+def reset_tactile_baseline_after_open(tactile_manager, delay_s):
+    if tactile_manager is None or not bool(getattr(tactile_manager, "enabled", False)):
+        return
+    delay_s = max(0.0, float(delay_s))
+    if delay_s <= 0.0:
+        return
+    tactile_manager.release_status = "baseline_reset_delay"
+    time.sleep(delay_s)
+    if tactile_manager.reset_baseline():
+        tactile_manager.release_status = "baseline_reset"
 
 
 def save_grasp_offset(controller, shared_state):
@@ -2173,7 +2888,7 @@ def compute_pre_release_descend_target_mm(place_x, place_y, place_z, args):
     }
 
 
-def execute_return_and_place(controller, shared_state, args, metadata_recorder=None):
+def execute_return_and_place(controller, shared_state, args, metadata_recorder=None, tactile_manager=None):
     """Run the post-grasp return, release, backoff, and HOME sequence."""
     target_eef_xyz, place_target_debug = compute_place_target(shared_state)
     if target_eef_xyz is None:
@@ -2186,6 +2901,8 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
     if fixed_orientation_base is None:
         print("[WARN] No fixed orientation.")
         return False
+
+    tactile_enabled = tactile_manager is not None and bool(getattr(tactile_manager, "enabled", False))
 
     target_x, target_y, target_z = target_eef_xyz
     target_x, target_y, target_z = clamp_pose_mm(target_x, target_y, target_z, args)
@@ -2223,13 +2940,19 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
         f"raw_place_z={raw_place_z_text} "
         f"fallback={place_target_debug['used_fallback']}"
     )
-    if pre_release_debug["enabled"]:
+    if pre_release_debug["enabled"] and not tactile_enabled:
         print(
             "[INFO] PRE-release descend target: "
             f"({release_x:.1f}, {release_y:.1f}, {release_z:.1f}), "
             f"descend={pre_release_debug['descend_mm']:.1f} mm, "
             f"unclamped_z={pre_release_debug['unclamped_z_mm']:.1f} mm, "
             f"home_guard_applied={pre_release_debug['home_guard_applied']}"
+        )
+    elif tactile_enabled:
+        print(
+            "[INFO] Tactile release descent enabled. "
+            f"Ignoring fixed pre-release descend distance={pre_release_debug['descend_mm']:.1f} mm; "
+            f"min_z={float(getattr(args, 'tactile_release_descent_min_z_mm', HOME_PLACE_MIN_Z_MM)):.1f} mm."
         )
 
     move_sequence = [
@@ -2249,7 +2972,20 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
             print(f"[WARN] Move timed out during {source_mode}.")
             return False
 
-    if pre_release_debug["enabled"]:
+    if tactile_enabled:
+        capture_tactile_release_reference(
+            tactile_manager,
+            delay_s=getattr(args, "tactile_release_ref_delay_s", DEFAULT_TACTILE_RELEASE_REF_DELAY_S),
+        )
+        descent_result = execute_tactile_release_descent(
+            controller,
+            tactile_manager,
+            fixed_orientation_base,
+            [place_x, place_y, place_z],
+            args,
+        )
+        release_x, release_y, release_z = descent_result["release_pose_mm"]
+    elif pre_release_debug["enabled"]:
         ok = move_robot_and_wait(
             controller,
             mm_to_m_tuple([release_x, release_y, release_z]),
@@ -2267,6 +3003,15 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
         dwell_s=args.gripper_release_dwell_s,
         metadata_recorder=metadata_recorder,
     )
+    if tactile_enabled:
+        reset_tactile_baseline_after_open(
+            tactile_manager,
+            getattr(
+                args,
+                "tactile_auto_baseline_reset_after_open_s",
+                DEFAULT_TACTILE_AUTO_BASELINE_RESET_AFTER_OPEN_S,
+            ),
+        )
 
     post_release_z = max(release_z + float(args.post_release_z_offset_mm), HOME_PLACE_MIN_Z_MM)
     post_release_x, post_release_y, post_release_z = clamp_pose_mm(release_x, release_y, post_release_z, args)
@@ -2697,6 +3442,24 @@ def draw_record_clock_overlay(image_bgr, elapsed_s):
     return image_bgr
 
 
+def draw_tactile_status_overlay(image_bgr, tactile_manager):
+    if tactile_manager is None or not bool(getattr(tactile_manager, "enabled", False)):
+        return image_bgr
+
+    norm_text = f"{float(getattr(tactile_manager, 'latest_norm', 0.0)):.1f}"
+    ref_norm = getattr(tactile_manager, "release_reference_norm", None)
+    ref_text = "-" if ref_norm is None else f"{float(ref_norm):.1f}"
+    delta_norm = getattr(tactile_manager, "release_delta_norm", None)
+    delta_text = "-" if delta_norm is None else f"{float(delta_norm):.1f}"
+    status = str(getattr(tactile_manager, "release_status", "off"))
+    text = f"Tactile norm={norm_text} ref={ref_text} d={delta_text} {status}"
+
+    origin = (12, 74)
+    cv.putText(image_bgr, text, origin, cv.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 0), 4, cv.LINE_AA)
+    cv.putText(image_bgr, text, origin, cv.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv.LINE_AA)
+    return image_bgr
+
+
 def render_cam0_perception_debug(
     snapshot,
     pipeline,
@@ -2707,6 +3470,7 @@ def render_cam0_perception_debug(
     display_grasp_point,
     shared_state,
     record_elapsed_s=None,
+    tactile_manager=None,
 ):
     """Render the main cam0 preview with mask, object cloud, hand, grasp, and HOME."""
     image_bgr = np.asarray(snapshot.cam0.color_image).copy()
@@ -2762,6 +3526,7 @@ def render_cam0_perception_debug(
         cv.putText(image_bgr, "HOME", (home_pixel[0] + 10, home_pixel[1] - 10), cv.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 1, cv.LINE_AA)
 
     image_bgr = draw_record_clock_overlay(image_bgr, record_elapsed_s)
+    image_bgr = draw_tactile_status_overlay(image_bgr, tactile_manager)
     return image_bgr
 
 
@@ -2776,6 +3541,9 @@ def main():
 
     pipeline = build_dual_perception_pipeline(args)
     sensor_hub = pipeline["sensor_hub"]
+    tactile_manager = AnySkinTactileManager(args) if bool(getattr(args, "tactile_enabled", False)) else None
+    if tactile_manager is not None:
+        tactile_manager.start()
     sensor_hub.start()
 
     model_label = args.model if not pipeline["prompt_classes"] else f"{args.model} ({','.join(pipeline['prompt_classes'])})"
@@ -3010,18 +3778,24 @@ def main():
                     print("[INFO] DIRECT GRASP trigger")
                     shared_state.stop_follow()
                     if stop_follow_for_handoff(shared_state, args.follow_handoff_timeout_s):
-                        configure_gripper_position_threshold_from_geometry(
-                            controller,
-                            shape_fitting_state.fitted_points_base,
-                            grasp_point_base,
-                            object_label=shape_fitting_state.label,
-                            template_axes_base=getattr(shape_fitting_state, "template_axes_base", None),
-                        )
+                        if tactile_manager is not None and bool(getattr(tactile_manager, "enabled", False)):
+                            reset_gripper_position_threshold_to_config_default(controller)
+                        else:
+                            configure_gripper_position_threshold_from_geometry(
+                                controller,
+                                shape_fitting_state.fitted_points_base,
+                                grasp_point_base,
+                                object_label=shape_fitting_state.label,
+                                template_axes_base=getattr(shape_fitting_state, "template_axes_base", None),
+                            )
                         grasp_ok = execute_gripper_close(
                             controller,
                             timeout_s=args.gripper_close_timeout_s,
                             verbose=True,
                             metadata_recorder=metadata_recorder,
+                            tactile_manager=tactile_manager,
+                            tactile_contact_threshold=args.tactile_contact_norm_threshold,
+                            tactile_extra_grasp_pos=args.tactile_extra_grasp_pos,
                         )
                         print(f"[INFO] grasp_ok = {grasp_ok}")
                         if grasp_ok:
@@ -3031,6 +3805,7 @@ def main():
                                 shared_state,
                                 args,
                                 metadata_recorder=metadata_recorder,
+                                tactile_manager=tactile_manager,
                             )
             else:
                 shared_state.clear_target(reset_prediction=False, reset_arm=False)
@@ -3042,6 +3817,8 @@ def main():
             record_elapsed_s = None if task_record_start_perf is None else max(now - task_record_start_perf, 0.0)
 
             with runtime_profiler.stage("render"):
+                if tactile_manager is not None:
+                    tactile_manager.total_norm()
                 annotated = render_cam0_perception_debug(
                     snapshot,
                     pipeline,
@@ -3052,6 +3829,7 @@ def main():
                     grasp_point_base,
                     shared_state,
                     record_elapsed_s=record_elapsed_s,
+                    tactile_manager=tactile_manager,
                 )
                 cam1_preview = render_camera_mask_preview(
                     snapshot,
@@ -3104,6 +3882,7 @@ def main():
                         metadata_recorder=metadata_recorder,
                         pipeline=pipeline,
                         video_recorder=video_recorder,
+                        tactile_manager=tactile_manager,
                     )
                     if reset_task_start_perf is not None:
                         task_record_start_perf = reset_task_start_perf
@@ -3132,6 +3911,7 @@ def main():
                         metadata_recorder=metadata_recorder,
                         pipeline=pipeline,
                         video_recorder=video_recorder,
+                        tactile_manager=tactile_manager,
                     )
                     if reset_task_start_perf is not None:
                         task_record_start_perf = reset_task_start_perf
@@ -3165,6 +3945,8 @@ def main():
             control_thread.join(timeout=1.0)
         safe_stop_rtde(controller)
         disconnect_rtde(controller)
+        if tactile_manager is not None:
+            tactile_manager.close()
         try:
             pipeline["hand_worker_cam0"].close()
         finally:

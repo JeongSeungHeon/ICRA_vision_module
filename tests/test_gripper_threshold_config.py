@@ -2,8 +2,10 @@ import contextlib
 import importlib
 import io
 import sys
+import threading
 import types
 import unittest
+import unittest.mock
 from types import SimpleNamespace
 
 import numpy as np
@@ -78,12 +80,19 @@ _MODULE = importlib.import_module("robot_control_rtde_fitting_final")
 configure_gripper_position_threshold_from_geometry = _MODULE.configure_gripper_position_threshold_from_geometry
 compute_pre_release_descend_target_mm = _MODULE.compute_pre_release_descend_target_mm
 execute_gripper_close = _MODULE.execute_gripper_close
+execute_return_and_place = _MODULE.execute_return_and_place
+execute_tactile_release_descent = _MODULE.execute_tactile_release_descent
 estimate_gripper_template_width_cm = _MODULE.estimate_gripper_template_width_cm
+AnySkinTactileManager = _MODULE.AnySkinTactileManager
 HOME_PLACE_MIN_Z_MM = _MODULE.HOME_PLACE_MIN_Z_MM
 PRE_RELEASE_MIN_Z_EPSILON_MM = _MODULE.PRE_RELEASE_MIN_Z_EPSILON_MM
 RELEASE_PARAMETER_MM = _MODULE.RELEASE_PARAMETER_MM
+apply_config_defaults = _MODULE.apply_config_defaults
+wait_for_tactile_release_trigger = _MODULE.wait_for_tactile_release_trigger
 resolve_gripper_position_stall_detection_config = _MODULE.resolve_gripper_position_stall_detection_config
 resolve_gripper_position_threshold_from_geometry = _MODULE.resolve_gripper_position_threshold_from_geometry
+reset_gripper_position_threshold_to_config_default = _MODULE.reset_gripper_position_threshold_to_config_default
+reset_tactile_state_for_system_reset = _MODULE.reset_tactile_state_for_system_reset
 sys.modules.pop("robot_control_rtde_fitting_final", None)
 
 for _name, _original in _STUBS:
@@ -225,6 +234,102 @@ class DummyCloseController:
         self.stop_count += 1
 
 
+class DummyTactile:
+    enabled = True
+
+    def __init__(self, norms):
+        self._norms = list(norms)
+        self.num_mags = 5
+        self.latest = np.ones((15,), dtype=np.float32)
+        self.latest_norm = 0.0
+        self.release_reference_norm = None
+        self.release_delta_norm = None
+        self.release_status = "off"
+        self.last_error = None
+        self.reset_count = 0
+
+    def total_norm(self):
+        if self._norms:
+            self.latest_norm = float(self._norms.pop(0))
+        return self.latest_norm
+
+    def set_release_reference(self, reference_norm):
+        self.release_reference_norm = None if reference_norm is None else float(reference_norm)
+        self.release_status = "armed"
+
+    def update_release_delta(self, current_norm):
+        self.release_delta_norm = abs(float(current_norm) - float(self.release_reference_norm))
+        return self.release_delta_norm
+
+    def reset_baseline(self):
+        self.reset_count += 1
+        self.latest = np.zeros((15,), dtype=np.float32)
+        self.latest_norm = 0.0
+        return True
+
+
+class DummySharedStateForPlace:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.home_object_xyz_mm = np.asarray([100.0, 100.0, 100.0], dtype=np.float32)
+        self.grasp_offset_xyz_mm = None
+        self.frozen_place_z_mm = None
+        self.frozen_place_z_raw_mm = None
+        self.frozen_place_z_grasp_median_mm = None
+        self.frozen_place_z_template_bottom_median_mm = None
+        self.task_state = None
+
+    def get_snapshot(self):
+        return {
+            "fixed_orientation_base": (0.0, 0.0, 0.0),
+            "initial_pose_base": None,
+        }
+
+    def set_task_state(self, task_state, *, reset_prediction=False, reset_arm=False):
+        del reset_prediction, reset_arm
+        self.task_state = task_state
+
+
+def config_args():
+    return SimpleNamespace(
+        robot_ip=None,
+        control_hz=None,
+        follow_z=None,
+        pre_release_descend_before_open=None,
+        pre_release_descend_m=None,
+        workspace_x=None,
+        workspace_y=None,
+        workspace_z=None,
+        fdct_depth_enabled=None,
+        fdct_cameras=None,
+        fdct_checkpoint=None,
+        fdct_device=None,
+        fdct_debug_stats=False,
+    )
+
+
+def place_args(*, tactile_enabled=False, pre_release_enabled=True, pre_release_descend_mm=20.0):
+    return SimpleNamespace(
+        tactile_enabled=tactile_enabled,
+        tactile_release_ref_delay_s=0.0,
+        tactile_release_delta_threshold=5.0,
+        tactile_release_timeout_s=0.0,
+        tactile_release_descent_min_z_mm=45.0,
+        tactile_release_descent_step_mm=2.0,
+        tactile_release_descent_poll_dt_s=0.0,
+        tactile_auto_baseline_reset_after_open_s=0.0,
+        pre_release_descend_before_open=pre_release_enabled,
+        pre_release_descend_mm=pre_release_descend_mm,
+        post_release_z_offset_mm=0.0,
+        workspace_x=[-1000.0, 1000.0],
+        workspace_y=[-1000.0, 1000.0],
+        workspace_z=[0.0, 800.0],
+        move_timeout_s=1.0,
+        position_tolerance_m=0.0,
+        gripper_release_dwell_s=0.0,
+    )
+
+
 class GripperThresholdConfigTests(unittest.TestCase):
     def test_pre_release_descend_disabled_keeps_place_z(self):
         target, debug = compute_pre_release_descend_target_mm(10.0, 20.0, 100.0, release_args())
@@ -233,14 +338,15 @@ class GripperThresholdConfigTests(unittest.TestCase):
         self.assertFalse(debug["enabled"])
 
     def test_pre_release_descend_enabled_subtracts_configured_distance(self):
+        descend_mm = 10.0
         target, debug = compute_pre_release_descend_target_mm(
             10.0,
             20.0,
             100.0,
-            release_args(enabled=True, descend_mm=RELEASE_PARAMETER_MM),
+            release_args(enabled=True, descend_mm=descend_mm),
         )
 
-        self.assertEqual(target, (10.0, 20.0, 90.0))
+        self.assertEqual(target, (10.0, 20.0, 100.0 - descend_mm))
         self.assertTrue(debug["enabled"])
         self.assertFalse(debug["home_guard_applied"])
 
@@ -387,6 +493,16 @@ class GripperThresholdConfigTests(unittest.TestCase):
         self.assertEqual(resolved, 40)
         self.assertEqual(controller.gripper_position_complete_threshold, 40)
 
+    def test_tactile_static_threshold_reset_ignores_template_geometry(self):
+        controller = DummyController()
+        controller.gripper_position_complete_threshold = 111
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            resolved = reset_gripper_position_threshold_to_config_default(controller)
+
+        self.assertEqual(resolved, 40)
+        self.assertEqual(controller.gripper_position_complete_threshold, 40)
+
 
 class GripperCloseStallFallbackTests(unittest.TestCase):
     def test_stall_fallback_accepts_three_stable_position_reads_below_threshold(self):
@@ -449,6 +565,325 @@ class GripperCloseStallFallbackTests(unittest.TestCase):
         self.assertEqual(resolved["stable_reads_required"], 1)
         self.assertEqual(resolved["tolerance"], 0)
         self.assertEqual(resolved["min_elapsed_s"], 0.0)
+
+
+class TactileConfigAndBehaviorTests(unittest.TestCase):
+    def test_tactile_config_defaults_are_read_from_yaml(self):
+        args = config_args()
+        config = {
+            "robot": {
+                "tactile": {
+                    "enabled": True,
+                    "port": "/dev/ttyUSB9",
+                    "num_mags": 7,
+                    "baseline_samples": 3,
+                    "startup_delay_s": 0.2,
+                    "contact_norm_threshold": 12.5,
+                    "extra_grasp_pos": 6,
+                    "release_delta_threshold": 4.5,
+                    "release_ref_delay_s": 0.1,
+                    "release_timeout_s": 0.7,
+                    "release_descent_min_z_mm": 45.0,
+                    "release_descent_step_mm": 3.0,
+                    "release_descent_poll_dt_s": 0.02,
+                    "auto_baseline_reset_after_open_s": 0.0,
+                    "debug": False,
+                }
+            }
+        }
+
+        resolved = apply_config_defaults(args, config)
+
+        self.assertTrue(resolved.tactile_enabled)
+        self.assertEqual(resolved.tactile_port, "/dev/ttyUSB9")
+        self.assertEqual(resolved.tactile_num_mags, 7)
+        self.assertEqual(resolved.tactile_baseline_samples, 3)
+        self.assertAlmostEqual(resolved.tactile_contact_norm_threshold, 12.5)
+        self.assertEqual(resolved.tactile_extra_grasp_pos, 6)
+        self.assertAlmostEqual(resolved.tactile_release_delta_threshold, 4.5)
+        self.assertAlmostEqual(resolved.tactile_release_descent_min_z_mm, 45.0)
+        self.assertAlmostEqual(resolved.tactile_release_descent_step_mm, 3.0)
+        self.assertAlmostEqual(resolved.tactile_release_descent_poll_dt_s, 0.02)
+        self.assertFalse(resolved.tactile_debug)
+
+    def test_system_reset_clears_tactile_reference_delta_and_latest(self):
+        tactile = DummyTactile([10.0])
+        tactile.latest = np.ones((15,), dtype=np.float32) * 3.0
+        tactile.latest_norm = 123.0
+        tactile.release_reference_norm = 99.0
+        tactile.release_delta_norm = 55.0
+        tactile.release_status = "release_triggered"
+        tactile.last_error = "old error"
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            baseline_reset = reset_tactile_state_for_system_reset(tactile)
+
+        self.assertTrue(baseline_reset)
+        self.assertEqual(tactile.reset_count, 1)
+        self.assertIsNone(tactile.release_reference_norm)
+        self.assertIsNone(tactile.release_delta_norm)
+        self.assertEqual(tactile.release_status, "reset_ready")
+        self.assertEqual(tactile.latest_norm, 0.0)
+        self.assertIsNone(tactile.last_error)
+        np.testing.assert_allclose(tactile.latest, np.zeros((15,), dtype=np.float32))
+
+    def test_tactile_disabled_preserves_existing_close_stall_fallback(self):
+        controller = DummyCloseController([10, 20, 25, 25, 25], threshold=40)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = execute_gripper_close(
+                controller,
+                timeout_s=0.1,
+                poll_dt=0.0,
+                verbose=False,
+                tactile_manager=None,
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(controller.stop_count, 1)
+
+    def test_tactile_contact_waits_for_extra_close_target(self):
+        controller = DummyCloseController([10, 20, 25, 30], threshold=40)
+        tactile = DummyTactile([0.0, 31.0, 31.0, 31.0])
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = execute_gripper_close(
+                controller,
+                timeout_s=0.1,
+                poll_dt=0.0,
+                verbose=False,
+                tactile_manager=tactile,
+                tactile_contact_threshold=30.0,
+                tactile_extra_grasp_pos=10,
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(controller.stop_count, 1)
+        self.assertEqual(tactile.release_status, "close_done")
+
+    def test_tactile_contact_without_position_stops_immediately(self):
+        controller = DummyCloseController([], threshold=40)
+        tactile = DummyTactile([31.0])
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = execute_gripper_close(
+                controller,
+                timeout_s=0.1,
+                poll_dt=0.0,
+                verbose=False,
+                tactile_manager=tactile,
+                tactile_contact_threshold=30.0,
+                tactile_extra_grasp_pos=10,
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(controller.stop_count, 1)
+        self.assertEqual(tactile.release_status, "close_tactile_stop")
+
+    def test_tactile_release_triggers_on_delta(self):
+        tactile = DummyTactile([10.0, 25.0])
+        tactile.set_release_reference(10.0)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = wait_for_tactile_release_trigger(
+                tactile,
+                delta_threshold=5.0,
+                timeout_s=0.1,
+                poll_dt=0.0,
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(tactile.release_status, "release_triggered")
+        self.assertAlmostEqual(tactile.release_delta_norm, 15.0)
+
+    def test_tactile_release_times_out(self):
+        tactile = DummyTactile([10.0, 12.0, 12.0])
+        tactile.set_release_reference(10.0)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = wait_for_tactile_release_trigger(
+                tactile,
+                delta_threshold=5.0,
+                timeout_s=0.0,
+                poll_dt=0.0,
+            )
+
+        self.assertFalse(result)
+        self.assertEqual(tactile.release_status, "release_timeout")
+
+    def test_tactile_release_descent_triggers_and_stops(self):
+        tactile = DummyTactile([10.0, 20.0])
+        tactile.set_release_reference(10.0)
+        targets_mm = []
+
+        def fake_move(controller, target_position_base, fixed_orientation_base, *, timeout_s, tolerance_m, source_mode):
+            del controller, fixed_orientation_base, timeout_s, tolerance_m, source_mode
+            targets_mm.append(tuple(np.asarray(target_position_base, dtype=np.float32) * 1000.0))
+            return True
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            with unittest.mock.patch.object(_MODULE, "move_robot_and_wait", side_effect=fake_move):
+                with unittest.mock.patch.object(_MODULE, "safe_stop_rtde") as safe_stop:
+                    result = execute_tactile_release_descent(
+                        SimpleNamespace(),
+                        tactile,
+                        (0.0, 0.0, 0.0),
+                        (100.0, 100.0, 50.0),
+                        place_args(tactile_enabled=True),
+                    )
+
+        self.assertTrue(result["triggered"])
+        self.assertFalse(result["reached_min_z"])
+        self.assertAlmostEqual(result["release_pose_mm"][2], 48.0)
+        self.assertEqual(len(targets_mm), 1)
+        safe_stop.assert_called()
+
+    def test_tactile_release_descent_stops_at_min_z_without_trigger(self):
+        tactile = DummyTactile([10.0, 11.0, 11.0, 11.0, 11.0])
+        tactile.set_release_reference(10.0)
+        targets_mm = []
+
+        def fake_move(controller, target_position_base, fixed_orientation_base, *, timeout_s, tolerance_m, source_mode):
+            del controller, fixed_orientation_base, timeout_s, tolerance_m, source_mode
+            targets_mm.append(tuple(np.asarray(target_position_base, dtype=np.float32) * 1000.0))
+            return True
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            with unittest.mock.patch.object(_MODULE, "move_robot_and_wait", side_effect=fake_move):
+                with unittest.mock.patch.object(_MODULE, "safe_stop_rtde") as safe_stop:
+                    result = execute_tactile_release_descent(
+                        SimpleNamespace(),
+                        tactile,
+                        (0.0, 0.0, 0.0),
+                        (100.0, 100.0, 50.0),
+                        place_args(tactile_enabled=True),
+                    )
+
+        self.assertFalse(result["triggered"])
+        self.assertTrue(result["reached_min_z"])
+        self.assertAlmostEqual(result["release_pose_mm"][2], 45.0)
+        self.assertEqual([round(target[2], 3) for target in targets_mm], [48.0, 46.0, 45.0])
+        safe_stop.assert_called()
+
+    def test_return_place_non_tactile_uses_fixed_pre_release_move(self):
+        shared_state = DummySharedStateForPlace()
+        sources = []
+
+        def fake_move(controller, target_position_base, fixed_orientation_base, *, timeout_s, tolerance_m, source_mode):
+            del controller, target_position_base, fixed_orientation_base, timeout_s, tolerance_m
+            sources.append(source_mode)
+            return True
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            with unittest.mock.patch.object(_MODULE, "move_robot_and_wait", side_effect=fake_move):
+                with unittest.mock.patch.object(_MODULE, "execute_gripper_open", return_value=True):
+                    with unittest.mock.patch.object(_MODULE, "get_base_pose_target", return_value=(None, None)):
+                        ok = execute_return_and_place(
+                            SimpleNamespace(),
+                            shared_state,
+                            place_args(tactile_enabled=False, pre_release_enabled=True),
+                        )
+
+        self.assertTrue(ok)
+        self.assertIn("pre_release_descend_before_open", sources)
+
+    def test_return_place_tactile_ignores_fixed_pre_release_move(self):
+        shared_state = DummySharedStateForPlace()
+        tactile = DummyTactile([77.0])
+        sources = []
+        refs_during_moves = []
+
+        def fake_move(controller, target_position_base, fixed_orientation_base, *, timeout_s, tolerance_m, source_mode):
+            del controller, target_position_base, fixed_orientation_base, timeout_s, tolerance_m
+            sources.append(source_mode)
+            if source_mode in ("return_hover", "return_place"):
+                refs_during_moves.append(tactile.release_reference_norm)
+            return True
+
+        def fake_descent(controller, tactile_manager, fixed_orientation_base, start_pose_mm, args):
+            del controller, fixed_orientation_base, start_pose_mm, args
+            self.assertIs(tactile_manager, tactile)
+            self.assertEqual(tactile_manager.release_reference_norm, 77.0)
+            return {
+                "triggered": False,
+                "timed_out": False,
+                "reached_min_z": True,
+                "release_pose_mm": (100.0, 97.0, 45.0),
+            }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            with unittest.mock.patch.object(_MODULE, "move_robot_and_wait", side_effect=fake_move):
+                with unittest.mock.patch.object(_MODULE, "execute_tactile_release_descent", side_effect=fake_descent) as descent:
+                    with unittest.mock.patch.object(_MODULE, "execute_gripper_open", return_value=True):
+                        with unittest.mock.patch.object(_MODULE, "get_base_pose_target", return_value=(None, None)):
+                            ok = execute_return_and_place(
+                                SimpleNamespace(),
+                                shared_state,
+                                place_args(
+                                    tactile_enabled=True,
+                                    pre_release_enabled=True,
+                                    pre_release_descend_mm=500.0,
+                                ),
+                                tactile_manager=tactile,
+                            )
+
+        self.assertTrue(ok)
+        self.assertNotIn("pre_release_descend_before_open", sources)
+        self.assertEqual(refs_during_moves, [None, None])
+        self.assertEqual(tactile.release_reference_norm, 77.0)
+        descent.assert_called_once()
+
+    def test_return_place_tactile_move_failure_does_not_capture_release_reference(self):
+        shared_state = DummySharedStateForPlace()
+        tactile = DummyTactile([77.0])
+        sources = []
+
+        def fake_move(controller, target_position_base, fixed_orientation_base, *, timeout_s, tolerance_m, source_mode):
+            del controller, target_position_base, fixed_orientation_base, timeout_s, tolerance_m
+            sources.append(source_mode)
+            return source_mode != "return_place"
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            with unittest.mock.patch.object(_MODULE, "move_robot_and_wait", side_effect=fake_move):
+                with unittest.mock.patch.object(_MODULE, "execute_tactile_release_descent") as descent:
+                    with unittest.mock.patch.object(_MODULE, "execute_gripper_open") as gripper_open:
+                        with unittest.mock.patch.object(_MODULE, "get_base_pose_target", return_value=(None, None)):
+                            ok = execute_return_and_place(
+                                SimpleNamespace(),
+                                shared_state,
+                                place_args(tactile_enabled=True),
+                                tactile_manager=tactile,
+                            )
+
+        self.assertFalse(ok)
+        self.assertEqual(sources, ["return_hover", "return_place"])
+        self.assertIsNone(tactile.release_reference_norm)
+        descent.assert_not_called()
+        gripper_open.assert_not_called()
+
+    def test_anyskin_import_failure_only_fatal_when_enabled(self):
+        disabled = AnySkinTactileManager(SimpleNamespace(tactile_enabled=False))
+        disabled.start()
+        self.assertEqual(disabled.status, "disabled")
+
+        original_import = __import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "anyskin":
+                raise ImportError("missing anyskin")
+            return original_import(name, *args, **kwargs)
+
+        enabled_args = SimpleNamespace(
+            tactile_enabled=True,
+            tactile_port="/dev/null",
+            tactile_num_mags=5,
+            tactile_baseline_samples=5,
+            tactile_startup_delay_s=0.0,
+            tactile_debug=False,
+        )
+        with unittest.mock.patch("builtins.__import__", side_effect=fake_import):
+            with self.assertRaises(RuntimeError):
+                AnySkinTactileManager(enabled_args).start()
 
 
 if __name__ == "__main__":

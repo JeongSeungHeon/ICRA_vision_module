@@ -433,6 +433,38 @@ robot:
     # gripper release 후 x backoff 전에 robot base +Z 방향으로 올릴 거리입니다.
     post_release_z_offset_m: -0.03
 
+  tactile:
+    # true이면 AnySkin tactile reader를 시작하고 grasp/release 판단에 사용합니다.
+    enabled: true
+    # AnySkin serial port입니다.
+    port: /dev/ttyACM0
+    # AnySkin magnetometer 개수입니다.
+    num_mags: 5
+    # baseline 계산에 사용할 초기 sample 수입니다.
+    baseline_samples: 5
+    # stream 시작 후 baseline reset 전 대기 시간입니다.
+    startup_delay_s: 1.0
+    # baseline-subtracted tactile total norm이 이 값 이상이면 contact로 봅니다.
+    contact_norm_threshold: 30.0
+    # tactile contact position에서 gripper를 추가로 닫을 Robotiq position count입니다.
+    extra_grasp_pos: 10
+    # place/release 위치에서 held reference 대비 이 delta 이상이면 release timing으로 봅니다.
+    release_delta_threshold: 30
+    # grasp 성공 후 held tactile reference를 잡기 전 대기 시간입니다.
+    release_ref_delay_s: 0.3
+    # 고정 위치 release trigger 대기용 timeout입니다. tactile continuous descent에서는 min_z가 fallback 한계입니다.
+    release_timeout_s: 1.0
+    # tactile release descent에서 허용할 최소 robot base Z입니다.
+    release_descent_min_z_mm: 45.0
+    # tactile release descent 중 한 번에 내릴 Z step입니다.
+    release_descent_step_mm: 2.0
+    # tactile release descent 중 step 사이 tactile 확인 주기입니다.
+    release_descent_poll_dt_s: 0.03
+    # gripper open 후 tactile baseline을 다시 잡기 전 대기 시간입니다. 0이면 비활성입니다.
+    auto_baseline_reset_after_open_s: 1.5
+    # tactile debug log 출력 여부입니다.
+    debug: true
+
   live_follow:
     # robot_control_loop servo 주기입니다. 실행 인자 --control-hz가 있으면 override됩니다.
     control_hz: 30.0
@@ -495,7 +527,7 @@ robot:
     # gripper close force입니다.
     close_force: 255
     # close 중 gripper position이 이 값 이상이면 완료로 봅니다.
-    position_complete_threshold: 40
+    position_complete_threshold: 200
     position_stall_detection:
       # true이면 close 중 gripper position이 충분히 오래 거의 변하지 않을 때 완료로 봅니다.
       enabled: true
