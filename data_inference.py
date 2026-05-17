@@ -85,6 +85,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-image", action="store_true", help="Copy raw color/depth frames into the output .npz.")
     parser.add_argument("--debug-3d-max-object-points", type=int, default=8000)
     parser.add_argument("--debug-3d-max-template-points", type=int, default=8000)
+    parser.add_argument(
+        "--no-debug-3d-template-axes",
+        dest="debug_3d_template_axes",
+        action="store_false",
+        help="Do not store fitted template local x/y/z axes in replayed 3D debug recordings.",
+    )
+    parser.set_defaults(debug_3d_template_axes=True)
     parser.add_argument("--continue-on-error", action="store_true", help="Skip failed recordings when input is a directory.")
     return parser.parse_args()
 
@@ -316,6 +323,7 @@ def run_replay(input_path: str | Path, args: argparse.Namespace) -> OfflineRepla
         save_images=bool(args.save_image),
         max_object_points=args.debug_3d_max_object_points,
         max_template_points=args.debug_3d_max_template_points,
+        record_template_axes=bool(args.debug_3d_template_axes),
     )
 
     previous_hand_approach = False

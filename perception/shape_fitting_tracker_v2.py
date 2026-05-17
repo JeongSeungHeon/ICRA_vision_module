@@ -410,6 +410,8 @@ class ShapeFittingState:
     scale: float | None
     scale_xyz: tuple[float, float, float] | None
     scale_mode: str
+    template_axes_base: tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]] | None
+    z_rotation_deg: float | None
     bowl_height_fraction: float | None
     initialized: bool
     reason: str
@@ -519,6 +521,8 @@ class ShapeFittingTracker:
             scale=None,
             scale_xyz=None,
             scale_mode=SCALE_MODE_UNIFORM,
+            template_axes_base=None,
+            z_rotation_deg=None,
             bowl_height_fraction=None,
             initialized=False,
             reason="uninitialized",
@@ -1033,6 +1037,32 @@ class ShapeFittingTracker:
             return self._normalize_scale_mode(self._frozen_scale_mode)
         return self._scale_mode_for_template(self._active_template)
 
+    def _template_axes_base(self) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]] | None:
+        if not self._initialized:
+            return None
+
+        basis = (
+            np.eye(3, dtype=np.float64)
+            if self._frozen_scale_basis is None
+            else np.asarray(self._frozen_scale_basis, dtype=np.float64).reshape((3, 3))
+        )
+        scale = (
+            np.ones((3,), dtype=np.float64)
+            if self._frozen_scale_xyz is None
+            else np.asarray(self._frozen_scale_xyz, dtype=np.float64).reshape(3)
+        )
+        rotation = np.asarray(self._frozen_rotation, dtype=np.float64).reshape((3, 3))
+        canonical_axes = np.eye(3, dtype=np.float64)
+        axes_base: list[tuple[float, float, float]] = []
+        for axis in canonical_axes:
+            axis_base = ((axis @ basis) * scale) @ basis.T @ rotation.T
+            norm = float(np.linalg.norm(axis_base))
+            if not np.isfinite(norm) or norm <= 1e-9:
+                return None
+            axis_base = axis_base / norm
+            axes_base.append(tuple(float(v) for v in axis_base))
+        return tuple(axes_base)  # type: ignore[return-value]
+
     def _resolve_template(self, label: str | None) -> ShapeTemplateModel | None:
         if not label:
             return None
@@ -1147,6 +1177,8 @@ class ShapeFittingTracker:
             scale=None if self._frozen_scale is None else float(self._frozen_scale),
             scale_xyz=scale_xyz,
             scale_mode=self._scale_mode_for_template(template),
+            template_axes_base=self._template_axes_base() if valid and template is not None else None,
+            z_rotation_deg=None if self._frozen_z_rotation_deg is None else float(self._frozen_z_rotation_deg),
             bowl_height_fraction=None if template is None else template.bowl_height_fraction,
             initialized=bool(self._initialized),
             reason=str(reason),

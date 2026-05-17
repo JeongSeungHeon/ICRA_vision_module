@@ -71,10 +71,19 @@ def format_instance_summary(instances, max_items=4):
     return "detections: " + ", ".join(summary_parts[:max_items])
 
 
-def select_instances(instances, mode="all_instances", class_names=None):
+def select_instances(instances, mode="all_instances", class_names=None, prefer_wine_glass_over_cup=False):
     if class_names:
         class_name_set = set(class_names)
         instances = [instance for instance in instances if instance.class_name in class_name_set]
+
+    if prefer_wine_glass_over_cup:
+        class_names_present = {str(instance.class_name).strip().lower() for instance in instances}
+        if "cup" in class_names_present and "wine glass" in class_names_present:
+            instances = [
+                instance
+                for instance in instances
+                if str(instance.class_name).strip().lower() == "wine glass"
+            ]
 
     if mode == "all_instances":
         return list(instances)

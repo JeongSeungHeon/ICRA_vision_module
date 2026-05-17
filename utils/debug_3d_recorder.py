@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 IMAGE_ARRAY_KEYS = (
     "cam0_color_image",
     "cam0_depth_image_m",
@@ -173,6 +173,7 @@ class Debug3DRecorder:
     save_images: bool = False
     max_object_points: int = 8000
     max_template_points: int = 8000
+    record_template_axes: bool = False
     frames: list[dict[str, Any]] = field(default_factory=list)
     session_index: int = 0
     _image_spool_dir: Path | None = field(default=None, init=False, repr=False)
@@ -237,68 +238,69 @@ class Debug3DRecorder:
             max_points=self.max_template_points,
         )
 
-        self.frames.append(
-            {
-                "frame_index": int(frame_index),
-                "timestamp_unix_s": float(timestamp_unix_s),
-                "timestamp_perf_s": float(timestamp_perf_s),
-                "record_elapsed_s": np.nan if record_elapsed_s is None else float(record_elapsed_s),
-                "record_clock_text": format_record_clock(record_elapsed_s),
-                "task_epoch": int(task_epoch),
-                "measurement_source": str(measurement_source or "none"),
-                "object_label": _none_if_missing(getattr(raw_merged_object, "label", None)),
-                "object_valid": bool(getattr(raw_merged_object, "valid", False)),
-                "object_point_count": int(getattr(raw_merged_object, "merged_point_count", len(raw_points))),
-                "object_points_base": raw_points,
-                "object_centroid_base": _vec(getattr(raw_merged_object, "centroid_base", None), 3),
-                "fitted_label": _none_if_missing(getattr(shape_fitting_state, "label", None)),
-                "template_id": _none_if_missing(getattr(shape_fitting_state, "template_id", None)),
-                "shape_fitting_valid": bool(getattr(shape_fitting_state, "valid", False)),
-                "shape_fitting_initialized": bool(getattr(shape_fitting_state, "initialized", False)),
-                "shape_fitting_reason": str(getattr(shape_fitting_state, "reason", "none")),
-                "shape_fitting_scale": np.nan
-                if getattr(shape_fitting_state, "scale", None) is None
-                else float(getattr(shape_fitting_state, "scale")),
-                "shape_fitting_scale_x": _vec(getattr(shape_fitting_state, "scale_xyz", None), 3)[0],
-                "shape_fitting_scale_y": _vec(getattr(shape_fitting_state, "scale_xyz", None), 3)[1],
-                "shape_fitting_scale_z": _vec(getattr(shape_fitting_state, "scale_xyz", None), 3)[2],
-                "shape_fitting_scale_mode": str(getattr(shape_fitting_state, "scale_mode", "uniform")),
-                "template_points_base": fitted_points,
-                "template_centroid_base": _vec(getattr(shape_fitting_state, "centroid_base", None), 3),
-                "cam0_hand_points_base": _hand_debug_points(hand_debug_cam0),
-                "cam0_hand_valid_mask": _hand_debug_mask(hand_debug_cam0),
-                "cam0_palm_rotation_base": _hand_debug_rotation(hand_debug_cam0),
-                "cam0_hand_detected": _hand_debug_detected(hand_debug_cam0),
-                "cam0_hand_valid_count": _hand_debug_valid_count(hand_debug_cam0),
-                "cam0_hand_confidence": _hand_debug_confidence(hand_debug_cam0),
-                "cam0_hand_reason": _hand_debug_reason(hand_debug_cam0),
-                "cam1_hand_points_base": _hand_debug_points(hand_debug_cam1),
-                "cam1_hand_valid_mask": _hand_debug_mask(hand_debug_cam1),
-                "cam1_palm_rotation_base": _hand_debug_rotation(hand_debug_cam1),
-                "cam1_hand_detected": _hand_debug_detected(hand_debug_cam1),
-                "cam1_hand_valid_count": _hand_debug_valid_count(hand_debug_cam1),
-                "cam1_hand_confidence": _hand_debug_confidence(hand_debug_cam1),
-                "cam1_hand_reason": _hand_debug_reason(hand_debug_cam1),
-                "selected_hand_valid": bool(getattr(selected_hand, "valid", False)),
-                "selected_hand_camera": -1
-                if getattr(selected_hand, "selected_camera", None) is None
-                else int(getattr(selected_hand, "selected_camera")),
-                "selected_handedness": _none_if_missing(getattr(selected_hand, "handedness", None)),
-                "selected_palm_center_base": _vec(getattr(selected_hand, "palm_center_base", None), 3),
-                "selected_palm_normal_base": _vec(getattr(selected_hand, "palm_normal_base", None), 3),
-                "selected_wrist_base": _vec(getattr(selected_hand, "wrist_base", None), 3),
-                "selected_hand_confidence": float(getattr(selected_hand, "confidence", np.nan)),
-                "hand_selection_reason": str(_selector_field(hand_selector_debug, "selection_reason", "")),
-                "hand_selector_cam0_reject_reason": str(_selector_field(hand_selector_debug, "cam0_reject_reason", "")),
-                "hand_selector_cam1_reject_reason": str(_selector_field(hand_selector_debug, "cam1_reject_reason", "")),
-                "hand_selector_chosen_camera": -1
-                if _selector_field(hand_selector_debug, "chosen_camera", None) is None
-                else int(_selector_field(hand_selector_debug, "chosen_camera")),
-                "eef_pose_base": _vec(eef_pose_base, 6),
-                "object_point_base": _vec(object_point_base, 3),
-                "grasp_point_base": _vec(grasp_point_base, 3),
-            }
-        )
+        frame = {
+            "frame_index": int(frame_index),
+            "timestamp_unix_s": float(timestamp_unix_s),
+            "timestamp_perf_s": float(timestamp_perf_s),
+            "record_elapsed_s": np.nan if record_elapsed_s is None else float(record_elapsed_s),
+            "record_clock_text": format_record_clock(record_elapsed_s),
+            "task_epoch": int(task_epoch),
+            "measurement_source": str(measurement_source or "none"),
+            "object_label": _none_if_missing(getattr(raw_merged_object, "label", None)),
+            "object_valid": bool(getattr(raw_merged_object, "valid", False)),
+            "object_point_count": int(getattr(raw_merged_object, "merged_point_count", len(raw_points))),
+            "object_points_base": raw_points,
+            "object_centroid_base": _vec(getattr(raw_merged_object, "centroid_base", None), 3),
+            "fitted_label": _none_if_missing(getattr(shape_fitting_state, "label", None)),
+            "template_id": _none_if_missing(getattr(shape_fitting_state, "template_id", None)),
+            "shape_fitting_valid": bool(getattr(shape_fitting_state, "valid", False)),
+            "shape_fitting_initialized": bool(getattr(shape_fitting_state, "initialized", False)),
+            "shape_fitting_reason": str(getattr(shape_fitting_state, "reason", "none")),
+            "shape_fitting_scale": np.nan
+            if getattr(shape_fitting_state, "scale", None) is None
+            else float(getattr(shape_fitting_state, "scale")),
+            "shape_fitting_scale_x": _vec(getattr(shape_fitting_state, "scale_xyz", None), 3)[0],
+            "shape_fitting_scale_y": _vec(getattr(shape_fitting_state, "scale_xyz", None), 3)[1],
+            "shape_fitting_scale_z": _vec(getattr(shape_fitting_state, "scale_xyz", None), 3)[2],
+            "shape_fitting_scale_mode": str(getattr(shape_fitting_state, "scale_mode", "uniform")),
+            "template_points_base": fitted_points,
+            "template_centroid_base": _vec(getattr(shape_fitting_state, "centroid_base", None), 3),
+            "cam0_hand_points_base": _hand_debug_points(hand_debug_cam0),
+            "cam0_hand_valid_mask": _hand_debug_mask(hand_debug_cam0),
+            "cam0_palm_rotation_base": _hand_debug_rotation(hand_debug_cam0),
+            "cam0_hand_detected": _hand_debug_detected(hand_debug_cam0),
+            "cam0_hand_valid_count": _hand_debug_valid_count(hand_debug_cam0),
+            "cam0_hand_confidence": _hand_debug_confidence(hand_debug_cam0),
+            "cam0_hand_reason": _hand_debug_reason(hand_debug_cam0),
+            "cam1_hand_points_base": _hand_debug_points(hand_debug_cam1),
+            "cam1_hand_valid_mask": _hand_debug_mask(hand_debug_cam1),
+            "cam1_palm_rotation_base": _hand_debug_rotation(hand_debug_cam1),
+            "cam1_hand_detected": _hand_debug_detected(hand_debug_cam1),
+            "cam1_hand_valid_count": _hand_debug_valid_count(hand_debug_cam1),
+            "cam1_hand_confidence": _hand_debug_confidence(hand_debug_cam1),
+            "cam1_hand_reason": _hand_debug_reason(hand_debug_cam1),
+            "selected_hand_valid": bool(getattr(selected_hand, "valid", False)),
+            "selected_hand_camera": -1
+            if getattr(selected_hand, "selected_camera", None) is None
+            else int(getattr(selected_hand, "selected_camera")),
+            "selected_handedness": _none_if_missing(getattr(selected_hand, "handedness", None)),
+            "selected_palm_center_base": _vec(getattr(selected_hand, "palm_center_base", None), 3),
+            "selected_palm_normal_base": _vec(getattr(selected_hand, "palm_normal_base", None), 3),
+            "selected_wrist_base": _vec(getattr(selected_hand, "wrist_base", None), 3),
+            "selected_hand_confidence": float(getattr(selected_hand, "confidence", np.nan)),
+            "hand_selection_reason": str(_selector_field(hand_selector_debug, "selection_reason", "")),
+            "hand_selector_cam0_reject_reason": str(_selector_field(hand_selector_debug, "cam0_reject_reason", "")),
+            "hand_selector_cam1_reject_reason": str(_selector_field(hand_selector_debug, "cam1_reject_reason", "")),
+            "hand_selector_chosen_camera": -1
+            if _selector_field(hand_selector_debug, "chosen_camera", None) is None
+            else int(_selector_field(hand_selector_debug, "chosen_camera")),
+            "eef_pose_base": _vec(eef_pose_base, 6),
+            "object_point_base": _vec(object_point_base, 3),
+            "grasp_point_base": _vec(grasp_point_base, 3),
+        }
+        if self.record_template_axes:
+            frame["template_axes_base"] = _matrix(getattr(shape_fitting_state, "template_axes_base", None), (3, 3))
+        self.frames.append(frame)
         if self.save_images:
             if snapshot is None:
                 raise ValueError("snapshot is required when save_images=True")

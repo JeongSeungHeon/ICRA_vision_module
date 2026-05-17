@@ -50,17 +50,30 @@ MARKERS = (
 
 EMPTY_POINTS = np.empty((0, 3), dtype=np.float32)
 EMPTY_LINE_STRIPS: list[np.ndarray] = []
+TEMPLATE_AXIS_COLORS = [(255, 0, 0), (0, 220, 0), (0, 120, 255)]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Visualize a saved handover 3D debug .npz recording in Rerun.")
     parser.add_argument("recording", help="Path to output/debug_3d/*.npz")
     parser.add_argument("--normal-length", type=float, default=0.08, help="Palm normal line length in meters.")
+    parser.add_argument("--template-axis-length", type=float, default=0.06, help="Template local x/y/z axis line length in meters.")
     parser.add_argument("--depth-max-m", type=float, default=1.7, help="Maximum depth range shown in Rerun depth views.")
     parser.add_argument("--dry-run", action="store_true", help="Load and validate Rerun frame conversion without importing Rerun.")
     parser.add_argument("--connect", action="store_true", help="Connect to an already running Rerun viewer instead of spawning one.")
     parser.add_argument("--save-rrd", default=None, help="Save the Rerun recording to this .rrd path instead of opening a viewer.")
     parser.add_argument("--app-id", default="handover_3d_debug", help="Rerun application id.")
+    parser.add_argument(
+        "--no-point-coordinate-labels",
+        action="store_true",
+        help="Do not attach per-point base-frame xyz labels for Rerun selection/inspection.",
+    )
+    parser.add_argument(
+        "--point-coordinate-precision",
+        type=int,
+        default=4,
+        help="Decimal places used for per-point base-frame xyz labels.",
+    )
     return parser.parse_args()
 
 
@@ -75,6 +88,24 @@ def _as_points(value: object) -> np.ndarray:
 def _is_valid_vec(value: object, length: int = 3) -> bool:
     vec = np.asarray(value, dtype=np.float32).reshape(-1)
     return len(vec) >= int(length) and bool(np.isfinite(vec[:length]).all())
+
+
+def _valid_template_axes(data: dict[str, Any], idx: int) -> bool:
+    if "template_axes_base" not in data or "template_centroid_base" not in data:
+        return False
+    if not _is_valid_vec(data["template_centroid_base"][idx], 3):
+        return False
+    axes = np.asarray(data["template_axes_base"][idx], dtype=np.float32)
+    return axes.shape == (3, 3) and bool(np.isfinite(axes).all())
+
+
+def _first_valid_template_axes_index(data: dict[str, Any]) -> int | None:
+    if "template_axes_base" not in data:
+        return None
+    for idx in range(int(data["frame_count"])):
+        if _valid_template_axes(data, idx):
+            return idx
+    return None
 
 
 def _string_at(data: dict[str, Any], key: str, index: int) -> str:
@@ -101,6 +132,22 @@ def _rgb(color: tuple[int, int, int] | tuple[float, float, float]) -> tuple[int,
 
 def _color_array(count: int, color: tuple[int, int, int] | tuple[float, float, float]) -> np.ndarray:
     return np.tile(np.asarray(_rgb(color), dtype=np.uint8).reshape(1, 3), (max(int(count), 0), 1))
+
+
+def point_coordinate_labels(points: np.ndarray, prefix: str, precision: int = 4) -> list[str]:
+    points = _as_points(points)
+    if len(points) == 0:
+        return []
+
+    decimals = max(int(precision), 0)
+    index_width = max(4, len(str(len(points) - 1)))
+    labels: list[str] = []
+    for point_index, (x, y, z) in enumerate(points):
+        labels.append(
+            f"{prefix}[{point_index:0{index_width}d}] "
+            f"base=({float(x):.{decimals}f}, {float(y):.{decimals}f}, {float(z):.{decimals}f})m"
+        )
+    return labels
 
 
 def rotvec_to_matrix(rotvec: np.ndarray) -> np.ndarray:
@@ -229,6 +276,9 @@ def recording_summary_text(data: dict[str, Any]) -> str:
         f"cam1_hand_valid_frames={int((cam1_hand_counts > 0).sum())}/{frame_count} first={_first_positive_index(cam1_hand_counts)} max_landmarks={int(cam1_hand_counts.max()) if len(cam1_hand_counts) else 0}",
         f"selected_hand_valid_frames={int(selected_hand.sum())}/{frame_count}",
     ]
+    axes_first = _first_valid_template_axes_index(data)
+    axes_key_status = "present" if "template_axes_base" in data else "missing"
+    lines.append(f"template_local_axes={axes_key_status} first_valid={axes_first}")
     if "hand_selector_cam0_reject_reason" in data:
         lines.append(f"frame0_hand_reject_cam0={_string_at(data, 'hand_selector_cam0_reject_reason', 0) or '-'}")
         lines.append(f"frame0_hand_reject_cam1={_string_at(data, 'hand_selector_cam1_reject_reason', 0) or '-'}")
@@ -322,6 +372,7 @@ def count_frame_entities(data: dict[str, Any], frame_index: int) -> int:
         count += int(len(strips) > 0)
     count += int(_valid_palm_normal(data, idx))
     count += int(_is_valid_vec(data["eef_pose_base"][idx], 6))
+    count += int(_valid_template_axes(data, idx))
     if has_image_streams(data):
         count += 1  # sync status text
         for camera_id in (0, 1):
@@ -423,6 +474,8 @@ def log_points(
     color: tuple[int, int, int] | tuple[float, float, float],
     *,
     radius: float | None = None,
+    labels: list[str] | None = None,
+    show_labels: bool | None = None,
 ) -> None:
     points = _as_points(points)
     if len(points) == 0:
@@ -431,6 +484,13 @@ def log_points(
     kwargs: dict[str, Any] = {"colors": _color_array(len(points), color)}
     if radius is not None:
         kwargs["radii"] = np.full((len(points),), float(radius), dtype=np.float32)
+    if labels is not None:
+        labels = list(labels)
+        if len(labels) != len(points):
+            raise ValueError(f"Point label count mismatch for {entity}: labels={len(labels)} points={len(points)}")
+        kwargs["labels"] = labels
+        if show_labels is not None:
+            kwargs["show_labels"] = bool(show_labels)
     rr.log(entity, rr.Points3D(points, **kwargs))
 
 
@@ -508,7 +568,15 @@ def log_camera_images(rr: Any, data: dict[str, Any], idx: int, camera_id: int, *
             rr.log(depth_entity, rr.DepthImage(depth_m, meter=1.0))
 
 
-def log_hand(rr: Any, data: dict[str, Any], idx: int, camera_id: int) -> None:
+def log_hand(
+    rr: Any,
+    data: dict[str, Any],
+    idx: int,
+    camera_id: int,
+    *,
+    include_coordinate_labels: bool,
+    point_coordinate_precision: int,
+) -> None:
     selected = int(data["selected_hand_camera"][idx]) == int(camera_id)
     default_color = (64, 115, 255) if camera_id == 0 else (255, 77, 191)
     points, strips, selected_color = build_hand_payload(
@@ -518,7 +586,8 @@ def log_hand(rr: Any, data: dict[str, Any], idx: int, camera_id: int) -> None:
     )
     color = selected_color if selected else default_color
     prefix = f"/world/hands/cam{camera_id}"
-    log_points(rr, f"{prefix}/keypoints", points, color, radius=0.006)
+    labels = point_coordinate_labels(points, f"cam{camera_id}_hand", point_coordinate_precision) if include_coordinate_labels else None
+    log_points(rr, f"{prefix}/keypoints", points, color, radius=0.006, labels=labels, show_labels=False)
     log_line_strips(rr, f"{prefix}/skeleton", strips, color, radius=0.003)
 
 
@@ -564,6 +633,30 @@ def log_eef_axes(rr: Any, pose_xyz_rotvec: np.ndarray) -> None:
         log_line_strips(rr, "/world/eef/axes", strips, (255, 255, 255), radius=0.004)
 
 
+def log_template_axes(rr: Any, data: dict[str, Any], idx: int, axis_length_m: float) -> None:
+    entity = "/world/template/local_axes"
+    if not _valid_template_axes(data, idx):
+        log_line_strips(rr, entity, EMPTY_LINE_STRIPS, (255, 255, 255), radius=0.004)
+        return
+
+    origin = np.asarray(data["template_centroid_base"][idx], dtype=np.float32).reshape(-1)[:3]
+    axes = np.asarray(data["template_axes_base"][idx], dtype=np.float32).reshape((3, 3))
+    strips: list[np.ndarray] = []
+    length = max(float(axis_length_m), 0.0)
+    for axis_index in range(3):
+        axis = axes[axis_index]
+        norm = float(np.linalg.norm(axis))
+        if not np.isfinite(norm) or norm <= 1e-9:
+            log_line_strips(rr, entity, EMPTY_LINE_STRIPS, (255, 255, 255), radius=0.004)
+            return
+        axis = axis / norm
+        strips.append(np.stack([origin, origin + axis * length], axis=0))
+    try:
+        rr.log(entity, rr.LineStrips3D(strips, colors=TEMPLATE_AXIS_COLORS, radii=0.004))
+    except TypeError:
+        log_line_strips(rr, entity, strips, (255, 255, 255), radius=0.004)
+
+
 def log_text(rr: Any, entity: str, text: str) -> None:
     if hasattr(rr, "TextDocument"):
         rr.log(entity, rr.TextDocument(text))
@@ -575,24 +668,51 @@ def log_status(rr: Any, text: str) -> None:
     log_text(rr, "/status/frame", text)
 
 
-def log_frame(rr: Any, data: dict[str, Any], idx: int, *, normal_length_m: float, depth_max_m: float) -> None:
+def log_frame(
+    rr: Any,
+    data: dict[str, Any],
+    idx: int,
+    *,
+    normal_length_m: float,
+    template_axis_length_m: float,
+    depth_max_m: float,
+    include_coordinate_labels: bool,
+    point_coordinate_precision: int,
+) -> None:
     set_frame_time(rr, data, idx)
 
     object_points = _as_points(data["object_points_base"][idx])
     object_color = (199, 199, 199) if bool(data["object_valid"][idx]) else (217, 64, 56)
-    log_points(rr, "/world/object/cloud", object_points, object_color, radius=0.0025)
+    object_labels = point_coordinate_labels(object_points, "object", point_coordinate_precision) if include_coordinate_labels else None
+    log_points(rr, "/world/object/cloud", object_points, object_color, radius=0.0025, labels=object_labels, show_labels=False)
 
     template_points = _as_points(data["template_points_base"][idx])
-    log_points(rr, "/world/template/cloud", template_points, (26, 204, 242), radius=0.0025)
+    template_labels = point_coordinate_labels(template_points, "template", point_coordinate_precision) if include_coordinate_labels else None
+    log_points(rr, "/world/template/cloud", template_points, (26, 204, 242), radius=0.0025, labels=template_labels, show_labels=False)
 
-    log_hand(rr, data, idx, 0)
-    log_hand(rr, data, idx, 1)
+    log_hand(
+        rr,
+        data,
+        idx,
+        0,
+        include_coordinate_labels=include_coordinate_labels,
+        point_coordinate_precision=point_coordinate_precision,
+    )
+    log_hand(
+        rr,
+        data,
+        idx,
+        1,
+        include_coordinate_labels=include_coordinate_labels,
+        point_coordinate_precision=point_coordinate_precision,
+    )
 
     for key, entity, radius, color in MARKERS:
         log_marker(rr, data, idx, key, entity, radius, color)
 
     log_palm_normal(rr, data, idx, normal_length_m)
     log_eef_axes(rr, data["eef_pose_base"][idx])
+    log_template_axes(rr, data, idx, template_axis_length_m)
     log_status(rr, frame_status_text(data, idx) + "\n\n" + recording_summary_text(data))
     if has_image_streams(data):
         for camera_id in (0, 1):
@@ -602,7 +722,7 @@ def log_frame(rr: Any, data: dict[str, Any], idx: int, *, normal_length_m: float
         log_clear(rr, "/status/sync")
 
 
-def dry_run(data: dict[str, Any], *, normal_length_m: float, depth_max_m: float) -> None:
+def dry_run(data: dict[str, Any], *, normal_length_m: float, template_axis_length_m: float, depth_max_m: float) -> None:
     print("[INFO] Debug recording summary:")
     print(recording_summary_text(data))
     frame_count = int(data["frame_count"])
@@ -619,6 +739,11 @@ def dry_run(data: dict[str, Any], *, normal_length_m: float, depth_max_m: float)
         print(f"[INFO] Last frame converts to {last_entities} Rerun entities.")
     if _valid_palm_normal(data, 0):
         print(f"[INFO] Palm normal line length: {float(normal_length_m):.3f} m.")
+    axes_first = _first_valid_template_axes_index(data)
+    if axes_first is None:
+        print("[INFO] Template local axes: not recorded or no valid axes.")
+    else:
+        print(f"[INFO] Template local axes first valid frame: {axes_first}; axis length: {float(template_axis_length_m):.3f} m.")
     if has_image_streams(data):
         print(f"[INFO] RGB/depth image streams detected. Depth display range: 0.000-{max(float(depth_max_m), 1e-6):.3f} m.")
         for camera_id in (0, 1):
@@ -642,7 +767,7 @@ def main() -> int:
         raise RuntimeError("Recording contains no frames.")
 
     if args.dry_run:
-        dry_run(data, normal_length_m=args.normal_length, depth_max_m=args.depth_max_m)
+        dry_run(data, normal_length_m=args.normal_length, template_axis_length_m=args.template_axis_length, depth_max_m=args.depth_max_m)
         return 0
 
     rr = _import_rerun()
@@ -650,7 +775,16 @@ def main() -> int:
     send_blueprint(rr, include_images=has_image_streams(data))
 
     for idx in range(frame_count):
-        log_frame(rr, data, idx, normal_length_m=args.normal_length, depth_max_m=args.depth_max_m)
+        log_frame(
+            rr,
+            data,
+            idx,
+            normal_length_m=args.normal_length,
+            template_axis_length_m=args.template_axis_length,
+            depth_max_m=args.depth_max_m,
+            include_coordinate_labels=not args.no_point_coordinate_labels,
+            point_coordinate_precision=args.point_coordinate_precision,
+        )
         print(frame_status_text(data, idx), flush=True)
 
     if args.save_rrd:

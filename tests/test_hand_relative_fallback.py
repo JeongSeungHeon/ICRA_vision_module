@@ -273,6 +273,48 @@ class HandRelativeFallbackTests(unittest.TestCase):
         self.assertTrue(any("ANCHOR_WAIT" in line and "reason=measured_available" in line for line in printed_lines))
         self.assertTrue(any("ANCHOR_LOCKED" in line for line in printed_lines))
 
+    def test_debug_log_reports_lock_progress_only_when_progress_changes(self) -> None:
+        tracker = HandRelativeFallbackTracker(make_fallback_config(debug_log=True))
+        hand = make_selected_hand()
+        fusion = make_fusion_state()
+        measured_object = (0.40, 0.20, 0.50)
+        measured_grasp = (0.42, 0.22, 0.53)
+
+        with patch("builtins.print") as mock_print:
+            for frame_idx in range(3):
+                tracker.process(
+                    measured_object_position_base=measured_object,
+                    measured_grasp_position_base=measured_grasp,
+                    selected_hand=hand,
+                    fusion_state=fusion,
+                    motion_triggered=False,
+                    now_timestamp=1.0 + frame_idx * 0.01,
+                )
+            for frame_idx in range(2):
+                tracker.process(
+                    measured_object_position_base=measured_object,
+                    measured_grasp_position_base=measured_grasp,
+                    selected_hand=hand,
+                    fusion_state=fusion,
+                    motion_triggered=True,
+                    now_timestamp=1.1 + frame_idx * 0.01,
+                )
+
+        printed_lines = [" ".join(str(part) for part in call.args) for call in mock_print.call_args_list]
+        motion_wait_lines = [
+            line
+            for line in printed_lines
+            if "ANCHOR_WAIT" in line and "reason=motion_trigger_required" in line
+        ]
+        measured_progress_lines = [
+            line
+            for line in printed_lines
+            if "ANCHOR_WAIT" in line and "reason=measured_available" in line
+        ]
+        self.assertEqual(len(motion_wait_lines), 1)
+        self.assertTrue(any("lock=1/5" in line for line in measured_progress_lines))
+        self.assertTrue(any("lock=2/5" in line for line in measured_progress_lines))
+
     def test_anchor_can_lock_without_motion_trigger_when_not_required(self) -> None:
         tracker = HandRelativeFallbackTracker(make_fallback_config(require_motion_triggered=False))
         hand = make_selected_hand()
@@ -414,6 +456,29 @@ class HandRelativeFallbackTests(unittest.TestCase):
 
 
 class FollowSharedStateTests(unittest.TestCase):
+    def test_motion_trigger_latches_after_first_detection(self) -> None:
+        args = make_args(min_valid_count=1)
+        shared_state = FollowSharedState(args)
+        with shared_state.lock:
+            shared_state.reference_locked = True
+            shared_state.reference_object_xy_mm = np.array([0.0, 0.0], dtype=np.float32)
+            shared_state.reference_object_xyz_mm = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            shared_state.motion_triggered = False
+
+        shared_state.update_target(
+            grasp_xyz_m=np.array([0.05, 0.0, 0.0], dtype=np.float32),
+            object_xyz_m=np.array([0.05, 0.0, 0.0], dtype=np.float32),
+            measurement_source="measured",
+        )
+        self.assertTrue(shared_state.get_snapshot()["motion_triggered"])
+
+        shared_state.update_target(
+            grasp_xyz_m=np.array([0.0, 0.0, 0.0], dtype=np.float32),
+            object_xyz_m=np.array([0.0, 0.0, 0.0], dtype=np.float32),
+            measurement_source="measured",
+        )
+        self.assertTrue(shared_state.get_snapshot()["motion_triggered"])
+
     def test_source_priority_measured_then_hand_fallback_then_predicted(self) -> None:
         args = make_args(min_valid_count=1)
         shared_state = FollowSharedState(args)

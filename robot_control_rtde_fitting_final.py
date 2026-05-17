@@ -87,12 +87,18 @@ DEFAULT_POST_RELEASE_Z_OFFSET_MM = 0.0
 HOME_PLACE_X_OFFSET_MM = 0.0
 HOME_PLACE_Y_OFFSET_MM = -3.0
 HOME_PLACE_MIN_Z_MM = 45.0
+PRE_RELEASE_MIN_Z_EPSILON_MM = 1e-3
 GRASP_POINT_Y_OFFSET_MM = 10.0
 PLACE_Z_GRASP_BUFFER_FRAMES = 5
 PLACE_Z_MIN_VALID_SAMPLES = 3
 GRIPPER_FORCE_STOP_DELTA_N = 100000
 GRIPPER_FORCE_STOP_MIN_ELAPSED_S = 0.12
 DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD = 200
+DEFAULT_GRIPPER_POSITION_STALL_ENABLED = True
+DEFAULT_GRIPPER_POSITION_STALL_STABLE_READS = 3
+DEFAULT_GRIPPER_POSITION_STALL_TOLERANCE = 1
+DEFAULT_GRIPPER_POSITION_STALL_MIN_ELAPSED_S = 0.12
+RELEASE_PARAMETER_MM = 20.0
 BASE_POSE = {
     "x": 208.0,
     "y": 102.0,
@@ -202,6 +208,19 @@ def parse_args():
     parser.add_argument("--move-timeout-s", type=float, default=10.0, help="Timeout for blocking move steps.")
     parser.add_argument("--gripper-close-timeout-s", type=float, default=2.0, help="Timeout for force/current grasp verification.")
     parser.add_argument("--gripper-release-dwell-s", type=float, default=0.5, help="Dwell after opening gripper.")
+    parser.add_argument(
+        "--enable-pre-release-descend-before-open",
+        dest="pre_release_descend_before_open",
+        action="store_true",
+        help="Descend in Z before opening the gripper at PLACE. Defaults to config.",
+    )
+    parser.add_argument(
+        "--pre-release-descend-m",
+        type=float,
+        default=None,
+        help="Optional pre-release descend distance in meters. Defaults to RELEASE_PARAMETER_MM.",
+    )
+    parser.set_defaults(pre_release_descend_before_open=None)
     parser.add_argument("--follow-handoff-timeout-s", type=float, default=5.0, help="Timeout to wait for the follow thread to release robot control before pregrasp.")
     parser.add_argument(
         "--enable-target-prediction",
@@ -276,9 +295,21 @@ def parse_args():
         help="Maximum fitted template cloud points stored per debug frame.",
     )
     parser.add_argument(
+        "--no-debug-3d-template-axes",
+        dest="debug_3d_template_axes",
+        action="store_false",
+        help="Do not store fitted template local x/y/z axes in 3D debug recordings.",
+    )
+    parser.set_defaults(debug_3d_template_axes=True)
+    parser.add_argument(
         "--disable-debug-3d-recording",
         action="store_true",
         help="Backward-compatible alias that keeps 3D debug recording disabled.",
+    )
+    parser.add_argument(
+        "--record-video",
+        action="store_true",
+        help="Enable task video recording. Press 's' to finish the current recording and open the recorder UI.",
     )
     parser.add_argument(
         "--profile-runtime",
@@ -331,6 +362,14 @@ def apply_config_defaults(args, config):
     args.post_release_z_offset_mm = (
         float(return_sequence_cfg.get("post_release_z_offset_m", DEFAULT_POST_RELEASE_Z_OFFSET_MM / 1000.0)) * 1000.0
     )
+    if args.pre_release_descend_before_open is None:
+        args.pre_release_descend_before_open = bool(return_sequence_cfg.get("pre_release_descend_enabled", False))
+    pre_release_descend_m = (
+        args.pre_release_descend_m
+        if args.pre_release_descend_m is not None
+        else return_sequence_cfg.get("pre_release_descend_m", RELEASE_PARAMETER_MM / 1000.0)
+    )
+    args.pre_release_descend_mm = max(0.0, float(pre_release_descend_m) * 1000.0)
 
     for axis_name in ("x", "y", "z"):
         arg_name = f"workspace_{axis_name}"
@@ -838,7 +877,7 @@ class FollowSharedState:
 
             grasp_z_median_mm = float(np.median(grasp_samples))
             template_bottom_z_median_mm = float(np.median(template_bottom_samples))
-            raw_place_z_mm = float(grasp_z_median_mm - template_bottom_z_median_mm)
+            raw_place_z_mm = float(grasp_z_median_mm - template_bottom_z_median_mm + RELEASE_PARAMETER_MM)
             place_z_mm = max(raw_place_z_mm, HOME_PLACE_MIN_Z_MM)
 
             self.frozen_place_z_mm = place_z_mm
@@ -1002,22 +1041,17 @@ class FollowSharedState:
                     f"label={self.initial_object_label}"
                 )
 
-            move_dist_mm = float(np.linalg.norm(object_xy_mm - self.reference_object_xy_mm))
-            move_dist_z_mm = 0.0
-            if self.reference_object_xyz_mm is not None:
-                move_dist_z_mm = float(abs(object_xyz_mm[2] - self.reference_object_xyz_mm[2]))
-            if (
-                not self.motion_triggered
-                and (
-                    move_dist_mm >= MOTION_TRIGGER_MM
-                    or move_dist_z_mm >= MOTION_TRIGGER_Z_MM
-                )
-            ):
-                self.motion_triggered = True
-                print(
-                    "[INFO] Object motion detected: "
-                    f"xy={move_dist_mm:.2f} mm, z={move_dist_z_mm:.2f} mm -> follow start"
-                )
+            if not self.motion_triggered:
+                move_dist_mm = float(np.linalg.norm(object_xy_mm - self.reference_object_xy_mm))
+                move_dist_z_mm = 0.0
+                if self.reference_object_xyz_mm is not None:
+                    move_dist_z_mm = float(abs(object_xyz_mm[2] - self.reference_object_xyz_mm[2]))
+                if move_dist_mm >= MOTION_TRIGGER_MM or move_dist_z_mm >= MOTION_TRIGGER_Z_MM:
+                    self.motion_triggered = True
+                    print(
+                        "[INFO] Object motion detected: "
+                        f"xy={move_dist_mm:.2f} mm, z={move_dist_z_mm:.2f} mm -> follow start"
+                    )
 
             self.latest_target_xyz_mm = target_xyz_mm.copy()
             self.valid_detection_streak += 1
@@ -1138,7 +1172,6 @@ class FollowSharedState:
 
         if stable_xy and stable_z:
             self.home_object_xyz_mm = buf.mean(axis=0)
-            self.home_object_xyz_mm[1] = 0.0
 
             if len(self.home_pixel_buffer) > 0:
                 pix_buf = np.stack(self.home_pixel_buffer, axis=0)
@@ -1408,6 +1441,28 @@ def resolve_default_gripper_position_threshold(gripper_cfg):
     )
 
 
+def resolve_gripper_position_stall_detection_config(controller):
+    """Resolve gripper position stall fallback settings from controller config."""
+    config = getattr(controller, "config", {}) or {}
+    gripper_cfg = dict(config.get("robot", {}).get("gripper", {}) or {})
+    stall_cfg = dict(gripper_cfg.get("position_stall_detection", {}) or {})
+    return {
+        "enabled": bool(stall_cfg.get("enabled", DEFAULT_GRIPPER_POSITION_STALL_ENABLED)),
+        "stable_reads_required": max(
+            1,
+            int(stall_cfg.get("stable_reads_required", DEFAULT_GRIPPER_POSITION_STALL_STABLE_READS)),
+        ),
+        "tolerance": max(
+            0,
+            int(stall_cfg.get("tolerance", DEFAULT_GRIPPER_POSITION_STALL_TOLERANCE)),
+        ),
+        "min_elapsed_s": max(
+            0.0,
+            float(stall_cfg.get("min_elapsed_s", DEFAULT_GRIPPER_POSITION_STALL_MIN_ELAPSED_S)),
+        ),
+    }
+
+
 def _gripper_geometry_cfg(gripper_cfg):
     gripper_cfg = dict(gripper_cfg or {})
     geometry_cfg = gripper_cfg.get("position_threshold_geometry", {})
@@ -1446,6 +1501,45 @@ def _estimate_pca_section_widths_m(points_xy):
     long_width = float(np.max(extents))
     short_width = float(np.min(extents))
     return short_width, long_width
+
+
+def _normalize_gripper_label(label):
+    return "" if label is None else str(label).strip().lower()
+
+
+def _local_width_axis_for_label(geometry_cfg, label):
+    axis_by_label = geometry_cfg.get("local_width_axis_by_label", {})
+    if not isinstance(axis_by_label, dict):
+        return None
+
+    normalized_label = _normalize_gripper_label(label)
+    for configured_label, configured_axis in axis_by_label.items():
+        if _normalize_gripper_label(configured_label) == normalized_label:
+            axis = str(configured_axis).strip().lower()
+            return axis if axis in {"x", "y", "z"} else None
+    return None
+
+
+def _estimate_local_axis_width_m(slice_points, template_axes_base, axis_name):
+    points = np.asarray(slice_points, dtype=np.float64).reshape((-1, 3))
+    try:
+        axes = np.asarray(template_axes_base, dtype=np.float64).reshape((3, 3))
+    except Exception:
+        return None
+    axis_index = {"x": 0, "y": 1, "z": 2}.get(str(axis_name).strip().lower())
+    if axis_index is None or len(points) == 0 or not np.all(np.isfinite(axes)):
+        return None
+
+    axis = axes[axis_index]
+    norm = float(np.linalg.norm(axis))
+    if not np.isfinite(norm) or norm <= 1e-9:
+        return None
+    axis = axis / norm
+    projected = points @ axis.reshape(3, 1)
+    projected = projected.reshape(-1)
+    if len(projected) == 0 or not np.all(np.isfinite(projected)):
+        return None
+    return float(np.max(projected) - np.min(projected))
 
 
 def _select_template_slice_points(fitted_points_base, grasp_point_base, geometry_cfg):
@@ -1488,7 +1582,14 @@ def _select_template_slice_points(fitted_points_base, grasp_point_base, geometry
     return nearest_points, "nearest_z"
 
 
-def estimate_gripper_template_width_cm(fitted_points_base, grasp_point_base, gripper_cfg):
+def estimate_gripper_template_width_cm(
+    fitted_points_base,
+    grasp_point_base,
+    gripper_cfg,
+    *,
+    object_label=None,
+    template_axes_base=None,
+):
     """Estimate template width/diameter at the grasp z position in centimeters."""
     geometry_cfg = _gripper_geometry_cfg(gripper_cfg)
     slice_points, slice_source = _select_template_slice_points(
@@ -1501,6 +1602,36 @@ def estimate_gripper_template_width_cm(fitted_points_base, grasp_point_base, gri
             "reason": slice_source,
             "slice_source": slice_source,
             "slice_point_count": 0,
+        }
+
+    local_axis = _local_width_axis_for_label(geometry_cfg, object_label)
+    if local_axis is not None:
+        if template_axes_base is None:
+            return None, {
+                "reason": "missing_template_axes",
+                "slice_source": slice_source,
+                "slice_point_count": int(len(slice_points)),
+                "width_mode": f"local_axis_{local_axis}",
+                "label": _normalize_gripper_label(object_label) or None,
+            }
+        width_m = _estimate_local_axis_width_m(slice_points, template_axes_base, local_axis)
+        if width_m is None or not np.isfinite(width_m):
+            return None, {
+                "reason": "invalid_local_axis_width",
+                "slice_source": slice_source,
+                "slice_point_count": int(len(slice_points)),
+                "width_mode": f"local_axis_{local_axis}",
+                "label": _normalize_gripper_label(object_label) or None,
+            }
+        width_cm = float(width_m * 100.0)
+        return width_cm, {
+            "reason": "ok",
+            "slice_source": slice_source,
+            "slice_point_count": int(len(slice_points)),
+            "width_mode": f"local_axis_{local_axis}",
+            "local_axis": local_axis,
+            "label": _normalize_gripper_label(object_label) or None,
+            "width_cm": width_cm,
         }
 
     points_xy = slice_points[:, :2]
@@ -1532,7 +1663,14 @@ def estimate_gripper_template_width_cm(fitted_points_base, grasp_point_base, gri
     }
 
 
-def resolve_gripper_position_threshold_from_geometry(gripper_cfg, fitted_points_base, grasp_point_base):
+def resolve_gripper_position_threshold_from_geometry(
+    gripper_cfg,
+    fitted_points_base,
+    grasp_point_base,
+    *,
+    object_label=None,
+    template_axes_base=None,
+):
     """Resolve gripper close completion threshold from fitted template geometry."""
     gripper_cfg = dict(gripper_cfg or {})
     default_threshold = resolve_default_gripper_position_threshold(gripper_cfg)
@@ -1549,6 +1687,8 @@ def resolve_gripper_position_threshold_from_geometry(gripper_cfg, fitted_points_
         fitted_points_base,
         grasp_point_base,
         gripper_cfg,
+        object_label=object_label,
+        template_axes_base=template_axes_base,
     )
     if width_cm is None:
         debug.update(
@@ -1584,7 +1724,14 @@ def resolve_gripper_position_threshold_from_geometry(gripper_cfg, fitted_points_
     return threshold, debug
 
 
-def configure_gripper_position_threshold_from_geometry(controller, fitted_points_base, grasp_point_base):
+def configure_gripper_position_threshold_from_geometry(
+    controller,
+    fitted_points_base,
+    grasp_point_base,
+    *,
+    object_label=None,
+    template_axes_base=None,
+):
     """Select a gripper completion threshold from the fitted template grasp section."""
     if controller is None:
         return None
@@ -1599,6 +1746,8 @@ def configure_gripper_position_threshold_from_geometry(controller, fitted_points
         gripper_cfg,
         fitted_points_base,
         grasp_point_base,
+        object_label=object_label,
+        template_axes_base=template_axes_base,
     )
 
     controller.gripper_position_complete_threshold = int(position_threshold)
@@ -1614,6 +1763,7 @@ def configure_gripper_position_threshold_from_geometry(controller, fitted_points
         f"threshold={int(position_threshold)}, "
         f"width={width_text}, "
         f"mode={debug.get('width_mode', 'fallback')}, "
+        f"label={debug.get('label', _normalize_gripper_label(object_label) or 'unknown')}, "
         f"slice_source={debug.get('slice_source', 'n/a')}, "
         f"slice_points={int(debug.get('slice_point_count', 0))}, "
         f"reason={reason}"
@@ -1766,6 +1916,9 @@ def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True,
     deadline = time.time() + timeout_s
     loop_start = time.time()
     force_threshold = float(getattr(controller, "min_tcp_force_norm_n", 8.0))
+    stall_cfg = resolve_gripper_position_stall_detection_config(controller)
+    last_position_value = None
+    stable_position_reads = 0
     while time.time() < deadline:
         state = controller.read_robot_state(now_timestamp=time.time())
         force_norm = state.tcp_force_norm_n
@@ -1787,14 +1940,29 @@ def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True,
 
         gripper_close_state = None
         position_triggered = False
+        position_stall_triggered = False
+        position_value_int = None
         if hasattr(controller, "get_gripper_close_state"):
             try:
                 gripper_close_state = controller.get_gripper_close_state()
                 if gripper_close_state is not None:
                     position_value = gripper_close_state.get("position")
                     if position_value is not None:
+                        position_value_int = int(position_value)
                         position_threshold = int(getattr(controller, "gripper_position_complete_threshold", DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD))
-                        position_triggered = int(position_value) >= position_threshold
+                        position_triggered = position_value_int >= position_threshold
+                        if last_position_value is None:
+                            stable_position_reads = 1
+                        elif abs(position_value_int - last_position_value) <= stall_cfg["tolerance"]:
+                            stable_position_reads += 1
+                        else:
+                            stable_position_reads = 1
+                        last_position_value = position_value_int
+                        position_stall_triggered = (
+                            bool(stall_cfg["enabled"])
+                            and elapsed >= stall_cfg["min_elapsed_s"]
+                            and stable_position_reads >= stall_cfg["stable_reads_required"]
+                        )
             except Exception as exc:
                 if verbose:
                     print(f"[WARN] Failed to read gripper close state: {exc}")
@@ -1808,6 +1976,8 @@ def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True,
                 f"verified={state.grasp_verified_force_current}, "
                 f"force_triggered={force_triggered}, "
                 f"position_triggered={position_triggered}, "
+                f"position_stall_triggered={position_stall_triggered}, "
+                f"stable_position_reads={stable_position_reads}, "
                 f"gripper_state={gripper_close_state}"
             )
         if force_triggered:
@@ -1841,6 +2011,23 @@ def execute_gripper_close(controller, timeout_s=2.0, poll_dt=0.05, verbose=True,
             )
             print(
                 f"[INFO] Gripper position reached threshold >= {position_threshold}. Stopping gripper close and finishing grasp stage."
+            )
+            return True
+        if position_stall_triggered:
+            if hasattr(controller, "stop_gripper_motion"):
+                try:
+                    controller.stop_gripper_motion()
+                except Exception as exc:
+                    print(f"[WARN] Failed to stop gripper after position stall trigger: {exc}")
+            if metadata_recorder is not None:
+                first_contact_timestamp = metadata_recorder.note_robot_first_contact()
+                if first_contact_timestamp is not None:
+                    print(f"[INFO] Robot first contact timestamp={first_contact_timestamp}")
+            print(
+                "[INFO] Gripper position stalled "
+                f"(position={position_value_int}, stable_reads={stable_position_reads}, "
+                f"tolerance={stall_cfg['tolerance']}). "
+                "Stopping gripper close and finishing grasp stage."
             )
             return True
         time.sleep(poll_dt)
@@ -1948,6 +2135,44 @@ def compute_place_target(shared_state):
     return home_xyz, debug
 
 
+def compute_pre_release_descend_target_mm(place_x, place_y, place_z, args):
+    """Resolve the optional descend target used immediately before gripper open."""
+    enabled = bool(getattr(args, "pre_release_descend_before_open", False))
+    descend_mm = max(0.0, float(getattr(args, "pre_release_descend_mm", RELEASE_PARAMETER_MM)))
+    place_x = float(place_x)
+    place_y = float(place_y)
+    place_z = float(place_z)
+    if not enabled or descend_mm <= 1e-9:
+        return (place_x, place_y, place_z), {
+            "enabled": False,
+            "descend_mm": descend_mm,
+            "unclamped_z_mm": place_z,
+            "target_z_mm": place_z,
+            "home_guard_applied": False,
+        }
+
+    unclamped_z = place_z - descend_mm
+    min_release_z = HOME_PLACE_MIN_Z_MM + PRE_RELEASE_MIN_Z_EPSILON_MM
+    workspace_z = getattr(args, "workspace_z", DEFAULT_WORKSPACE_MM["z"])
+    workspace_z_low = float(workspace_z[0])
+    workspace_z_high = float(workspace_z[1])
+    guarded_low = max(min_release_z, workspace_z_low)
+    target_z = clamp_value(unclamped_z, guarded_low, workspace_z_high)
+    if target_z <= HOME_PLACE_MIN_Z_MM:
+        target_z = min_release_z
+
+    target_x = clamp_value(place_x, args.workspace_x[0], args.workspace_x[1])
+    target_y = clamp_value(place_y, args.workspace_y[0], args.workspace_y[1])
+    home_guard_applied = unclamped_z < min_release_z or target_z <= HOME_PLACE_MIN_Z_MM
+    return (target_x, target_y, target_z), {
+        "enabled": True,
+        "descend_mm": descend_mm,
+        "unclamped_z_mm": unclamped_z,
+        "target_z_mm": target_z,
+        "home_guard_applied": bool(home_guard_applied),
+    }
+
+
 def execute_return_and_place(controller, shared_state, args, metadata_recorder=None):
     """Run the post-grasp return, release, backoff, and HOME sequence."""
     target_eef_xyz, place_target_debug = compute_place_target(shared_state)
@@ -1970,6 +2195,8 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
 
     place_z = target_z + DESCEND_EXTRA_MM
     place_x, place_y, place_z = clamp_pose_mm(target_x, target_y, place_z, args)
+    release_pose_mm, pre_release_debug = compute_pre_release_descend_target_mm(place_x, place_y, place_z, args)
+    release_x, release_y, release_z = release_pose_mm
 
     grasp_z_med_text = (
         "-"
@@ -1996,6 +2223,14 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
         f"raw_place_z={raw_place_z_text} "
         f"fallback={place_target_debug['used_fallback']}"
     )
+    if pre_release_debug["enabled"]:
+        print(
+            "[INFO] PRE-release descend target: "
+            f"({release_x:.1f}, {release_y:.1f}, {release_z:.1f}), "
+            f"descend={pre_release_debug['descend_mm']:.1f} mm, "
+            f"unclamped_z={pre_release_debug['unclamped_z_mm']:.1f} mm, "
+            f"home_guard_applied={pre_release_debug['home_guard_applied']}"
+        )
 
     move_sequence = [
         ("return_hover", [hover_x, hover_y, hover_z]),
@@ -2014,14 +2249,27 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
             print(f"[WARN] Move timed out during {source_mode}.")
             return False
 
+    if pre_release_debug["enabled"]:
+        ok = move_robot_and_wait(
+            controller,
+            mm_to_m_tuple([release_x, release_y, release_z]),
+            fixed_orientation_base,
+            timeout_s=args.move_timeout_s,
+            tolerance_m=args.position_tolerance_m,
+            source_mode="pre_release_descend_before_open",
+        )
+        if not ok:
+            print("[WARN] Pre-release descend move timed out.")
+            return False
+
     execute_gripper_open(
         controller,
         dwell_s=args.gripper_release_dwell_s,
         metadata_recorder=metadata_recorder,
     )
 
-    post_release_z = max(place_z + float(args.post_release_z_offset_mm), HOME_PLACE_MIN_Z_MM)
-    post_release_x, post_release_y, post_release_z = clamp_pose_mm(place_x, place_y, post_release_z, args)
+    post_release_z = max(release_z + float(args.post_release_z_offset_mm), HOME_PLACE_MIN_Z_MM)
+    post_release_x, post_release_y, post_release_z = clamp_pose_mm(release_x, release_y, post_release_z, args)
     if abs(float(args.post_release_z_offset_mm)) > 1e-6:
         print(
             "[INFO] POST-release Z target: "
@@ -2568,22 +2816,24 @@ def main():
             save_images=bool(args.save_image),
             max_object_points=args.debug_3d_max_object_points,
             max_template_points=args.debug_3d_max_template_points,
+            record_template_axes=bool(args.debug_3d_template_axes),
         )
         print(f"[INFO] 3D debug recorder armed. Press 'd' to save to {args.debug_3d_dir} and reset.")
         if debug_3d_recorder.save_images:
             print("[INFO] 3D debug recorder will include raw color/depth frames.")
 
-    try:
-        video_recorder = HandoverVideoRecorderService(
-            serial=VIDEO_RECORDER_SERIAL,
-            port=VIDEO_RECORDER_PORT,
-            metadata_recorder=metadata_recorder,
-        )
-        recorder_url = video_recorder.start_server()
-        print(f"[INFO] Video recorder UI ready: {recorder_url}")
-    except Exception as exc:
-        video_recorder = None
-        print(f"[WARN] Failed to start video recorder service: {exc}")
+    if args.record_video:
+        try:
+            video_recorder = HandoverVideoRecorderService(
+                serial=VIDEO_RECORDER_SERIAL,
+                port=VIDEO_RECORDER_PORT,
+                metadata_recorder=metadata_recorder,
+            )
+            recorder_url = video_recorder.start_server()
+            print(f"[INFO] Video recorder UI ready: {recorder_url}")
+        except Exception as exc:
+            video_recorder = None
+            print(f"[WARN] Failed to start video recorder service: {exc}")
 
     if args.enable_follow:
         controller = init_rtde(args)
@@ -2764,6 +3014,8 @@ def main():
                             controller,
                             shape_fitting_state.fitted_points_base,
                             grasp_point_base,
+                            object_label=shape_fitting_state.label,
+                            template_axes_base=getattr(shape_fitting_state, "template_axes_base", None),
                         )
                         grasp_ok = execute_gripper_close(
                             controller,

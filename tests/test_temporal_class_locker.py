@@ -43,6 +43,57 @@ class TemporalClassLockerTests(unittest.TestCase):
 
 
 class ObjectWorkerClassLockLogTests(unittest.TestCase):
+    def test_prefers_wine_glass_mask_when_cup_and_wine_glass_are_detected(self):
+        segmentation_engine = SimpleNamespace()
+        transform_chain = SimpleNamespace(
+            transform_points_camera_to_base=lambda camera_id, points: np.asarray(points, dtype=np.float32)
+        )
+        worker = ObjectWorker(
+            camera_id=0,
+            segmentation_engine=segmentation_engine,
+            transform_chain=transform_chain,
+            config={
+                "perception": {
+                    "object": {
+                        "confidence_threshold": 0.1,
+                        "segmentation": {
+                            "selection_mode": "highest_score",
+                            "selection_class_names": ["wine glass", "cup"],
+                            "prefer_wine_glass_over_cup": True,
+                        },
+                        "point_cloud": {"min_points_per_camera": 1},
+                    }
+                }
+            },
+        )
+        cup_instance = SimpleNamespace(class_name="cup", score=0.95)
+        wine_instance = SimpleNamespace(class_name="wine glass", score=0.40)
+        segmentation_result = SimpleNamespace(instances=[cup_instance, wine_instance], infer_ms=1.0)
+        segmentation_engine.predict = lambda image: segmentation_result
+        frame = FrameBundle(
+            color_image=np.zeros((2, 2, 3), dtype=np.uint8),
+            depth_image_m=np.ones((2, 2), dtype=np.float32),
+            intrinsics={},
+            timestamp_ms=1000.0,
+            serial="test",
+        )
+
+        with patch(
+            "perception.object_worker.build_point_cloud_from_instances",
+            return_value=(
+                np.ones((2, 2), dtype=bool),
+                np.asarray([[0.1, 0.2, 0.3]], dtype=np.float32),
+                None,
+                None,
+                np.asarray([[255, 255, 255]], dtype=np.uint8),
+            ),
+        ):
+            state = worker.process_frame(frame, frame_id=20)
+
+        self.assertEqual(state.label, "wine glass")
+        self.assertEqual(state.confidence, 0.40)
+        self.assertEqual(worker.last_debug.selected_class_names, ("wine glass",))
+
     def test_prints_once_when_class_lock_is_acquired(self):
         segmentation_engine = SimpleNamespace()
         transform_chain = SimpleNamespace(

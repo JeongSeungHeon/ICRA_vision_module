@@ -156,6 +156,8 @@ perception:
       half: false
       # Ultralytics retina mask 옵션입니다.
       retina_masks: true
+      # cup과 wine glass가 동시에 잡히면 confidence와 무관하게 wine glass mask를 선택합니다.
+      prefer_wine_glass_over_cup: true
       # 특정 class를 우선 선택해야 할 때 사용할 class 이름 목록입니다.
       selection_class_names: ["wine glass", "box-shaped snack","cup"]
       preprocess:
@@ -370,7 +372,7 @@ perception:
     # hand와 object 거리로 접근 상태를 판단하는 threshold입니다.
     hand_approach_distance_threshold_m: 0.15
     # object lift/activation 안정화에 필요한 frame 수입니다.
-    stable_frames_required: 5
+    stable_frames_required: 2
 
 grasp:
   # fixed_orientation_base 해석 형식입니다.
@@ -387,16 +389,16 @@ grasp:
     # object 측정 dropout 때 hand-relative fallback을 사용할지 정합니다.
     enabled: true
     # hand/object 상대 위치를 lock하기 전 필요한 frame 수입니다.
-    lock_frames: 4
+    lock_frames: 3
     # 측정이 끊겨도 fallback을 유지할 최대 시간입니다.
     max_dropout_sec: 3.0
     # fallback lock에 hand approach 상태를 요구할지 정합니다.
-    require_hand_approach: true
+    require_hand_approach: false
     # fallback lock에 motion trigger 상태를 요구할지 정합니다.
     require_motion_triggered: true
     # hand-relative fallback lock/active 여부를 콘솔에 출력합니다.
-    debug_log: false
-    # lock_frames가 채워지는 과정을 frame마다 출력합니다.
+    debug_log: true
+    # lock_frames progress가 바뀔 때만 출력합니다.
     log_lock_progress: true
     # fallback active 로그를 몇 frame마다 출력할지 정합니다. 1이면 매 fallback frame 출력입니다.
     log_fallback_every_frames: 1
@@ -424,6 +426,10 @@ home_pose:
 
 robot:
   return_sequence:
+    # true이면 PLACE 도착 후 gripper open 전에 아래 방향으로 한 번 더 이동합니다.
+    pre_release_descend_enabled: true
+    # gripper open 전 추가 하강 거리입니다. 기본 코드 상수 RELEASE_PARAMETER_MM와 같은 10 mm입니다.
+    pre_release_descend_m: 0.02
     # gripper release 후 x backoff 전에 robot base +Z 방향으로 올릴 거리입니다.
     post_release_z_offset_m: -0.03
 
@@ -481,7 +487,7 @@ robot:
     # gripper socket 연결 시 activate 명령을 보낼지 정합니다.
     activate_on_connect: true
     # gripper open speed입니다.
-    open_speed: 255
+    open_speed: 100 # 기존 255에서 100으로 낮춤
     # gripper open force입니다.
     open_force: 255
     # gripper close speed입니다.
@@ -490,6 +496,15 @@ robot:
     close_force: 255
     # close 중 gripper position이 이 값 이상이면 완료로 봅니다.
     position_complete_threshold: 40
+    position_stall_detection:
+      # true이면 close 중 gripper position이 충분히 오래 거의 변하지 않을 때 완료로 봅니다.
+      enabled: true
+      # position 변화가 tolerance 이하인 상태가 이 read 수만큼 이어지면 stall로 봅니다.
+      stable_reads_required: 3
+      # 같은 position으로 볼 Robotiq position 정수값 허용 오차입니다.
+      tolerance: 1
+      # close 시작 직후 순간적인 동일 read를 무시하기 위한 최소 경과 시간입니다.
+      min_elapsed_s: 0.12
     # grasp 직전 fitted template의 grasp z 단면 폭/지름으로 close 완료 position threshold를 계산합니다.
     position_threshold_geometry:
       # true이면 object label이 아니라 template 단면 geometry 기반 threshold를 사용합니다.
@@ -504,6 +519,9 @@ robot:
       min_slice_points: 8
       # band point가 부족할 때 z가 가까운 point를 이 개수만큼 사용합니다.
       fallback_nearest_points: 64
+      # label별로 template local 축 기준 폭을 사용할 때의 축 이름입니다.
+      local_width_axis_by_label:
+        box-shaped snack: x
       # PCA 긴 변/짧은 변 비율이 이 값 이상이면 직사각 단면으로 보고 짧은 변을 폭으로 씁니다.
       anisotropic_ratio: 1.25
       # 계산된 position threshold 하한입니다.

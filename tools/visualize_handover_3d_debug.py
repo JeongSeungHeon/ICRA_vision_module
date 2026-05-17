@@ -52,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("recording", help="Path to output/debug_3d/*.npz")
     parser.add_argument("--point-size", type=float, default=3.0, help="Open3D point size.")
     parser.add_argument("--normal-length", type=float, default=0.08, help="Palm normal line length in meters.")
+    parser.add_argument("--template-axis-length", type=float, default=0.06, help="Template local x/y/z axis line length in meters.")
     parser.add_argument("--play-hz", type=float, default=10.0, help="Playback frame rate.")
     parser.add_argument("--dry-run", action="store_true", help="Load the recording and build frame 0 geometries, then exit.")
     return parser.parse_args()
@@ -68,6 +69,15 @@ def _as_points(value: object) -> np.ndarray:
 def _is_valid_vec(value: object, length: int = 3) -> bool:
     vec = np.asarray(value, dtype=np.float32).reshape(-1)
     return len(vec) >= int(length) and bool(np.isfinite(vec[:length]).all())
+
+
+def _valid_template_axes(data: dict[str, np.ndarray], idx: int) -> bool:
+    if "template_axes_base" not in data or "template_centroid_base" not in data:
+        return False
+    if not _is_valid_vec(data["template_centroid_base"][idx], 3):
+        return False
+    axes = np.asarray(data["template_axes_base"][idx], dtype=np.float32)
+    return axes.shape == (3, 3) and bool(np.isfinite(axes).all())
 
 
 def _string_at(data: dict[str, np.ndarray], key: str, index: int) -> str:
@@ -100,6 +110,30 @@ def make_line_set(points_xyz: np.ndarray, lines_ij: list[list[int]], color_rgb: 
     colors = np.tile(np.asarray(list(color_rgb), dtype=np.float64).reshape(1, 3), (len(lines_ij), 1))
     line_set.colors = o3d.utility.Vector3dVector(colors)
     return line_set
+
+
+def build_template_axis_geometries(
+    data: dict[str, np.ndarray],
+    idx: int,
+    *,
+    axis_length_m: float,
+) -> list[o3d.geometry.Geometry]:
+    if not _valid_template_axes(data, idx):
+        return []
+    origin = np.asarray(data["template_centroid_base"][idx], dtype=np.float32).reshape(-1)[:3]
+    axes = np.asarray(data["template_axes_base"][idx], dtype=np.float32).reshape((3, 3))
+    colors = [(1.0, 0.0, 0.0), (0.0, 0.86, 0.0), (0.0, 0.47, 1.0)]
+    geometries: list[o3d.geometry.Geometry] = []
+    length = max(float(axis_length_m), 0.0)
+    for axis_index, color in enumerate(colors):
+        axis = axes[axis_index]
+        norm = float(np.linalg.norm(axis))
+        if not np.isfinite(norm) or norm <= 1e-9:
+            return []
+        axis = axis / norm
+        points = np.stack([origin, origin + axis * length], axis=0)
+        geometries.append(make_line_set(points, [[0, 1]], color))
+    return geometries
 
 
 def rotvec_to_matrix(rotvec: np.ndarray) -> np.ndarray:
@@ -162,6 +196,7 @@ def build_frame_geometries(
     frame_index: int,
     *,
     normal_length_m: float = 0.08,
+    template_axis_length_m: float = 0.06,
 ) -> list[o3d.geometry.Geometry]:
     idx = int(frame_index)
     geometries: list[o3d.geometry.Geometry] = [o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.10)]
@@ -217,6 +252,8 @@ def build_frame_geometries(
     eef_pose = data["eef_pose_base"][idx]
     if _is_valid_vec(eef_pose, 6):
         geometries.append(make_pose_frame(np.asarray(eef_pose, dtype=np.float32), size=0.055))
+
+    geometries.extend(build_template_axis_geometries(data, idx, axis_length_m=template_axis_length_m))
 
     return geometries
 
@@ -287,7 +324,12 @@ def main() -> int:
         raise RuntimeError("Recording contains no frames.")
 
     if args.dry_run:
-        geometries = build_frame_geometries(data, 0, normal_length_m=args.normal_length)
+        geometries = build_frame_geometries(
+            data,
+            0,
+            normal_length_m=args.normal_length,
+            template_axis_length_m=args.template_axis_length,
+        )
         print(f"[INFO] Loaded {frame_count} frames and built {len(geometries)} geometries for frame 0.")
         return 0
 
@@ -316,7 +358,12 @@ def main() -> int:
             state.advance_if_due()
             if state.changed:
                 visualizer.clear_geometries()
-                for geometry in build_frame_geometries(data, state.index, normal_length_m=args.normal_length):
+                for geometry in build_frame_geometries(
+                    data,
+                    state.index,
+                    normal_length_m=args.normal_length,
+                    template_axis_length_m=args.template_axis_length,
+                ):
                     visualizer.add_geometry(geometry, reset_bounding_box=(state.index == 0))
                 print_frame_status(data, state.index)
                 state.changed = False

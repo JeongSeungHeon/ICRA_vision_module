@@ -88,6 +88,7 @@ class ObjectWorker:
         self.confidence_threshold = float(object_cfg.get("confidence_threshold", 0.5))
         self.selection_mode = segmentation_cfg.get("selection_mode", "highest_score")
         self.selection_class_names = list(segmentation_cfg.get("selection_class_names", []))
+        self.prefer_wine_glass_over_cup = bool(segmentation_cfg.get("prefer_wine_glass_over_cup", False))
         self.stride = int(point_cfg.get("stride", 2))
         self.max_points = int(point_cfg.get("max_points", 20000))
         self.min_depth_m = float(point_cfg.get("min_depth_m", 0.10))
@@ -136,6 +137,7 @@ class ObjectWorker:
             segmentation_result.instances,
             mode=self.selection_mode,
             class_names=self.selection_class_names or None,
+            prefer_wine_glass_over_cup=self.prefer_wine_glass_over_cup,
         )
         combined_mask, points_camera, _, _, colors_rgb = build_point_cloud_from_instances(
             frame_bundle.color_image,

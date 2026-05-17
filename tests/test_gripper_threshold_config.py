@@ -76,7 +76,13 @@ _STUBS = [
 
 _MODULE = importlib.import_module("robot_control_rtde_fitting_final")
 configure_gripper_position_threshold_from_geometry = _MODULE.configure_gripper_position_threshold_from_geometry
+compute_pre_release_descend_target_mm = _MODULE.compute_pre_release_descend_target_mm
+execute_gripper_close = _MODULE.execute_gripper_close
 estimate_gripper_template_width_cm = _MODULE.estimate_gripper_template_width_cm
+HOME_PLACE_MIN_Z_MM = _MODULE.HOME_PLACE_MIN_Z_MM
+PRE_RELEASE_MIN_Z_EPSILON_MM = _MODULE.PRE_RELEASE_MIN_Z_EPSILON_MM
+RELEASE_PARAMETER_MM = _MODULE.RELEASE_PARAMETER_MM
+resolve_gripper_position_stall_detection_config = _MODULE.resolve_gripper_position_stall_detection_config
 resolve_gripper_position_threshold_from_geometry = _MODULE.resolve_gripper_position_threshold_from_geometry
 sys.modules.pop("robot_control_rtde_fitting_final", None)
 
@@ -111,6 +117,44 @@ def rectangle_points(width_m=0.03, length_m=0.05, z_m=0.5, repeats=8):
     return np.repeat(corners, repeats, axis=0)
 
 
+def local_box_points(x_width_m=0.03, y_length_m=0.05, z_m=0.5, repeats=8):
+    corners = np.asarray(
+        [
+            [-0.5 * x_width_m, -0.5 * y_length_m, z_m],
+            [-0.5 * x_width_m, 0.5 * y_length_m, z_m],
+            [0.5 * x_width_m, -0.5 * y_length_m, z_m],
+            [0.5 * x_width_m, 0.5 * y_length_m, z_m],
+        ],
+        dtype=np.float64,
+    )
+    return np.repeat(corners, repeats, axis=0)
+
+
+def rotate_z(points, angle_deg):
+    angle_rad = np.deg2rad(float(angle_deg))
+    c = np.cos(angle_rad)
+    s = np.sin(angle_rad)
+    rotation = np.asarray(
+        [
+            [c, -s, 0.0],
+            [s, c, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    return np.asarray(points, dtype=np.float64) @ rotation.T, np.eye(3, dtype=np.float64) @ rotation.T
+
+
+def release_args(*, enabled=False, descend_mm=RELEASE_PARAMETER_MM, workspace_z=(0.0, 800.0)):
+    return SimpleNamespace(
+        pre_release_descend_before_open=enabled,
+        pre_release_descend_mm=descend_mm,
+        workspace_x=[-1000.0, 1000.0],
+        workspace_y=[-1000.0, 1000.0],
+        workspace_z=list(workspace_z),
+    )
+
+
 class DummyController:
     def __init__(self, gripper_cfg=None):
         self.config = {
@@ -127,6 +171,9 @@ class DummyController:
                         "slice_band_m": 0.005,
                         "min_slice_points": 8,
                         "fallback_nearest_points": 64,
+                        "local_width_axis_by_label": {
+                            "box-shaped snack": "x",
+                        },
                         "anisotropic_ratio": 1.25,
                         "clamp_min": 0,
                         "clamp_max": 255,
@@ -137,7 +184,89 @@ class DummyController:
         self.gripper_position_complete_threshold = None
 
 
+class DummyCloseController:
+    def __init__(self, positions, *, threshold=40, stall_cfg=None):
+        gripper_cfg = {
+            "position_complete_threshold": int(threshold),
+            "position_stall_detection": {
+                "enabled": True,
+                "stable_reads_required": 3,
+                "tolerance": 1,
+                "min_elapsed_s": 0.0,
+            },
+        }
+        if stall_cfg is not None:
+            gripper_cfg["position_stall_detection"].update(stall_cfg)
+        self.config = {"robot": {"gripper": gripper_cfg}}
+        self.gripper_position_complete_threshold = int(threshold)
+        self.min_tcp_force_norm_n = 999.0
+        self._positions = list(positions)
+        self.stop_count = 0
+        self.close_started = False
+
+    def start_gripper_close(self):
+        self.close_started = True
+        return True
+
+    def read_robot_state(self, *, now_timestamp=None):
+        del now_timestamp
+        return SimpleNamespace(
+            tcp_force_norm_n=0.0,
+            mean_joint_current_a=0.0,
+            grasp_verified_force_current=False,
+        )
+
+    def get_gripper_close_state(self):
+        if not self._positions:
+            return None
+        return {"position": self._positions.pop(0)}
+
+    def stop_gripper_motion(self):
+        self.stop_count += 1
+
+
 class GripperThresholdConfigTests(unittest.TestCase):
+    def test_pre_release_descend_disabled_keeps_place_z(self):
+        target, debug = compute_pre_release_descend_target_mm(10.0, 20.0, 100.0, release_args())
+
+        self.assertEqual(target, (10.0, 20.0, 100.0))
+        self.assertFalse(debug["enabled"])
+
+    def test_pre_release_descend_enabled_subtracts_configured_distance(self):
+        target, debug = compute_pre_release_descend_target_mm(
+            10.0,
+            20.0,
+            100.0,
+            release_args(enabled=True, descend_mm=RELEASE_PARAMETER_MM),
+        )
+
+        self.assertEqual(target, (10.0, 20.0, 90.0))
+        self.assertTrue(debug["enabled"])
+        self.assertFalse(debug["home_guard_applied"])
+
+    def test_pre_release_descend_clamps_strictly_above_home_place_min_z(self):
+        target, debug = compute_pre_release_descend_target_mm(
+            10.0,
+            20.0,
+            HOME_PLACE_MIN_Z_MM + 5.0,
+            release_args(enabled=True, descend_mm=RELEASE_PARAMETER_MM),
+        )
+
+        self.assertGreater(target[2], HOME_PLACE_MIN_Z_MM)
+        self.assertAlmostEqual(target[2], HOME_PLACE_MIN_Z_MM + PRE_RELEASE_MIN_Z_EPSILON_MM)
+        self.assertTrue(debug["home_guard_applied"])
+
+    def test_pre_release_descend_workspace_lower_cannot_drop_below_home_guard(self):
+        target, debug = compute_pre_release_descend_target_mm(
+            10.0,
+            20.0,
+            HOME_PLACE_MIN_Z_MM + 2.0,
+            release_args(enabled=True, descend_mm=RELEASE_PARAMETER_MM, workspace_z=(0.0, 800.0)),
+        )
+
+        self.assertGreater(target[2], HOME_PLACE_MIN_Z_MM)
+        self.assertTrue(debug["home_guard_applied"])
+
     def test_formula_uses_template_diameter_and_rounds_half_up(self):
         controller = DummyController()
         points = circle_points(radius_m=0.025)
@@ -162,6 +291,36 @@ class GripperThresholdConfigTests(unittest.TestCase):
 
         self.assertEqual(debug["width_mode"], "diameter")
         self.assertAlmostEqual(width_cm, 5.0, places=5)
+
+    def test_box_uses_template_local_x_axis_even_when_rotated(self):
+        controller = DummyController()
+        rotated_points, axes_base = rotate_z(local_box_points(x_width_m=0.03, y_length_m=0.05), 35.0)
+
+        width_cm, debug = estimate_gripper_template_width_cm(
+            rotated_points,
+            (0.0, 0.0, 0.5),
+            controller.config["robot"]["gripper"],
+            object_label="box-shaped snack",
+            template_axes_base=axes_base,
+        )
+
+        self.assertEqual(debug["width_mode"], "local_axis_x")
+        self.assertAlmostEqual(width_cm, 3.0, places=5)
+
+    def test_box_without_template_axes_falls_back_to_default_threshold(self):
+        controller = DummyController()
+
+        threshold, debug = resolve_gripper_position_threshold_from_geometry(
+            controller.config["robot"]["gripper"],
+            local_box_points(x_width_m=0.03, y_length_m=0.05),
+            (0.0, 0.0, 0.5),
+            object_label="box-shaped snack",
+            template_axes_base=None,
+        )
+
+        self.assertEqual(debug["reason"], "missing_template_axes")
+        self.assertEqual(debug["width_mode"], "local_axis_x")
+        self.assertEqual(threshold, 40)
 
     def test_rectangular_slice_uses_pca_short_axis_not_diagonal(self):
         controller = DummyController()
@@ -227,6 +386,69 @@ class GripperThresholdConfigTests(unittest.TestCase):
 
         self.assertEqual(resolved, 40)
         self.assertEqual(controller.gripper_position_complete_threshold, 40)
+
+
+class GripperCloseStallFallbackTests(unittest.TestCase):
+    def test_stall_fallback_accepts_three_stable_position_reads_below_threshold(self):
+        controller = DummyCloseController([10, 20, 25, 25, 25], threshold=40)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = execute_gripper_close(controller, timeout_s=0.1, poll_dt=0.0, verbose=False)
+
+        self.assertTrue(result)
+        self.assertTrue(controller.close_started)
+        self.assertEqual(controller.stop_count, 1)
+
+    def test_stall_fallback_accepts_small_position_jitter_within_tolerance(self):
+        controller = DummyCloseController([10, 20, 25, 26, 25], threshold=40)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = execute_gripper_close(controller, timeout_s=0.1, poll_dt=0.0, verbose=False)
+
+        self.assertTrue(result)
+        self.assertEqual(controller.stop_count, 1)
+
+    def test_still_moving_position_sequence_does_not_trigger_stall(self):
+        controller = DummyCloseController([10, 20, 25, 30, 35], threshold=40)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = execute_gripper_close(controller, timeout_s=0.001, poll_dt=0.0, verbose=False)
+
+        self.assertFalse(result)
+        self.assertEqual(controller.stop_count, 1)
+
+    def test_stall_disabled_preserves_timeout_behavior(self):
+        controller = DummyCloseController(
+            [10, 20, 25, 25, 25],
+            threshold=40,
+            stall_cfg={"enabled": False},
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = execute_gripper_close(controller, timeout_s=0.001, poll_dt=0.0, verbose=False)
+
+        self.assertFalse(result)
+        self.assertEqual(controller.stop_count, 1)
+
+    def test_threshold_reached_still_succeeds_without_waiting_for_stall(self):
+        controller = DummyCloseController([10, 40], threshold=40)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = execute_gripper_close(controller, timeout_s=0.1, poll_dt=0.0, verbose=False)
+
+        self.assertTrue(result)
+        self.assertEqual(controller.stop_count, 1)
+        self.assertEqual(controller._positions, [])
+
+    def test_stall_config_defaults_are_resolved_from_controller_config(self):
+        controller = DummyCloseController([], stall_cfg={"stable_reads_required": 0, "tolerance": -5})
+
+        resolved = resolve_gripper_position_stall_detection_config(controller)
+
+        self.assertTrue(resolved["enabled"])
+        self.assertEqual(resolved["stable_reads_required"], 1)
+        self.assertEqual(resolved["tolerance"], 0)
+        self.assertEqual(resolved["min_elapsed_s"], 0.0)
 
 
 if __name__ == "__main__":

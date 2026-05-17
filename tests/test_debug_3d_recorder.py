@@ -6,15 +6,37 @@ from types import SimpleNamespace
 import numpy as np
 
 from utils.debug_3d_recorder import Debug3DRecorder, load_debug_3d_npz
+from tools.visualize_handover_3d_debug_rerun import count_frame_entities, log_points, point_coordinate_labels
 
 
-def _shape_state(points=None, valid=True):
+def _shape_state(points=None, valid=True, template_axes_base=None):
+    if template_axes_base is None:
+        template_axes_base = np.eye(3, dtype=np.float32)
     return SimpleNamespace(
         label="cup",
         template_id="cup_template",
         fitted_points_base=np.empty((0, 3), dtype=np.float32) if points is None else points,
         centroid_base=(0.2, 0.3, 0.4),
         scale=1.25,
+        scale_xyz=(1.25, 1.25, 1.25),
+        scale_mode="uniform",
+        template_axes_base=template_axes_base,
+        bowl_height_fraction=None,
+        initialized=True,
+        reason="ok",
+        valid=bool(valid),
+    )
+
+
+def _shape_state_without_axes(points=None, valid=True):
+    return SimpleNamespace(
+        label="cup",
+        template_id="cup_template",
+        fitted_points_base=np.empty((0, 3), dtype=np.float32) if points is None else points,
+        centroid_base=(0.2, 0.3, 0.4),
+        scale=1.25,
+        scale_xyz=(1.25, 1.25, 1.25),
+        scale_mode="uniform",
         bowl_height_fraction=None,
         initialized=True,
         reason="ok",
@@ -87,6 +109,7 @@ def _append(
     snapshot=None,
     hand_debug_cam0=None,
     hand_debug_cam1=None,
+    shape_fitting_state=None,
 ):
     selected_hand = SimpleNamespace(
         valid=not missing,
@@ -107,7 +130,7 @@ def _append(
         hand_debug_cam0=None if missing else (hand_debug_cam0 if hand_debug_cam0 is not None else _hand_debug(0.0)),
         hand_debug_cam1=None if missing else (hand_debug_cam1 if hand_debug_cam1 is not None else _hand_debug(0.1)),
         raw_merged_object=_merged_object(object_points, valid=not missing),
-        shape_fitting_state=_shape_state(template_points, valid=not missing),
+        shape_fitting_state=shape_fitting_state if shape_fitting_state is not None else _shape_state(template_points, valid=not missing),
         object_point_base=None if missing else (0.1, 0.2, 0.3),
         grasp_point_base=None if missing else (0.2, 0.3, 0.4),
         eef_pose_base=None if missing else (0.5, 0.6, 0.7, 0.0, 0.1, 0.2),
@@ -122,7 +145,61 @@ def _append(
     )
 
 
+class _FakeRerun:
+    class Points3D:
+        def __init__(self, points, **kwargs):
+            self.points = np.asarray(points)
+            self.kwargs = kwargs
+
+    class Clear:
+        def __init__(self, recursive=False):
+            self.recursive = recursive
+
+    def __init__(self):
+        self.logged = []
+
+    def log(self, entity, payload):
+        self.logged.append((entity, payload))
+
+
 class Debug3DRecorderTests(unittest.TestCase):
+    def test_point_coordinate_labels_format_and_precision(self):
+        points = np.asarray([[0.123456, -0.045678, 0.789012], [1.0, 2.0, 3.0]], dtype=np.float32)
+
+        labels = point_coordinate_labels(points, "object", precision=3)
+
+        self.assertEqual(labels[0], "object[0000] base=(0.123, -0.046, 0.789)m")
+        self.assertEqual(labels[1], "object[0001] base=(1.000, 2.000, 3.000)m")
+
+    def test_point_coordinate_labels_filters_invalid_and_empty_points(self):
+        points = np.asarray([[np.nan, 0.0, 0.0], [0.1, 0.2, 0.3]], dtype=np.float32)
+
+        labels = point_coordinate_labels(points, "template", precision=1)
+
+        self.assertEqual(labels, ["template[0000] base=(0.1, 0.2, 0.3)m"])
+        self.assertEqual(point_coordinate_labels(np.empty((0, 3), dtype=np.float32), "object"), [])
+
+    def test_log_points_passes_coordinate_labels_to_rerun(self):
+        fake_rr = _FakeRerun()
+        points = np.asarray([[0.1, 0.2, 0.3]], dtype=np.float32)
+        labels = point_coordinate_labels(points, "object", precision=2)
+
+        log_points(fake_rr, "/world/object/cloud", points, (255, 255, 255), radius=0.01, labels=labels, show_labels=False)
+
+        self.assertEqual(fake_rr.logged[0][0], "/world/object/cloud")
+        payload = fake_rr.logged[0][1]
+        np.testing.assert_allclose(payload.points, points)
+        self.assertEqual(payload.kwargs["labels"], ["object[0000] base=(0.10, 0.20, 0.30)m"])
+        self.assertFalse(payload.kwargs["show_labels"])
+        np.testing.assert_allclose(payload.kwargs["radii"], np.asarray([0.01], dtype=np.float32))
+
+    def test_log_points_rejects_mismatched_label_count(self):
+        fake_rr = _FakeRerun()
+        points = np.asarray([[0.1, 0.2, 0.3]], dtype=np.float32)
+
+        with self.assertRaises(ValueError):
+            log_points(fake_rr, "/world/object/cloud", points, (255, 255, 255), labels=[])
+
     def test_round_trip_variable_clouds(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             recorder = Debug3DRecorder(output_dir=Path(temp_dir), max_object_points=10, max_template_points=8)
@@ -150,6 +227,56 @@ class Debug3DRecorderTests(unittest.TestCase):
             self.assertAlmostEqual(float(data["record_elapsed_s"][0]), 1.2, places=6)
             self.assertNotIn("cam0_color_image", data)
             self.assertNotIn("cam0_depth_image_m", data)
+            self.assertEqual(data["template_axes_base"].shape, (2, 3, 3))
+            np.testing.assert_allclose(data["template_axes_base"][0], np.eye(3, dtype=np.float32))
+
+    def test_template_axes_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = Debug3DRecorder(output_dir=Path(temp_dir), record_template_axes=False)
+            _append(
+                recorder,
+                0,
+                np.empty((0, 3), dtype=np.float32),
+                np.empty((0, 3), dtype=np.float32),
+            )
+
+            data = load_debug_3d_npz(recorder.save())
+
+            self.assertNotIn("template_axes_base", data)
+
+    def test_missing_template_axes_are_saved_as_nan(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = Debug3DRecorder(output_dir=Path(temp_dir))
+            _append(
+                recorder,
+                0,
+                np.empty((0, 3), dtype=np.float32),
+                np.empty((0, 3), dtype=np.float32),
+                shape_fitting_state=_shape_state_without_axes(np.empty((0, 3), dtype=np.float32)),
+            )
+
+            data = load_debug_3d_npz(recorder.save())
+
+            self.assertEqual(data["template_axes_base"].shape, (1, 3, 3))
+            self.assertTrue(np.isnan(data["template_axes_base"][0]).all())
+
+    def test_rerun_entity_count_includes_valid_template_axes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = Debug3DRecorder(output_dir=Path(temp_dir))
+            _append(
+                recorder,
+                0,
+                np.empty((0, 3), dtype=np.float32),
+                np.empty((0, 3), dtype=np.float32),
+            )
+            data = load_debug_3d_npz(recorder.save())
+
+            with_axes = count_frame_entities(data, 0)
+            data_without_axes = dict(data)
+            data_without_axes.pop("template_axes_base")
+            without_axes = count_frame_entities(data_without_axes, 0)
+
+            self.assertEqual(with_axes, without_axes + 1)
 
     def test_missing_values_are_nan_or_empty(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -62,8 +62,8 @@ class HandRelativeFallbackTracker:
         self._anchor_record_elapsed_s: float | None = None
         self._last_measured_record_elapsed_s: float | None = None
         self._fallback_log_counter = 0
-        self._anchor_wait_log_counter = 0
         self._last_anchor_wait_reason: str | None = None
+        self._last_anchor_wait_log_key: tuple[str, int] | None = None
         self.last_debug = HandRelativeFallbackDebug(
             anchor_locked=False,
             lock_streak=0,
@@ -90,8 +90,8 @@ class HandRelativeFallbackTracker:
         self._anchor_record_elapsed_s = None
         self._last_measured_record_elapsed_s = None
         self._fallback_log_counter = 0
-        self._anchor_wait_log_counter = 0
         self._last_anchor_wait_reason = None
+        self._last_anchor_wait_log_key = None
         self.last_debug = HandRelativeFallbackDebug(
             anchor_locked=False,
             lock_streak=0,
@@ -154,8 +154,8 @@ class HandRelativeFallbackTracker:
                     self._anchor_frame_id = frame_id
                     self._anchor_record_elapsed_s = record_elapsed_s
                     self._fallback_log_counter = 0
-                    self._anchor_wait_log_counter = 0
                     self._last_anchor_wait_reason = None
+                    self._last_anchor_wait_log_key = None
                     self._log(
                         "ANCHOR_LOCKED "
                         f"clock={self._format_record_clock(record_elapsed_s)} "
@@ -175,7 +175,6 @@ class HandRelativeFallbackTracker:
                         measured_grasp=measured_grasp,
                         hand_approach_ok=hand_approach_ok,
                         motion_trigger_ok=motion_trigger_ok,
-                        force=True,
                     )
             elif not self._anchor_locked:
                 self._lock_streak = 0
@@ -394,7 +393,6 @@ class HandRelativeFallbackTracker:
         measured_grasp: np.ndarray | None,
         hand_approach_ok: bool,
         motion_trigger_ok: bool,
-        force: bool = False,
     ) -> None:
         if not self.debug_log or self._anchor_locked:
             return
@@ -402,14 +400,13 @@ class HandRelativeFallbackTracker:
         reason_changed = reason != self._last_anchor_wait_reason
         if reason_changed:
             self._last_anchor_wait_reason = reason
-            self._anchor_wait_log_counter = 0
-        self._anchor_wait_log_counter += 1
 
-        should_log = force or reason_changed or (
-            (self._anchor_wait_log_counter - 1) % self.log_fallback_every_frames == 0
-        )
+        log_key = (reason, int(self._lock_streak))
+        progress_changed = log_key != self._last_anchor_wait_log_key
+        should_log = reason_changed or progress_changed
         if not should_log:
             return
+        self._last_anchor_wait_log_key = log_key
 
         self._log(
             "ANCHOR_WAIT "
