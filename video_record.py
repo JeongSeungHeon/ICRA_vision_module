@@ -5,9 +5,11 @@ from __future__ import annotations
 import threading
 import time
 import webbrowser
+import csv
 from datetime import datetime
 from pathlib import Path
 import re
+import shutil
 
 import cv2
 import numpy as np
@@ -18,6 +20,11 @@ try:
     import pyrealsense2 as rs
 except ImportError:
     rs = None
+
+try:
+    import rerun as rr
+except ImportError:
+    rr = None
 
 
 SAVE_DIR = Path("recordings")
@@ -443,6 +450,30 @@ def get_unique_pending_path(pending_dir: Path, timestamp: datetime | None = None
         idx += 1
 
 
+def get_unique_plain_video_path(save_dir: Path, timestamp: datetime | None = None, suffix: str | None = None) -> Path:
+    timestamp = datetime.now() if timestamp is None else timestamp
+    base = f"task_{timestamp.strftime('%Y%m%d_%H%M%S')}"
+    suffix_text = "" if not suffix else f"_{slugify(str(suffix))}"
+    path = save_dir / f"{base}{suffix_text}.mp4"
+    if not path.exists():
+        return path
+
+    idx = 1
+    while True:
+        candidate = save_dir / f"{base}{suffix_text}_{idx:03d}.mp4"
+        if not candidate.exists():
+            return candidate
+        idx += 1
+
+
+def get_rerun_sidecar_path(video_path: Path) -> Path:
+    return video_path.with_suffix(".rrd")
+
+
+def get_tactile_csv_sidecar_path(video_path: Path) -> Path:
+    return video_path.with_name(f"{video_path.stem}_tactile.csv")
+
+
 def open_writer(path: Path, *, fps: int, width: int, height: int):
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(path), fourcc, fps, (width, height))
@@ -500,6 +531,12 @@ class HandoverVideoRecorderService:
         height: int = DEFAULT_HEIGHT,
         fps: int = DEFAULT_FPS,
         metadata_recorder=None,
+        web_ui_enabled: bool = True,
+        tactile_manager=None,
+        tactile_logging_enabled: bool = True,
+        tactile_csv_enabled: bool = True,
+        tactile_rerun_enabled: bool = True,
+        tactile_rerun_live: bool = False,
     ) -> None:
         self.serial = str(serial)
         self.save_dir = Path(save_dir)
@@ -510,6 +547,12 @@ class HandoverVideoRecorderService:
         self.height = int(height)
         self.fps = int(fps)
         self.metadata_recorder = metadata_recorder
+        self.web_ui_enabled = bool(web_ui_enabled)
+        self.tactile_manager = tactile_manager
+        self.tactile_logging_enabled = bool(tactile_logging_enabled)
+        self.tactile_csv_enabled = bool(tactile_csv_enabled)
+        self.tactile_rerun_enabled = bool(tactile_rerun_enabled)
+        self.tactile_rerun_live = bool(tactile_rerun_live)
 
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.pending_dir.mkdir(parents=True, exist_ok=True)
@@ -524,6 +567,13 @@ class HandoverVideoRecorderService:
         self._latest_frame = None
         self._latest_frame_perf = None
         self._writer = None
+        self._csv_file = None
+        self._csv_writer = None
+        self._csv_path = None
+        self._rrd_path = None
+        self._rr_recording = None
+        self._rerun_active = False
+        self._tactile_sidecar_status = "disabled"
 
         self._recording = False
         self._pending_save = False
@@ -544,12 +594,84 @@ class HandoverVideoRecorderService:
             "handover_location": None,
         }
 
-        self._app = Flask(__name__)
-        self._register_routes()
+        self._app = Flask(__name__) if self.web_ui_enabled else None
+        if self._app is not None:
+            self._register_routes()
 
     @property
     def url(self) -> str:
         return f"http://{self.host}:{self.port}"
+
+    @property
+    def is_web_ui_enabled(self) -> bool:
+        return self.web_ui_enabled
+
+    def _tactile_logging_available(self) -> bool:
+        manager = self.tactile_manager
+        if manager is None or not self.tactile_logging_enabled:
+            return False
+        return bool(getattr(manager, "enabled", True))
+
+    def _tactile_num_mags(self) -> int:
+        manager = self.tactile_manager
+        if manager is None:
+            return 0
+        try:
+            num_mags = int(getattr(manager, "num_mags", 0))
+        except Exception:
+            num_mags = 0
+        return max(num_mags, 0)
+
+    def _snapshot_tactile(self, *, refresh: bool = True):
+        manager = self.tactile_manager
+        if manager is None or not self._tactile_logging_available():
+            return None
+
+        try:
+            if hasattr(manager, "snapshot"):
+                snapshot = manager.snapshot(refresh=refresh)
+                if snapshot is not None:
+                    values = np.asarray(snapshot.get("values", []), dtype=np.float32).flatten()
+                    return {
+                        "values": values,
+                        "num_mags": int(snapshot.get("num_mags", max(values.size // 3, 0))),
+                        "total_norm": float(snapshot.get("total_norm", float(np.linalg.norm(values)))),
+                        "release_ref_norm": snapshot.get("release_ref_norm"),
+                        "release_delta_norm": snapshot.get("release_delta_norm"),
+                        "status": str(snapshot.get("status", "")),
+                        "error": snapshot.get("error"),
+                    }
+
+            if refresh:
+                if hasattr(manager, "read"):
+                    manager.read()
+                elif hasattr(manager, "total_norm"):
+                    manager.total_norm()
+
+            values = np.asarray(getattr(manager, "latest", []), dtype=np.float32).flatten()
+            num_mags = self._tactile_num_mags()
+            if num_mags <= 0 and values.size > 0:
+                num_mags = max(values.size // 3, 1)
+            expected_values = num_mags * 3
+            if expected_values > 0:
+                if values.size < expected_values:
+                    padded = np.zeros(expected_values, dtype=np.float32)
+                    padded[: values.size] = values
+                    values = padded
+                values = values[:expected_values]
+            return {
+                "values": values,
+                "num_mags": num_mags,
+                "total_norm": float(getattr(manager, "latest_norm", float(np.linalg.norm(values)))),
+                "release_ref_norm": getattr(manager, "release_reference_norm", None),
+                "release_delta_norm": getattr(manager, "release_delta_norm", None),
+                "status": str(getattr(manager, "release_status", getattr(manager, "status", ""))),
+                "error": getattr(manager, "last_error", None),
+            }
+        except Exception as exc:
+            with self._lock:
+                self._tactile_sidecar_status = f"tactile snapshot failed: {exc}"
+            return None
 
     def _require_realsense(self):
         if rs is None:
@@ -567,14 +689,36 @@ class HandoverVideoRecorderService:
         pipeline.start(config)
         self._pipeline = pipeline
 
+    def _start_capture_locked(self):
+        self._start_camera()
+        self._stop_event.clear()
+        if self._capture_thread is None:
+            self._capture_thread = threading.Thread(target=self._capture_loop, name="handover-recorder-capture", daemon=True)
+            self._capture_thread.start()
+
+    def start_capture(self) -> str:
+        with self._lock:
+            if self._capture_thread is not None:
+                return "video recorder capture ready"
+            self._start_capture_locked()
+            self._last_status = "video recorder ready with web UI disabled"
+
+        frame_ready = self._wait_for_frame(timeout_s=2.0)
+        with self._lock:
+            if frame_ready:
+                self._last_status = "video recorder ready with live frame and web UI disabled"
+            else:
+                self._last_status = "video recorder ready but waiting for first frame; web UI disabled"
+            return self._last_status
+
     def start_server(self) -> str:
+        if not self.web_ui_enabled:
+            return self.start_capture()
+
         with self._lock:
             if self._server_thread is not None:
                 return self.url
-            self._start_camera()
-            self._stop_event.clear()
-            self._capture_thread = threading.Thread(target=self._capture_loop, name="handover-recorder-capture", daemon=True)
-            self._capture_thread.start()
+            self._start_capture_locked()
             self._server = make_server(self.host, self.port, self._app, threaded=True)
             self._server_thread = threading.Thread(
                 target=self._server.serve_forever,
@@ -597,6 +741,7 @@ class HandoverVideoRecorderService:
         with self._lock:
             self._stop_event.set()
             self._close_writer_locked()
+            self._close_sidecars_locked()
             server = self._server
             capture_thread = self._capture_thread
             server_thread = self._server_thread
@@ -646,17 +791,28 @@ class HandoverVideoRecorderService:
                 time.sleep(0.05)
                 continue
 
+            frame_timestamp = datetime.now()
+            frame_perf = time.perf_counter()
+            with self._lock:
+                should_sample_tactile = (
+                    self._tactile_logging_available()
+                    and (self._recording or self._pending_start_task_started_at is not None)
+                )
+            tactile_snapshot = self._snapshot_tactile(refresh=True) if should_sample_tactile else None
+
             with self._lock:
                 display_frame = frame.copy()
                 task_started_at = self._task_started_at
                 if task_started_at is None:
                     task_started_at = self._pending_start_task_started_at
                 if task_started_at is not None:
-                    elapsed_s = max((datetime.now() - task_started_at).total_seconds(), 0.0)
+                    elapsed_s = max((frame_timestamp - task_started_at).total_seconds(), 0.0)
                     display_frame = draw_record_clock_overlay(display_frame, elapsed_s)
+                else:
+                    elapsed_s = 0.0
 
                 self._latest_frame = display_frame
-                self._latest_frame_perf = time.perf_counter()
+                self._latest_frame_perf = frame_perf
                 self._frame_ready.notify_all()
                 if (
                     self._pending_start_task_started_at is not None
@@ -668,6 +824,9 @@ class HandoverVideoRecorderService:
                         task_start_timestamp_iso=self._pending_start_task_timestamp_iso,
                         task_started_at=self._pending_start_task_started_at,
                         initial_frame=display_frame,
+                        initial_tactile_snapshot=tactile_snapshot,
+                        initial_timestamp=frame_timestamp,
+                        initial_perf=frame_perf,
                     )
                     self._last_status = message
                     if not ok:
@@ -675,6 +834,14 @@ class HandoverVideoRecorderService:
                         self._pending_start_task_started_at = None
                 if self._recording and self._writer is not None:
                     self._writer.write(display_frame)
+                    self._write_sidecars_locked(
+                        display_frame,
+                        frame_index=self._frame_count,
+                        elapsed_s=elapsed_s,
+                        timestamp=frame_timestamp,
+                        perf_s=frame_perf,
+                        tactile_snapshot=tactile_snapshot,
+                    )
                     self._frame_count += 1
 
     def _wait_for_frame(self, timeout_s=2.0, *, min_frame_perf=None):
@@ -727,6 +894,235 @@ class HandoverVideoRecorderService:
             finally:
                 self._writer = None
 
+    def _close_sidecars_locked(self):
+        if self._csv_file is not None:
+            try:
+                self._csv_file.flush()
+                self._csv_file.close()
+            except Exception:
+                pass
+            finally:
+                self._csv_file = None
+                self._csv_writer = None
+
+        if self._rerun_active and rr is not None:
+            recording = self._rr_recording
+            try:
+                if hasattr(rr, "flush"):
+                    try:
+                        rr.flush(blocking=True, recording=recording)
+                    except TypeError:
+                        rr.flush(blocking=True)
+            except Exception:
+                pass
+            try:
+                if hasattr(rr, "disconnect"):
+                    try:
+                        rr.disconnect(recording=recording)
+                    except TypeError:
+                        rr.disconnect()
+            except Exception:
+                pass
+        self._rerun_active = False
+        self._rr_recording = None
+
+    def _open_sidecars_locked(self, video_path: Path):
+        self._close_sidecars_locked()
+        self._csv_path = None
+        self._rrd_path = None
+        self._rr_recording = None
+
+        if not self._tactile_logging_available():
+            self._tactile_sidecar_status = "disabled"
+            return
+
+        num_mags = self._tactile_num_mags()
+        if num_mags <= 0:
+            num_mags = 5
+
+        opened_parts = []
+        warnings = []
+        if self.tactile_csv_enabled:
+            csv_path = get_tactile_csv_sidecar_path(video_path)
+            try:
+                csv_file = open(csv_path, "w", newline="", encoding="utf-8")
+                header = [
+                    "frame_index",
+                    "elapsed_s",
+                    "timestamp_iso",
+                    "perf_s",
+                    "total_norm",
+                    "release_ref_norm",
+                    "release_delta_norm",
+                    "status",
+                    "error",
+                ]
+                for mag_idx in range(num_mags):
+                    header.extend([f"mag{mag_idx}_x", f"mag{mag_idx}_y", f"mag{mag_idx}_z"])
+                csv_writer = csv.writer(csv_file)
+                csv_writer.writerow(header)
+                self._csv_file = csv_file
+                self._csv_writer = csv_writer
+                self._csv_path = csv_path
+                opened_parts.append(csv_path.name)
+            except Exception as exc:
+                self._csv_file = None
+                self._csv_writer = None
+                self._csv_path = None
+                warnings.append(f"tactile CSV disabled: {exc}")
+
+        if self.tactile_rerun_enabled:
+            rrd_path = get_rerun_sidecar_path(video_path)
+            if rr is None:
+                warnings.append("rerun package not available")
+            else:
+                try:
+                    recording = None
+                    if hasattr(rr, "new_recording"):
+                        recording = rr.new_recording("handover_tactile_recording")
+                    else:
+                        rr.init("handover_tactile_recording", spawn=self.tactile_rerun_live)
+
+                    if recording is not None:
+                        rr.save(str(rrd_path), recording=recording)
+                        if self.tactile_rerun_live and hasattr(rr, "spawn"):
+                            try:
+                                rr.spawn(recording=recording)
+                            except TypeError:
+                                rr.spawn()
+                    else:
+                        rr.save(str(rrd_path))
+
+                    self._rrd_path = rrd_path
+                    self._rr_recording = recording
+                    self._rerun_active = True
+                    opened_parts.append(rrd_path.name)
+                except Exception as exc:
+                    self._rrd_path = None
+                    self._rr_recording = None
+                    self._rerun_active = False
+                    warnings.append(f"rerun disabled: {exc}")
+
+        if opened_parts:
+            warning_text = "" if not warnings else f" ({'; '.join(warnings)})"
+            self._tactile_sidecar_status = f"recording tactile sidecars: {', '.join(opened_parts)}{warning_text}"
+        elif warnings:
+            self._tactile_sidecar_status = "; ".join(warnings)
+
+    def _write_sidecars_locked(self, frame_bgr, *, frame_index: int, elapsed_s: float, timestamp: datetime, perf_s: float, tactile_snapshot):
+        if tactile_snapshot is None:
+            return
+
+        values = np.asarray(tactile_snapshot.get("values", []), dtype=np.float32).flatten()
+        num_mags = int(tactile_snapshot.get("num_mags", self._tactile_num_mags()))
+        if num_mags <= 0 and values.size > 0:
+            num_mags = max(values.size // 3, 1)
+        expected_values = max(num_mags, 0) * 3
+        if expected_values > 0:
+            if values.size < expected_values:
+                padded = np.zeros(expected_values, dtype=np.float32)
+                padded[: values.size] = values
+                values = padded
+            values = values[:expected_values]
+
+        total_norm = float(tactile_snapshot.get("total_norm", float(np.linalg.norm(values))))
+        release_ref_norm = tactile_snapshot.get("release_ref_norm")
+        release_delta_norm = tactile_snapshot.get("release_delta_norm")
+        status = str(tactile_snapshot.get("status", ""))
+        error = tactile_snapshot.get("error")
+
+        if self._csv_writer is not None:
+            row = [
+                int(frame_index),
+                f"{float(elapsed_s):.6f}",
+                timestamp.isoformat(),
+                f"{float(perf_s):.9f}",
+                f"{total_norm:.9f}",
+                "" if release_ref_norm is None else f"{float(release_ref_norm):.9f}",
+                "" if release_delta_norm is None else f"{float(release_delta_norm):.9f}",
+                status,
+                "" if error is None else str(error),
+            ]
+            row.extend(f"{float(value):.9f}" for value in values)
+            try:
+                self._csv_writer.writerow(row)
+            except Exception as exc:
+                self._tactile_sidecar_status = f"tactile CSV write failed: {exc}"
+                try:
+                    self._csv_file.close()
+                except Exception:
+                    pass
+                self._csv_file = None
+                self._csv_writer = None
+
+        if self._rerun_active and rr is not None:
+            try:
+                rr_kwargs = {}
+                if self._rr_recording is not None:
+                    rr_kwargs["recording"] = self._rr_recording
+
+                if hasattr(rr, "set_time"):
+                    rr.set_time("frame", sequence=int(frame_index), **rr_kwargs)
+                    rr.set_time("time", duration=float(elapsed_s), **rr_kwargs)
+                else:
+                    rr.set_time_sequence("frame", int(frame_index), **rr_kwargs)
+                    rr.set_time_seconds("time", float(elapsed_s), **rr_kwargs)
+
+                rr_image = rr.Image(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+                if hasattr(rr_image, "compress"):
+                    rr_image = rr_image.compress()
+                rr.log("camera/rgb", rr_image, **rr_kwargs)
+                scalar_cls = getattr(rr, "Scalars", None)
+                if scalar_cls is None:
+                    scalar_cls = getattr(rr, "Scalar")
+                rr.log("tactile/total_norm", scalar_cls(total_norm), **rr_kwargs)
+                if hasattr(rr, "TextLog"):
+                    rr.log("tactile/status", rr.TextLog(status), **rr_kwargs)
+                tactile_values = values.reshape(num_mags, 3) if num_mags > 0 else np.zeros((0, 3), dtype=np.float32)
+                for mag_idx, mag_values in enumerate(tactile_values):
+                    bx, by, bz = [float(value) for value in mag_values]
+                    mag_norm = float(np.linalg.norm(mag_values))
+                    rr.log(f"tactile/mag_{mag_idx}/x", scalar_cls(bx), **rr_kwargs)
+                    rr.log(f"tactile/mag_{mag_idx}/y", scalar_cls(by), **rr_kwargs)
+                    rr.log(f"tactile/mag_{mag_idx}/z", scalar_cls(bz), **rr_kwargs)
+                    rr.log(f"tactile/mag_{mag_idx}/norm", scalar_cls(mag_norm), **rr_kwargs)
+            except Exception as exc:
+                self._rerun_active = False
+                self._tactile_sidecar_status = f"rerun write failed; disabled: {exc}"
+                print(f"[WARN] {self._tactile_sidecar_status}", flush=True)
+
+    def _sidecar_paths_for_video(self, video_path: Path):
+        return [
+            get_tactile_csv_sidecar_path(video_path),
+            get_rerun_sidecar_path(video_path),
+        ]
+
+    def _move_sidecars(self, pending_path: Path, final_path: Path):
+        for source_path, target_path in zip(self._sidecar_paths_for_video(pending_path), self._sidecar_paths_for_video(final_path)):
+            if not source_path.exists():
+                continue
+            if target_path.exists():
+                target_path.unlink()
+            shutil.move(str(source_path), str(target_path))
+            if self._csv_path == source_path:
+                self._csv_path = target_path
+            if self._rrd_path == source_path:
+                self._rrd_path = target_path
+
+    def _remove_sidecars(self, video_path: Path | None):
+        if video_path is None:
+            return
+        for path in self._sidecar_paths_for_video(video_path):
+            if path.exists():
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
+            if self._csv_path == path:
+                self._csv_path = None
+            if self._rrd_path == path:
+                self._rrd_path = None
+
     def _render_pending_video_with_config_overlay(self, pending_path: Path, final_path: Path, config_id):
         capture = cv2.VideoCapture(str(pending_path))
         if not capture.isOpened():
@@ -771,7 +1167,16 @@ class HandoverVideoRecorderService:
             return "pending_save"
         return "idle"
 
-    def _start_recording_locked(self, *, task_start_timestamp_iso, task_started_at, initial_frame=None):
+    def _start_recording_locked(
+        self,
+        *,
+        task_start_timestamp_iso,
+        task_started_at,
+        initial_frame=None,
+        initial_tactile_snapshot=None,
+        initial_timestamp=None,
+        initial_perf=None,
+    ):
         pending_path = get_unique_pending_path(self.pending_dir, task_started_at)
         writer = open_writer(
             pending_path,
@@ -791,8 +1196,22 @@ class HandoverVideoRecorderService:
         self._task_start_timestamp_iso = task_start_timestamp_iso
         self._pending_start_task_timestamp_iso = None
         self._pending_start_task_started_at = None
+        self._open_sidecars_locked(pending_path)
         if initial_frame is not None:
             self._writer.write(initial_frame)
+            snapshot = initial_tactile_snapshot
+            if snapshot is None:
+                snapshot = self._snapshot_tactile(refresh=True)
+            timestamp = initial_timestamp if initial_timestamp is not None else task_started_at
+            perf_s = initial_perf if initial_perf is not None else time.perf_counter()
+            self._write_sidecars_locked(
+                initial_frame,
+                frame_index=0,
+                elapsed_s=max((timestamp - task_started_at).total_seconds(), 0.0),
+                timestamp=timestamp,
+                perf_s=perf_s,
+                tactile_snapshot=snapshot,
+            )
             self._frame_count = 1
         return True, f"recording in progress: {pending_path.name}"
 
@@ -852,6 +1271,9 @@ class HandoverVideoRecorderService:
                 "has_live_frame": self._latest_frame is not None,
                 "last_frame_age_ms": last_frame_age_ms,
                 "capture_error_count": int(self._capture_error_count),
+                "tactile_logging": self._tactile_sidecar_status,
+                "tactile_csv_file": self._csv_path.name if self._csv_path is not None else "-",
+                "tactile_rerun_file": self._rrd_path.name if self._rrd_path is not None else "-",
                 "url": self.url,
             }
 
@@ -902,6 +1324,14 @@ class HandoverVideoRecorderService:
 
             if self._frame_count <= 0 and self._latest_frame is not None and self._writer is not None:
                 self._writer.write(self._latest_frame)
+                self._write_sidecars_locked(
+                    self._latest_frame,
+                    frame_index=0,
+                    elapsed_s=0.0,
+                    timestamp=datetime.now(),
+                    perf_s=time.perf_counter(),
+                    tactile_snapshot=self._snapshot_tactile(refresh=True),
+                )
                 self._frame_count = 1
 
             self._recording = False
@@ -909,6 +1339,7 @@ class HandoverVideoRecorderService:
             pending_name = self._current_path.name if self._current_path is not None else "-"
             saved_frames = int(self._frame_count)
             self._close_writer_locked()
+            self._close_sidecars_locked()
             self._last_status = f"ready to save pending recording: {pending_name} ({saved_frames} frames)"
             return True, self._last_status
 
@@ -940,6 +1371,7 @@ class HandoverVideoRecorderService:
 
         try:
             self._render_pending_video_with_config_overlay(pending_path, final_path, config_id)
+            self._move_sidecars(pending_path, final_path)
         except Exception as exc:
             if final_path.exists():
                 final_path.unlink()
@@ -972,6 +1404,64 @@ class HandoverVideoRecorderService:
             self._last_status = f"saved: {final_path.name}"
             return True, self._last_status
 
+    def finish_and_save_plain_recording(self):
+        with self._lock:
+            if self._pending_start_task_started_at is not None and not self._recording:
+                self._last_status = "recording has not started yet; still waiting for live frame"
+                return False, self._last_status
+            if not self._recording and not self._pending_save:
+                self._last_status = "no active recording to save"
+                return False, self._last_status
+            if self._current_path is None:
+                self._last_status = "no recording file to save"
+                return False, self._last_status
+
+            if self._recording and self._frame_count <= 0 and self._latest_frame is not None and self._writer is not None:
+                self._writer.write(self._latest_frame)
+                self._write_sidecars_locked(
+                    self._latest_frame,
+                    frame_index=0,
+                    elapsed_s=0.0,
+                    timestamp=datetime.now(),
+                    perf_s=time.perf_counter(),
+                    tactile_snapshot=self._snapshot_tactile(refresh=True),
+                )
+                self._frame_count = 1
+
+            self._recording = False
+            self._pending_save = True
+            self._close_writer_locked()
+            self._close_sidecars_locked()
+
+            pending_path = self._current_path
+            task_started_at = self._task_started_at or datetime.now()
+            final_path = get_unique_plain_video_path(self.save_dir, timestamp=task_started_at)
+            pending_size = pending_path.stat().st_size if pending_path.exists() else 0
+            if self._frame_count <= 0 or pending_size <= 512:
+                self._last_status = (
+                    "cannot save video: recording has no frames. "
+                    "Wait for the live preview before starting or finish later."
+                )
+                return False, self._last_status
+
+        try:
+            shutil.move(str(pending_path), str(final_path))
+            self._move_sidecars(pending_path, final_path)
+        except Exception as exc:
+            with self._lock:
+                self._last_status = f"failed to save video: {exc}"
+            return False, self._last_status
+
+        with self._lock:
+            self._pending_save = False
+            self._current_path = None
+            self._last_saved_path = final_path
+            self._task_start_timestamp_iso = None
+            self._task_started_at = None
+            self._frame_count = 0
+            self._last_status = f"saved: {final_path.name}"
+            return True, self._last_status
+
     def discard_pending_recording(self):
         with self._lock:
             path = self._current_path
@@ -984,6 +1474,7 @@ class HandoverVideoRecorderService:
             self._recording = False
             self._pending_save = False
             self._close_writer_locked()
+            self._close_sidecars_locked()
             self._current_path = None
             self._frame_count = 0
             self._last_saved_path = None
@@ -994,12 +1485,15 @@ class HandoverVideoRecorderService:
 
         if path is not None and path.exists():
             path.unlink()
+        self._remove_sidecars(path)
 
         with self._lock:
             self._last_status = "recording discarded"
             return True, self._last_status
 
     def open_browser(self):
+        if not self.web_ui_enabled:
+            return False, "web UI disabled; press s to save directly"
         url = self.url
         opened = False
         try:
@@ -1071,6 +1565,8 @@ class HandoverVideoRecorderService:
 
     def _register_routes(self):
         app = self._app
+        if app is None:
+            return
 
         @app.route("/")
         def index():

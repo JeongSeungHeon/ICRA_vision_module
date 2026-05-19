@@ -154,6 +154,7 @@ class RtdeController:
         self._mock_pose = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         self._mock_speed = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         self._mock_force = (0.0, 0.0, 0.0)
+        self._mock_joint_positions = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         self._mock_joint_currents = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
         self.last_debug = RtdeControllerDebug(
@@ -378,6 +379,78 @@ class RtdeController:
             print(f"[rtde_controller] move_home failed: {exc}", flush=True)
             return False
 
+    def move_to_joint_positions(
+        self,
+        joints_rad: Sequence[float],
+        *,
+        speed_rad_s: float = 0.5,
+        acceleration_rad_s2: float = 0.5,
+        async_move: bool = True,
+    ) -> bool:
+        """Move the robot to an absolute joint target using RTDE moveJ."""
+        target = self._to_joint_tuple(joints_rad)
+        if target is None:
+            return False
+
+        with self._rtde_lock:
+            self.connect()
+
+            self._move_in_progress = False
+            self._pending_move_target = None
+
+            if self._using_mock:
+                self._mock_joint_positions = target
+                print(
+                    "[rtde_controller] Joint target reached (mock): "
+                    "q=(%.3f, %.3f, %.3f, %.3f, %.3f, %.3f)"
+                    % target,
+                    flush=True,
+                )
+                return True
+
+            move_j = getattr(self._rtde_control, "moveJ", None)
+            if not callable(move_j):
+                self._last_error = "RTDE control interface does not expose moveJ"
+                return False
+
+            try:
+                move_j(list(target), float(speed_rad_s), float(acceleration_rad_s2), bool(async_move))
+                self._last_error = None
+                return True
+            except TypeError:
+                try:
+                    move_j(list(target), float(speed_rad_s), float(acceleration_rad_s2))
+                    self._last_error = None
+                    return True
+                except Exception as exc:
+                    self._last_error = str(exc)
+                    print(f"[rtde_controller] move_to_joint_positions failed: {exc}", flush=True)
+                    return False
+            except Exception as exc:
+                self._last_error = str(exc)
+                print(f"[rtde_controller] move_to_joint_positions failed: {exc}", flush=True)
+                return False
+
+    def stop_joint_motion(self) -> None:
+        """Stop an active joint move when supported by the RTDE interface."""
+        with self._rtde_lock:
+            if self._using_mock:
+                return
+            stop_j = getattr(self._rtde_control, "stopJ", None)
+            if callable(stop_j):
+                try:
+                    stop_j(self.stop_acceleration)
+                    return
+                except TypeError:
+                    try:
+                        stop_j()
+                        return
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            self._safe_stop_motion()
+
     def _resolve_home_orientation(self) -> Optional[Tuple[float, float, float]]:
         """Convert home_pose_orientation (RPY or rotvec) to RTDE rotvec 3-tuple."""
         if self.fixed_orientation_format == "rpy":
@@ -449,6 +522,7 @@ class RtdeController:
                     actual_tcp_speed=self._map_incoming_pose6(self._mock_speed),
                     actual_tcp_force_base=self._map_incoming_vec3(self._mock_force),
                     tcp_force_norm_n=tcp_force_norm,
+                    joint_positions=self._mock_joint_positions,
                     joint_currents_a=self._mock_joint_currents,
                     mean_joint_current_a=mean_joint_current,
                     gripper_state=self._last_gripper_state,

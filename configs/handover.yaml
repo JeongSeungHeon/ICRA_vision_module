@@ -2,6 +2,21 @@ system:
   # 카메라별 fps가 비어 있을 때 DualSensorHub가 쓰는 기본 센서 FPS입니다.
   sensor_fps: 30
 
+video_recording:
+  web_ui:
+    # true이면 기존 Flask web UI에서 config 선택 후 저장합니다.
+    # false이면 web UI 없이 s 키 입력 시 바로 mp4를 저장합니다.
+    enabled: false
+  tactile_logging:
+    # true이면 video recorder capture thread에서 frame과 같은 타임라인으로 tactile sidecar를 기록합니다.
+    enabled: true
+    # true이면 분석용 baseline-subtracted tactile 값을 CSV로 저장합니다.
+    csv_enabled: true
+    # true이면 Rerun .rrd 시각화 파일도 함께 저장합니다. rerun 패키지가 없으면 CSV만 저장합니다.
+    rerun_enabled: true
+    # true이면 Rerun viewer를 live로 띄웁니다. 기본은 파일 저장만 합니다.
+    rerun_live: false
+
 frames:
   height_axis:
     # 리프트 감지, hand clearance, grasp 후보 필터링에서 높이로 볼 robot base 축입니다.
@@ -456,7 +471,7 @@ robot:
     release_timeout_s: 1.0
     # tactile release descent에서 허용할 최소 robot base Z입니다.
     release_descent_min_z_mm: 45.0
-    # tactile release descent 중 한 번에 내릴 Z step입니다.
+    # legacy step mode용 값입니다. 현재 single-target tactile release descent에서는 사용하지 않습니다.
     release_descent_step_mm: 2.0
     # tactile release descent 중 step 사이 tactile 확인 주기입니다.
     release_descent_poll_dt_s: 0.03

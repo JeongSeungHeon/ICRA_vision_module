@@ -85,6 +85,7 @@ execute_tactile_release_descent = _MODULE.execute_tactile_release_descent
 estimate_gripper_template_width_cm = _MODULE.estimate_gripper_template_width_cm
 AnySkinTactileManager = _MODULE.AnySkinTactileManager
 HOME_PLACE_MIN_Z_MM = _MODULE.HOME_PLACE_MIN_Z_MM
+HOME_JOINTS_DEG = _MODULE.HOME_JOINTS_DEG
 PRE_RELEASE_MIN_Z_EPSILON_MM = _MODULE.PRE_RELEASE_MIN_Z_EPSILON_MM
 RELEASE_PARAMETER_MM = _MODULE.RELEASE_PARAMETER_MM
 apply_config_defaults = _MODULE.apply_config_defaults
@@ -234,6 +235,20 @@ class DummyCloseController:
         self.stop_count += 1
 
 
+class DummyPoseController:
+    def __init__(self, poses_mm):
+        self._poses_mm = list(poses_mm)
+
+    def read_robot_state(self, *, now_timestamp=None):
+        del now_timestamp
+        if not self._poses_mm:
+            pose_mm = None
+        else:
+            pose_mm = self._poses_mm.pop(0)
+        pose_base = None if pose_mm is None else tuple(float(v) / 1000.0 for v in (*pose_mm, 0.0, 0.0, 0.0))
+        return SimpleNamespace(actual_tcp_pose_base=pose_base)
+
+
 class DummyTactile:
     enabled = True
 
@@ -290,6 +305,32 @@ class DummySharedStateForPlace:
         self.task_state = task_state
 
 
+class DummyJointHomeController:
+    def __init__(self):
+        self.calls = []
+        self.joint_positions = None
+        self.stop_called = False
+
+    def move_to_joint_positions(self, joints_rad, *, speed_rad_s, acceleration_rad_s2, async_move):
+        self.calls.append(
+            {
+                "joints_rad": tuple(float(v) for v in joints_rad),
+                "speed_rad_s": float(speed_rad_s),
+                "acceleration_rad_s2": float(acceleration_rad_s2),
+                "async_move": bool(async_move),
+            }
+        )
+        self.joint_positions = self.calls[-1]["joints_rad"]
+        return True
+
+    def read_robot_state(self, *, now_timestamp=None):
+        del now_timestamp
+        return SimpleNamespace(joint_positions=self.joint_positions)
+
+    def stop_joint_motion(self):
+        self.stop_called = True
+
+
 def config_args():
     return SimpleNamespace(
         robot_ip=None,
@@ -331,6 +372,24 @@ def place_args(*, tactile_enabled=False, pre_release_enabled=True, pre_release_d
 
 
 class GripperThresholdConfigTests(unittest.TestCase):
+    def test_home_joint_degrees_are_converted_to_radians(self):
+        expected = tuple(float(np.deg2rad(value)) for value in HOME_JOINTS_DEG)
+        self.assertEqual(_MODULE.get_home_joints_rad(), expected)
+
+    def test_move_robot_to_home_pose_sends_joint_home_target(self):
+        controller = DummyJointHomeController()
+        args = SimpleNamespace(move_timeout_s=0.1)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            _MODULE.move_robot_to_home_pose(controller, args)
+
+        self.assertEqual(len(controller.calls), 1)
+        self.assertEqual(controller.calls[0]["joints_rad"], _MODULE.get_home_joints_rad())
+        self.assertEqual(controller.calls[0]["speed_rad_s"], _MODULE.HOME_JOINT_SPEED_RAD_S)
+        self.assertEqual(controller.calls[0]["acceleration_rad_s2"], _MODULE.HOME_JOINT_ACCELERATION_RAD_S2)
+        self.assertTrue(controller.calls[0]["async_move"])
+        self.assertFalse(controller.stop_called)
+
     def test_pre_release_descend_disabled_keeps_place_z(self):
         target, debug = compute_pre_release_descend_target_mm(10.0, 20.0, 100.0, release_args())
 
@@ -714,45 +773,82 @@ class TactileConfigAndBehaviorTests(unittest.TestCase):
     def test_tactile_release_descent_triggers_and_stops(self):
         tactile = DummyTactile([10.0, 20.0])
         tactile.set_release_reference(10.0)
-        targets_mm = []
+        controller = DummyPoseController([(100.0, 100.0, 50.0), (100.0, 100.0, 49.0)])
+        sent_commands = []
 
-        def fake_move(controller, target_position_base, fixed_orientation_base, *, timeout_s, tolerance_m, source_mode):
-            del controller, fixed_orientation_base, timeout_s, tolerance_m, source_mode
-            targets_mm.append(tuple(np.asarray(target_position_base, dtype=np.float32) * 1000.0))
-            return True
+        def fake_send(controller, command_type, *, target_position_base=None, fixed_orientation_base=None, gripper_action=None, source_mode):
+            del controller, fixed_orientation_base, gripper_action
+            sent_commands.append((command_type, tuple(np.asarray(target_position_base, dtype=np.float32) * 1000.0), source_mode))
+            return None
 
         with contextlib.redirect_stdout(io.StringIO()):
-            with unittest.mock.patch.object(_MODULE, "move_robot_and_wait", side_effect=fake_move):
-                with unittest.mock.patch.object(_MODULE, "safe_stop_rtde") as safe_stop:
-                    result = execute_tactile_release_descent(
-                        SimpleNamespace(),
-                        tactile,
-                        (0.0, 0.0, 0.0),
-                        (100.0, 100.0, 50.0),
-                        place_args(tactile_enabled=True),
-                    )
+            with unittest.mock.patch.object(_MODULE, "move_robot_and_wait") as move_wait:
+                with unittest.mock.patch.object(_MODULE, "send_robot_command", side_effect=fake_send) as send_command:
+                    with unittest.mock.patch.object(_MODULE, "safe_stop_rtde") as safe_stop:
+                        result = execute_tactile_release_descent(
+                            controller,
+                            tactile,
+                            (0.0, 0.0, 0.0),
+                            (100.0, 100.0, 50.0),
+                            place_args(tactile_enabled=True),
+                        )
 
         self.assertTrue(result["triggered"])
         self.assertFalse(result["reached_min_z"])
-        self.assertAlmostEqual(result["release_pose_mm"][2], 48.0)
-        self.assertEqual(len(targets_mm), 1)
+        self.assertAlmostEqual(result["release_pose_mm"][2], 49.0)
+        self.assertEqual(len(sent_commands), 1)
+        self.assertEqual(sent_commands[0][0], "move_to_position")
+        self.assertAlmostEqual(sent_commands[0][1][2], 45.0)
+        self.assertEqual(sent_commands[0][2], "tactile_release_descent")
+        send_command.assert_called_once()
+        move_wait.assert_not_called()
         safe_stop.assert_called()
 
     def test_tactile_release_descent_stops_at_min_z_without_trigger(self):
         tactile = DummyTactile([10.0, 11.0, 11.0, 11.0, 11.0])
         tactile.set_release_reference(10.0)
-        targets_mm = []
+        controller = DummyPoseController([
+            (100.0, 100.0, 50.0),
+            (100.0, 100.0, 48.0),
+            (100.0, 100.0, 45.0),
+        ])
+        sent_commands = []
 
-        def fake_move(controller, target_position_base, fixed_orientation_base, *, timeout_s, tolerance_m, source_mode):
-            del controller, fixed_orientation_base, timeout_s, tolerance_m, source_mode
-            targets_mm.append(tuple(np.asarray(target_position_base, dtype=np.float32) * 1000.0))
-            return True
+        def fake_send(controller, command_type, *, target_position_base=None, fixed_orientation_base=None, gripper_action=None, source_mode):
+            del controller, fixed_orientation_base, gripper_action
+            sent_commands.append((command_type, tuple(np.asarray(target_position_base, dtype=np.float32) * 1000.0), source_mode))
+            return None
 
         with contextlib.redirect_stdout(io.StringIO()):
-            with unittest.mock.patch.object(_MODULE, "move_robot_and_wait", side_effect=fake_move):
+            with unittest.mock.patch.object(_MODULE, "move_robot_and_wait") as move_wait:
+                with unittest.mock.patch.object(_MODULE, "send_robot_command", side_effect=fake_send):
+                    with unittest.mock.patch.object(_MODULE, "safe_stop_rtde") as safe_stop:
+                        result = execute_tactile_release_descent(
+                            controller,
+                            tactile,
+                            (0.0, 0.0, 0.0),
+                            (100.0, 100.0, 50.0),
+                            place_args(tactile_enabled=True),
+                        )
+
+        self.assertFalse(result["triggered"])
+        self.assertTrue(result["reached_min_z"])
+        self.assertAlmostEqual(result["release_pose_mm"][2], 45.0)
+        self.assertEqual(len(sent_commands), 1)
+        self.assertAlmostEqual(sent_commands[0][1][2], 45.0)
+        move_wait.assert_not_called()
+        safe_stop.assert_called()
+
+    def test_tactile_release_descent_times_out_when_pose_missing(self):
+        tactile = DummyTactile([10.0])
+        tactile.set_release_reference(10.0)
+        controller = DummyPoseController([None])
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            with unittest.mock.patch.object(_MODULE, "send_robot_command") as send_command:
                 with unittest.mock.patch.object(_MODULE, "safe_stop_rtde") as safe_stop:
                     result = execute_tactile_release_descent(
-                        SimpleNamespace(),
+                        controller,
                         tactile,
                         (0.0, 0.0, 0.0),
                         (100.0, 100.0, 50.0),
@@ -760,9 +856,10 @@ class TactileConfigAndBehaviorTests(unittest.TestCase):
                     )
 
         self.assertFalse(result["triggered"])
-        self.assertTrue(result["reached_min_z"])
-        self.assertAlmostEqual(result["release_pose_mm"][2], 45.0)
-        self.assertEqual([round(target[2], 3) for target in targets_mm], [48.0, 46.0, 45.0])
+        self.assertTrue(result["timed_out"])
+        self.assertFalse(result["reached_min_z"])
+        self.assertEqual(result["release_pose_mm"], (100.0, 100.0, 50.0))
+        send_command.assert_called_once()
         safe_stop.assert_called()
 
     def test_return_place_non_tactile_uses_fixed_pre_release_move(self):
@@ -777,7 +874,7 @@ class TactileConfigAndBehaviorTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             with unittest.mock.patch.object(_MODULE, "move_robot_and_wait", side_effect=fake_move):
                 with unittest.mock.patch.object(_MODULE, "execute_gripper_open", return_value=True):
-                    with unittest.mock.patch.object(_MODULE, "get_base_pose_target", return_value=(None, None)):
+                    with unittest.mock.patch.object(_MODULE, "move_robot_to_home_pose", return_value=None):
                         ok = execute_return_and_place(
                             SimpleNamespace(),
                             shared_state,
@@ -815,7 +912,7 @@ class TactileConfigAndBehaviorTests(unittest.TestCase):
             with unittest.mock.patch.object(_MODULE, "move_robot_and_wait", side_effect=fake_move):
                 with unittest.mock.patch.object(_MODULE, "execute_tactile_release_descent", side_effect=fake_descent) as descent:
                     with unittest.mock.patch.object(_MODULE, "execute_gripper_open", return_value=True):
-                        with unittest.mock.patch.object(_MODULE, "get_base_pose_target", return_value=(None, None)):
+                        with unittest.mock.patch.object(_MODULE, "move_robot_to_home_pose", return_value=None):
                             ok = execute_return_and_place(
                                 SimpleNamespace(),
                                 shared_state,
@@ -847,7 +944,7 @@ class TactileConfigAndBehaviorTests(unittest.TestCase):
             with unittest.mock.patch.object(_MODULE, "move_robot_and_wait", side_effect=fake_move):
                 with unittest.mock.patch.object(_MODULE, "execute_tactile_release_descent") as descent:
                     with unittest.mock.patch.object(_MODULE, "execute_gripper_open") as gripper_open:
-                        with unittest.mock.patch.object(_MODULE, "get_base_pose_target", return_value=(None, None)):
+                        with unittest.mock.patch.object(_MODULE, "move_robot_to_home_pose", return_value=None):
                             ok = execute_return_and_place(
                                 SimpleNamespace(),
                                 shared_state,

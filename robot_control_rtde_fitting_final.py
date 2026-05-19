@@ -111,14 +111,10 @@ DEFAULT_TACTILE_RELEASE_TIMEOUT_S = 1.0
 DEFAULT_TACTILE_RELEASE_DESCENT_STEP_MM = 2.0
 DEFAULT_TACTILE_RELEASE_DESCENT_POLL_DT_S = 0.03
 DEFAULT_TACTILE_AUTO_BASELINE_RESET_AFTER_OPEN_S = 1.5
-BASE_POSE = {
-    "x": 208.0,
-    "y": 102.0,
-    "z": 308.0,
-    "roll": 90.0,
-    "pitch": 0.0,
-    "yaw": 90.0,
-}
+HOME_JOINTS_DEG = [0.0, -135.0, 135.0, 0.0, 90.0, 0.0]
+HOME_JOINT_TOLERANCE_DEG = 1.0
+HOME_JOINT_SPEED_RAD_S = 0.5
+HOME_JOINT_ACCELERATION_RAD_S2 = 0.5
 VIDEO_RECORDER_SERIAL = "335522072904"
 VIDEO_RECORDER_PORT = 5000
 
@@ -321,7 +317,7 @@ def parse_args():
     parser.add_argument(
         "--record-video",
         action="store_true",
-        help="Enable task video recording. Press 's' to finish the current recording and open the recorder UI.",
+        help="Enable task video recording. Press 's' to finish/save using the configured recorder flow.",
     )
     parser.add_argument(
         "--profile-runtime",
@@ -364,6 +360,25 @@ def load_yaml_config(path):
     """Load the YAML runtime config used by cameras, perception, safety, and RTDE."""
     with open(path, "r", encoding="utf-8") as handle:
         return yaml.safe_load(handle) or {}
+
+
+def get_video_recorder_web_ui_enabled(config):
+    """Return whether task video recording should use the web UI finalize flow."""
+    video_cfg = dict((config or {}).get("video_recording", {}) or {})
+    web_ui_cfg = dict(video_cfg.get("web_ui", {}) or {})
+    return bool(web_ui_cfg.get("enabled", True))
+
+
+def get_video_recorder_tactile_logging_config(config):
+    """Return tactile sidecar logging switches for the task video recorder."""
+    video_cfg = dict((config or {}).get("video_recording", {}) or {})
+    tactile_cfg = dict(video_cfg.get("tactile_logging", {}) or {})
+    return {
+        "enabled": bool(tactile_cfg.get("enabled", True)),
+        "csv_enabled": bool(tactile_cfg.get("csv_enabled", True)),
+        "rerun_enabled": bool(tactile_cfg.get("rerun_enabled", True)),
+        "rerun_live": bool(tactile_cfg.get("rerun_live", False)),
+    }
 
 
 def apply_config_defaults(args, config):
@@ -615,6 +630,7 @@ class AnySkinTactileManager:
             float(getattr(args, "tactile_contact_norm_threshold", DEFAULT_TACTILE_CONTACT_NORM_THRESHOLD)),
         )
         self.debug = bool(getattr(args, "tactile_debug", True))
+        self.lock = threading.RLock()
         self.stream = None
         self.baseline = None
         self.latest = np.zeros(self.num_mags * 3, dtype=np.float32)
@@ -652,67 +668,96 @@ class AnySkinTactileManager:
             raise RuntimeError(f"Failed to start AnySkin tactile reader on {self.port}: {exc}") from exc
 
     def reset_baseline(self):
-        if self.stream is None:
-            return False
-        try:
-            baseline_data = self.stream.get_data(num_samples=self.baseline_samples)
-            baseline_data = np.asarray(baseline_data, dtype=np.float32)
-            if baseline_data.ndim != 2 or baseline_data.shape[1] < self.num_mags * 3 + 1:
-                raise RuntimeError(f"Unexpected AnySkin baseline shape: {baseline_data.shape}")
-            self.baseline = np.mean(baseline_data[:, 1 : 1 + self.num_mags * 3], axis=0)
+        with self.lock:
+            if self.stream is None:
+                return False
+            try:
+                baseline_data = self.stream.get_data(num_samples=self.baseline_samples)
+                baseline_data = np.asarray(baseline_data, dtype=np.float32)
+                if baseline_data.ndim != 2 or baseline_data.shape[1] < self.num_mags * 3 + 1:
+                    raise RuntimeError(f"Unexpected AnySkin baseline shape: {baseline_data.shape}")
+                self.baseline = np.mean(baseline_data[:, 1 : 1 + self.num_mags * 3], axis=0)
+                self.latest = np.zeros(self.num_mags * 3, dtype=np.float32)
+                self.latest_norm = 0.0
+                self.last_error = None
+                if self.debug:
+                    print("[Tactile] Baseline reset.")
+                return True
+            except Exception as exc:
+                self.last_error = str(exc)
+                self.status = "read_error"
+                print(f"[WARN] Tactile baseline reset failed: {exc}")
+                return False
+
+    def read(self):
+        with self.lock:
+            if not self.enabled or self.stream is None:
+                return self.latest.copy()
+            if self.baseline is None:
+                self.reset_baseline()
+            try:
+                sensor_data = self.stream.get_data(num_samples=1)[0]
+                sensor_data = np.asarray(sensor_data, dtype=np.float32)[1 : 1 + self.num_mags * 3]
+                if sensor_data.shape[0] != self.num_mags * 3:
+                    raise RuntimeError(f"Unexpected AnySkin sample length: {sensor_data.shape[0]}")
+                self.latest = sensor_data - self.baseline
+                self.latest_norm = float(np.linalg.norm(self.latest))
+                self.last_error = None
+                if self.status == "read_error":
+                    self.status = "ready"
+                return self.latest.copy()
+            except Exception as exc:
+                self.last_error = str(exc)
+                self.status = "read_error"
+                print(f"[WARN] Tactile read failed: {exc}")
+                return self.latest.copy()
+
+    def total_norm(self):
+        with self.lock:
+            self.read()
+            return float(self.latest_norm)
+
+    def snapshot(self, *, refresh=True):
+        with self.lock:
+            if refresh:
+                self.read()
+            return {
+                "values": np.asarray(self.latest, dtype=np.float32).copy(),
+                "num_mags": int(self.num_mags),
+                "total_norm": float(self.latest_norm),
+                "release_ref_norm": self.release_reference_norm,
+                "release_delta_norm": self.release_delta_norm,
+                "status": str(self.release_status),
+                "error": self.last_error,
+            }
+
+    def clear_runtime_state(self, *, release_status="reset_cleared"):
+        with self.lock:
+            self.release_reference_norm = None
+            self.release_delta_norm = None
+            self.release_status = str(release_status)
             self.latest = np.zeros(self.num_mags * 3, dtype=np.float32)
             self.latest_norm = 0.0
             self.last_error = None
-            if self.debug:
-                print("[Tactile] Baseline reset.")
-            return True
-        except Exception as exc:
-            self.last_error = str(exc)
-            self.status = "read_error"
-            print(f"[WARN] Tactile baseline reset failed: {exc}")
-            return False
-
-    def read(self):
-        if not self.enabled or self.stream is None:
-            return self.latest
-        if self.baseline is None:
-            self.reset_baseline()
-        try:
-            sensor_data = self.stream.get_data(num_samples=1)[0]
-            sensor_data = np.asarray(sensor_data, dtype=np.float32)[1 : 1 + self.num_mags * 3]
-            if sensor_data.shape[0] != self.num_mags * 3:
-                raise RuntimeError(f"Unexpected AnySkin sample length: {sensor_data.shape[0]}")
-            self.latest = sensor_data - self.baseline
-            self.latest_norm = float(np.linalg.norm(self.latest))
-            self.last_error = None
-            if self.status == "read_error":
-                self.status = "ready"
-            return self.latest
-        except Exception as exc:
-            self.last_error = str(exc)
-            self.status = "read_error"
-            print(f"[WARN] Tactile read failed: {exc}")
-            return self.latest
-
-    def total_norm(self):
-        self.read()
-        return float(self.latest_norm)
 
     def set_release_reference(self, reference_norm):
-        self.release_reference_norm = None if reference_norm is None else float(reference_norm)
-        self.release_delta_norm = None
-        self.release_status = "armed" if reference_norm is not None else "off"
+        with self.lock:
+            self.release_reference_norm = None if reference_norm is None else float(reference_norm)
+            self.release_delta_norm = None
+            self.release_status = "armed" if reference_norm is not None else "off"
 
     def update_release_delta(self, current_norm):
-        if self.release_reference_norm is None:
-            self.release_delta_norm = None
-            return None
-        self.release_delta_norm = abs(float(current_norm) - float(self.release_reference_norm))
-        return self.release_delta_norm
+        with self.lock:
+            if self.release_reference_norm is None:
+                self.release_delta_norm = None
+                return None
+            self.release_delta_norm = abs(float(current_norm) - float(self.release_reference_norm))
+            return self.release_delta_norm
 
     def close(self):
-        stream = self.stream
-        self.stream = None
+        with self.lock:
+            stream = self.stream
+            self.stream = None
         if stream is None:
             return
         try:
@@ -804,7 +849,12 @@ class TactileDebugWindow:
             if event.type == pygame.KEYDOWN and event.key == pygame.K_b:
                 self.tactile_manager.reset_baseline()
 
-        tactile_data = np.asarray(self.tactile_manager.latest, dtype=np.float32).copy()
+        if hasattr(self.tactile_manager, "snapshot"):
+            tactile_snapshot = self.tactile_manager.snapshot(refresh=False)
+            tactile_values = tactile_snapshot.get("values", [])
+        else:
+            tactile_values = self.tactile_manager.latest
+        tactile_data = np.asarray(tactile_values, dtype=np.float32).copy()
         expected_values = int(getattr(self.tactile_manager, "num_mags", DEFAULT_TACTILE_NUM_MAGS)) * 3
         if tactile_data.size < expected_values:
             padded = np.zeros((expected_values,), dtype=np.float32)
@@ -956,16 +1006,15 @@ def compute_close_range_ref_step_xyz(ref_err_xyz, max_step_xy, max_step_z, *, fo
 
 
 
+def get_home_joints_rad():
+    """Return the configured HOME joint target in radians."""
+    return tuple(float(np.deg2rad(value)) for value in HOME_JOINTS_DEG)
+
+
 def get_base_pose_target(controller):
-    """Build the fixed HOME xyz target while preserving the robot's current orientation."""
-    state = controller.read_robot_state(now_timestamp=time.time())
-    pose = state.actual_tcp_pose_base
-    if pose is None:
-        raise RuntimeError("Failed to read current TCP pose for BASE_POSE move.")
-    return (
-        mm_to_m_tuple([BASE_POSE["x"], BASE_POSE["y"], BASE_POSE["z"]]),
-        tuple(float(v) for v in pose[3:6]),
-    )
+    """Deprecated compatibility shim; HOME is now defined by joint positions."""
+    del controller
+    return (None, None)
 
 
 def make_robot_command(command_type, *, target_position_base=None, fixed_orientation_base=None, gripper_action=None, source_mode="manual"):
@@ -1744,6 +1793,24 @@ def wait_until_target_reached(controller, target_position_base, *, timeout_s, to
     return False
 
 
+def wait_until_joint_target_reached(controller, target_joints_rad, *, timeout_s, tolerance_rad, poll_dt=0.05):
+    """Poll the robot joints until the target is reached or the move times out."""
+    deadline = time.time() + timeout_s
+    target = np.asarray(target_joints_rad, dtype=np.float64).reshape(6)
+
+    while time.time() < deadline:
+        state = controller.read_robot_state(now_timestamp=time.time())
+        joints = getattr(state, "joint_positions", None)
+        if joints is not None:
+            current = np.asarray(joints, dtype=np.float64).reshape(6)
+            if np.all(np.isfinite(current)):
+                max_error = float(np.max(np.abs(current - target)))
+                if max_error <= tolerance_rad:
+                    return True
+        time.sleep(poll_dt)
+    return False
+
+
 def move_robot_and_wait(controller, target_position_base, fixed_orientation_base, *, timeout_s, tolerance_m, source_mode):
     """Issue one blocking position move and wait for completion."""
     send_robot_command(
@@ -1774,23 +1841,41 @@ def stop_follow_for_handoff(shared_state, timeout_s):
 
 
 def move_robot_to_home_pose(controller, args):
-    """Move the robot to the configured HOME xyz before or between tasks."""
-    base_target, base_orientation = get_base_pose_target(controller)
+    """Move the robot to the configured HOME joint target before or between tasks."""
+    home_joints_rad = get_home_joints_rad()
+    home_text = ", ".join(f"{value:.1f}" for value in HOME_JOINTS_DEG)
     print(
-        "[INFO] Moving robot to HOME position while keeping current orientation: "
-        f"x={BASE_POSE['x']:.1f}, y={BASE_POSE['y']:.1f}, z={BASE_POSE['z']:.1f}"
+        "[INFO] Moving robot to HOME joints: "
+        f"deg=[{home_text}], speed={HOME_JOINT_SPEED_RAD_S:.2f} rad/s, "
+        f"accel={HOME_JOINT_ACCELERATION_RAD_S2:.2f} rad/s^2"
     )
-    ok = move_robot_and_wait(
+    if not hasattr(controller, "move_to_joint_positions"):
+        raise RuntimeError("RTDE controller does not support joint HOME moves.")
+
+    started = bool(
+        controller.move_to_joint_positions(
+            home_joints_rad,
+            speed_rad_s=HOME_JOINT_SPEED_RAD_S,
+            acceleration_rad_s2=HOME_JOINT_ACCELERATION_RAD_S2,
+            async_move=True,
+        )
+    )
+    if not started:
+        raise RuntimeError("Failed to start HOME joint move.")
+
+    ok = wait_until_joint_target_reached(
         controller,
-        base_target,
-        base_orientation,
+        home_joints_rad,
         timeout_s=args.move_timeout_s,
-        tolerance_m=args.position_tolerance_m,
-        source_mode="startup_home_pose",
+        tolerance_rad=float(np.deg2rad(HOME_JOINT_TOLERANCE_DEG)),
     )
     if not ok:
-        raise RuntimeError("Failed to reach HOME pose during startup.")
-    print("[INFO] HOME pose reached")
+        if hasattr(controller, "stop_joint_motion"):
+            controller.stop_joint_motion()
+        else:
+            safe_stop_rtde(controller)
+        raise RuntimeError("Failed to reach HOME joints during startup.")
+    print("[INFO] HOME joints reached")
 
 
 def resolve_default_gripper_position_threshold(gripper_cfg):
@@ -2204,21 +2289,27 @@ def reset_tactile_state_for_system_reset(tactile_manager):
     if tactile_manager is None or not bool(getattr(tactile_manager, "enabled", False)):
         return False
 
-    num_mags = max(1, int(getattr(tactile_manager, "num_mags", DEFAULT_TACTILE_NUM_MAGS)))
-    tactile_manager.release_reference_norm = None
-    tactile_manager.release_delta_norm = None
-    tactile_manager.release_status = "reset_cleared"
-    tactile_manager.latest = np.zeros(num_mags * 3, dtype=np.float32)
-    tactile_manager.latest_norm = 0.0
-    tactile_manager.last_error = None
+    if hasattr(tactile_manager, "clear_runtime_state"):
+        tactile_manager.clear_runtime_state(release_status="reset_cleared")
+    else:
+        num_mags = max(1, int(getattr(tactile_manager, "num_mags", DEFAULT_TACTILE_NUM_MAGS)))
+        tactile_manager.release_reference_norm = None
+        tactile_manager.release_delta_norm = None
+        tactile_manager.release_status = "reset_cleared"
+        tactile_manager.latest = np.zeros(num_mags * 3, dtype=np.float32)
+        tactile_manager.latest_norm = 0.0
+        tactile_manager.last_error = None
 
     baseline_reset = False
     if hasattr(tactile_manager, "reset_baseline"):
         baseline_reset = bool(tactile_manager.reset_baseline())
 
-    tactile_manager.release_reference_norm = None
-    tactile_manager.release_delta_norm = None
-    tactile_manager.release_status = "reset_ready" if baseline_reset else "reset_cleared"
+    if hasattr(tactile_manager, "clear_runtime_state"):
+        tactile_manager.clear_runtime_state(release_status="reset_ready" if baseline_reset else "reset_cleared")
+    else:
+        tactile_manager.release_reference_norm = None
+        tactile_manager.release_delta_norm = None
+        tactile_manager.release_status = "reset_ready" if baseline_reset else "reset_cleared"
     print(
         "[Tactile] Reset state for system reset: "
         f"baseline_reset={baseline_reset}, ref cleared, delta cleared."
@@ -2323,7 +2414,11 @@ def print_tactile_frame_log(tactile_manager, *, stage, stage_time_s=None, **fiel
         return
 
     num_mags = max(1, int(getattr(tactile_manager, "num_mags", DEFAULT_TACTILE_NUM_MAGS)))
-    tactile_data = np.asarray(getattr(tactile_manager, "latest", []), dtype=np.float32).flatten()
+    tactile_snapshot = None
+    if hasattr(tactile_manager, "snapshot"):
+        tactile_snapshot = tactile_manager.snapshot(refresh=False)
+    tactile_values = getattr(tactile_manager, "latest", []) if tactile_snapshot is None else tactile_snapshot.get("values", [])
+    tactile_data = np.asarray(tactile_values, dtype=np.float32).flatten()
     expected_values = num_mags * 3
     if tactile_data.size < expected_values:
         padded = np.zeros((expected_values,), dtype=np.float32)
@@ -2332,12 +2427,12 @@ def print_tactile_frame_log(tactile_manager, *, stage, stage_time_s=None, **fiel
     tactile_data = tactile_data[:expected_values].reshape(num_mags, 3)
 
     time_text = "-" if stage_time_s is None else f"{float(stage_time_s):.3f}"
-    ref_norm = getattr(tactile_manager, "release_reference_norm", None)
+    ref_norm = getattr(tactile_manager, "release_reference_norm", None) if tactile_snapshot is None else tactile_snapshot.get("release_ref_norm")
     ref_text = "-" if ref_norm is None else f"{float(ref_norm):.3f}"
-    delta_norm = getattr(tactile_manager, "release_delta_norm", None)
+    delta_norm = getattr(tactile_manager, "release_delta_norm", None) if tactile_snapshot is None else tactile_snapshot.get("release_delta_norm")
     delta_text = "-" if delta_norm is None else f"{float(delta_norm):.3f}"
-    status = str(getattr(tactile_manager, "release_status", "off"))
-    norm = float(getattr(tactile_manager, "latest_norm", 0.0))
+    status = str(getattr(tactile_manager, "release_status", "off") if tactile_snapshot is None else tactile_snapshot.get("status", "off"))
+    norm = float(getattr(tactile_manager, "latest_norm", 0.0) if tactile_snapshot is None else tactile_snapshot.get("total_norm", 0.0))
     field_text = " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
     # mag_text = " ".join(
     #     f"M{idx}=({values[0]:.3f},{values[1]:.3f},{values[2]:.3f})"
@@ -2659,10 +2754,6 @@ def execute_tactile_release_descent(
         HOME_PLACE_MIN_Z_MM,
         float(getattr(args, "tactile_release_descent_min_z_mm", HOME_PLACE_MIN_Z_MM)),
     )
-    step_mm = max(
-        0.1,
-        float(getattr(args, "tactile_release_descent_step_mm", DEFAULT_TACTILE_RELEASE_DESCENT_STEP_MM)),
-    )
     poll_dt = max(
         0.0,
         float(getattr(args, "tactile_release_descent_poll_dt_s", DEFAULT_TACTILE_RELEASE_DESCENT_POLL_DT_S)),
@@ -2671,25 +2762,44 @@ def execute_tactile_release_descent(
         0.0,
         float(getattr(args, "tactile_release_delta_threshold", DEFAULT_TACTILE_RELEASE_DELTA_THRESHOLD)),
     )
-    current_z = max(start_z, min_z_mm)
+    tolerance_mm = max(0.0, float(getattr(args, "position_tolerance_m", 0.0)) * 1000.0)
+    current_pose_mm = (start_x, start_y, max(start_z, min_z_mm))
     descent_start = time.time()
+    deadline = time.time() + max(0.0, float(getattr(args, "move_timeout_s", 0.0)))
     tactile_manager.release_status = "release_descending"
 
     print(
         "[Tactile] Release descent start: "
         f"start=({start_x:.1f}, {start_y:.1f}, {start_z:.1f}), "
-        f"min_z={min_z_mm:.1f}, step={step_mm:.1f}, "
+        f"target_z={min_z_mm:.1f}, "
         f"delta_threshold={delta_threshold:.3f}."
     )
 
-    def check_trigger():
+    send_robot_command(
+        controller,
+        ROBOT_CMD_MOVE_TO_POSITION,
+        target_position_base=mm_to_m_tuple([start_x, start_y, min_z_mm]),
+        fixed_orientation_base=fixed_orientation_base,
+        gripper_action=GRIPPER_HOLD,
+        source_mode="tactile_release_descent",
+    )
+
+    def read_current_pose_mm():
+        state = controller.read_robot_state(now_timestamp=time.time())
+        pose = state.actual_tcp_pose_base
+        if pose is None:
+            return None
+        pose_mm = meters_to_mm(pose[:3])
+        return tuple(float(v) for v in pose_mm[:3])
+
+    def check_trigger(pose_mm):
         current_norm = tactile_manager.total_norm()
         delta_norm = tactile_manager.update_release_delta(current_norm)
         print_tactile_frame_log(
             tactile_manager,
             stage="release_descent",
             stage_time_s=time.time() - descent_start,
-            z_mm=f"{current_z:.1f}",
+            z_mm=f"{pose_mm[2]:.1f}",
         )
         if delta_norm is not None and delta_norm > delta_threshold:
             tactile_manager.release_status = "release_triggered"
@@ -2701,63 +2811,61 @@ def execute_tactile_release_descent(
             return True
         return False
 
-    if check_trigger():
-        safe_stop_rtde(controller)
-        return {
-            "triggered": True,
-            "timed_out": False,
-            "reached_min_z": False,
-            "release_pose_mm": (start_x, start_y, current_z),
-        }
-
-    while current_z > min_z_mm + 1e-6:
-        next_z = max(min_z_mm, current_z - step_mm)
-        ok = move_robot_and_wait(
-            controller,
-            mm_to_m_tuple([start_x, start_y, next_z]),
-            fixed_orientation_base,
-            timeout_s=args.move_timeout_s,
-            tolerance_m=args.position_tolerance_m,
-            source_mode="tactile_release_descent",
-        )
-        current_z = next_z
-        if not ok:
-            tactile_manager.release_status = "release_descent_move_timeout"
+    while True:
+        pose_mm = read_current_pose_mm()
+        if pose_mm is None:
+            tactile_manager.release_status = "release_descent_pose_missing"
             safe_stop_rtde(controller)
             print(
-                "[WARN] Tactile release descent move timed out; opening gripper at current target. "
-                f"z={current_z:.1f}."
+                "[WARN] Tactile release descent could not read current TCP pose; "
+                "opening gripper at last known target."
             )
             return {
                 "triggered": False,
                 "timed_out": True,
                 "reached_min_z": False,
-                "release_pose_mm": (start_x, start_y, current_z),
+                "release_pose_mm": current_pose_mm,
             }
+        current_pose_mm = pose_mm
 
-        if poll_dt > 0.0:
-            time.sleep(poll_dt)
-        if check_trigger():
+        if check_trigger(current_pose_mm):
             safe_stop_rtde(controller)
             return {
                 "triggered": True,
                 "timed_out": False,
                 "reached_min_z": False,
-                "release_pose_mm": (start_x, start_y, current_z),
+                "release_pose_mm": current_pose_mm,
             }
 
-    tactile_manager.release_status = "release_min_z_open"
-    safe_stop_rtde(controller)
-    print(
-        "[Tactile] Release descent reached min z without trigger; opening gripper. "
-        f"z={current_z:.1f}, min_z={min_z_mm:.1f}."
-    )
-    return {
-        "triggered": False,
-        "timed_out": False,
-        "reached_min_z": True,
-        "release_pose_mm": (start_x, start_y, current_z),
-    }
+        if current_pose_mm[2] <= min_z_mm + tolerance_mm:
+            tactile_manager.release_status = "release_min_z_open"
+            safe_stop_rtde(controller)
+            print(
+                "[Tactile] Release descent reached min z without trigger; opening gripper. "
+                f"z={current_pose_mm[2]:.1f}, min_z={min_z_mm:.1f}."
+            )
+            return {
+                "triggered": False,
+                "timed_out": False,
+                "reached_min_z": True,
+                "release_pose_mm": current_pose_mm,
+            }
+
+        if time.time() >= deadline:
+            tactile_manager.release_status = "release_descent_move_timeout"
+            safe_stop_rtde(controller)
+            print(
+                "[WARN] Tactile release descent move timed out; opening gripper at current pose. "
+                f"z={current_pose_mm[2]:.1f}, min_z={min_z_mm:.1f}."
+            )
+            return {
+                "triggered": False,
+                "timed_out": True,
+                "reached_min_z": False,
+                "release_pose_mm": current_pose_mm,
+            }
+        if poll_dt > 0.0:
+            time.sleep(poll_dt)
 
 
 def reset_tactile_baseline_after_open(tactile_manager, delay_s):
@@ -3047,20 +3155,12 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
         print("[WARN] Back off move timed out.")
         return False
 
-    base_target, base_orientation = get_base_pose_target(controller)
-    if base_target is not None:
-        ok = move_robot_and_wait(
-            controller,
-            base_target,
-            base_orientation,
-            timeout_s=args.move_timeout_s,
-            tolerance_m=args.position_tolerance_m,
-            source_mode="return_base_pose",
-        )
-        if not ok:
-            print("[WARN] Return to BASE_POSE timed out.")
+    try:
+        move_robot_to_home_pose(controller, args)
+    except Exception as exc:
+        print(f"[WARN] Return to HOME joints failed: {exc}")
+        if initial_pose_base is None:
             return False
-    elif initial_pose_base is not None:
         initial_target = tuple(float(v) for v in initial_pose_base[:3])
         initial_orientation = tuple(float(v) for v in initial_pose_base[3:6])
         ok = move_robot_and_wait(
@@ -3446,12 +3546,14 @@ def draw_tactile_status_overlay(image_bgr, tactile_manager):
     if tactile_manager is None or not bool(getattr(tactile_manager, "enabled", False)):
         return image_bgr
 
-    norm_text = f"{float(getattr(tactile_manager, 'latest_norm', 0.0)):.1f}"
-    ref_norm = getattr(tactile_manager, "release_reference_norm", None)
+    tactile_snapshot = tactile_manager.snapshot(refresh=False) if hasattr(tactile_manager, "snapshot") else None
+    norm_value = getattr(tactile_manager, "latest_norm", 0.0) if tactile_snapshot is None else tactile_snapshot.get("total_norm", 0.0)
+    norm_text = f"{float(norm_value):.1f}"
+    ref_norm = getattr(tactile_manager, "release_reference_norm", None) if tactile_snapshot is None else tactile_snapshot.get("release_ref_norm")
     ref_text = "-" if ref_norm is None else f"{float(ref_norm):.1f}"
-    delta_norm = getattr(tactile_manager, "release_delta_norm", None)
+    delta_norm = getattr(tactile_manager, "release_delta_norm", None) if tactile_snapshot is None else tactile_snapshot.get("release_delta_norm")
     delta_text = "-" if delta_norm is None else f"{float(delta_norm):.1f}"
-    status = str(getattr(tactile_manager, "release_status", "off"))
+    status = str(getattr(tactile_manager, "release_status", "off") if tactile_snapshot is None else tactile_snapshot.get("status", "off"))
     text = f"Tactile norm={norm_text} ref={ref_text} d={delta_text} {status}"
 
     origin = (12, 74)
@@ -3590,15 +3692,26 @@ def main():
         if debug_3d_recorder.save_images:
             print("[INFO] 3D debug recorder will include raw color/depth frames.")
 
+    video_recorder_web_ui_enabled = get_video_recorder_web_ui_enabled(config)
+    video_recorder_tactile_logging = get_video_recorder_tactile_logging_config(config)
     if args.record_video:
         try:
             video_recorder = HandoverVideoRecorderService(
                 serial=VIDEO_RECORDER_SERIAL,
                 port=VIDEO_RECORDER_PORT,
                 metadata_recorder=metadata_recorder,
+                web_ui_enabled=video_recorder_web_ui_enabled,
+                tactile_manager=tactile_manager,
+                tactile_logging_enabled=video_recorder_tactile_logging["enabled"],
+                tactile_csv_enabled=video_recorder_tactile_logging["csv_enabled"],
+                tactile_rerun_enabled=video_recorder_tactile_logging["rerun_enabled"],
+                tactile_rerun_live=video_recorder_tactile_logging["rerun_live"],
             )
-            recorder_url = video_recorder.start_server()
-            print(f"[INFO] Video recorder UI ready: {recorder_url}")
+            recorder_status = video_recorder.start_server()
+            if video_recorder.is_web_ui_enabled:
+                print(f"[INFO] Video recorder UI ready: {recorder_status}")
+            else:
+                print(f"[INFO] Video recorder ready; web UI disabled; press s to save directly. {recorder_status}")
         except Exception as exc:
             video_recorder = None
             print(f"[WARN] Failed to start video recorder service: {exc}")
@@ -3930,10 +4043,14 @@ def main():
                     else:
                         print("[INFO] Handover metadata was already saved or no task metadata is available.")
                 if video_recorder is not None:
-                    ok, message = video_recorder.finish_recording_to_pending()
+                    if video_recorder.is_web_ui_enabled:
+                        ok, message = video_recorder.finish_recording_to_pending()
+                    else:
+                        ok, message = video_recorder.finish_and_save_plain_recording()
                     level = "[INFO]" if ok else "[WARN]"
                     print(f"{level} Video recorder: {message}")
-                    open_video_recorder_ui(video_recorder)
+                    if video_recorder.is_web_ui_enabled:
+                        open_video_recorder_ui(video_recorder)
                 save_runtime_profile(runtime_profiler, reason="s_key")
 
     finally:
