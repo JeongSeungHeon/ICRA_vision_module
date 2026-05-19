@@ -24,8 +24,8 @@ class ObjectMergerDebug:
     merge_stats: dict[str, Any]
     stable_observation_frames: int
     initial_centroid_locked: bool
-    hand_approach_required: bool
-    hand_approach_detected: bool
+    # hand_approach_required: bool
+    # hand_approach_detected: bool
 
 
 class ObjectMerger:
@@ -46,7 +46,7 @@ class ObjectMerger:
         self.outlier_min_neighbors = int(point_cfg.get("outlier_min_neighbors", 8))
         self.stable_frames_required = int(activation_cfg.get("stable_frames_required", 5))
         self.lift_threshold_m = float(lift_cfg.get("threshold_m", 0.05))
-        self.require_hand_approach_first = bool(lift_cfg.get("require_hand_approach_first", True))
+        # self.require_hand_approach_first = bool(lift_cfg.get("require_hand_approach_first", True))
         self.height_axis_name = str(
             lift_cfg.get("axis_name")
             or frame_cfg.get("name")
@@ -83,8 +83,8 @@ class ObjectMerger:
         self,
         object_cam0: ObjectState,
         object_cam1: ObjectState,
-        *,
-        hand_approach_detected: bool = False,
+        # *,
+        # hand_approach_detected: bool = False,
     ) -> MergedObjectState:
         valid_states = [state for state in (object_cam0, object_cam1) if self._is_state_usable(state)]
         if not valid_states:
@@ -111,8 +111,8 @@ class ObjectMerger:
                 merge_stats={},
                 stable_observation_frames=self._stable_observation_frames,
                 initial_centroid_locked=self._initial_centroid_base is not None,
-                hand_approach_required=self.require_hand_approach_first,
-                hand_approach_detected=bool(hand_approach_detected),
+                # hand_approach_required=self.require_hand_approach_first,
+                # hand_approach_detected=bool(hand_approach_detected),
             )
             return merged_state
 
@@ -133,7 +133,7 @@ class ObjectMerger:
             return self.process_states(
                 object_cam0.copy_with(valid=False, object_detected=False, points_base=[]),
                 object_cam1.copy_with(valid=False, object_detected=False, points_base=[]),
-                hand_approach_detected=hand_approach_detected,
+                # hand_approach_detected=hand_approach_detected,
             )
 
         merged_points, _, merge_stats = merge_point_clouds(
@@ -160,11 +160,12 @@ class ObjectMerger:
             self._stable_observation_frames = 0
 
         lift_height_delta_m = self._compute_lift_delta(merged_centroid)
-        lift_allowed = bool(hand_approach_detected) or not self.require_hand_approach_first
+        # lift_allowed = bool(hand_approach_detected) or not self.require_hand_approach_first
+        # lift_allowed =  not self.require_hand_approach_first
         object_lifted = bool(
             merged_centroid is not None
             and self._initial_centroid_base is not None
-            and lift_allowed
+            # and lift_allowed
             and lift_height_delta_m >= self.lift_threshold_m
         )
 
@@ -192,8 +193,8 @@ class ObjectMerger:
             merge_stats=merge_stats,
             stable_observation_frames=self._stable_observation_frames,
             initial_centroid_locked=self._initial_centroid_base is not None,
-            hand_approach_required=self.require_hand_approach_first,
-            hand_approach_detected=bool(hand_approach_detected),
+            # hand_approach_required=self.require_hand_approach_first,
+            # hand_approach_detected=bool(hand_approach_detected),
         )
         return merged_state
 
@@ -210,10 +211,10 @@ class ObjectMerger:
         return bool(state.valid and state.object_detected and state.point_count > 0 and state.points_base)
 
 
-__all__ = [
-    "DEFAULT_CONFIG_PATH",
-    "HEIGHT_AXIS_TO_INDEX",
-    "HEIGHT_DIRECTION_TO_SIGN",
-    "ObjectMergerDebug",
-    "ObjectMerger",
-]
+# __all__ = [
+#     "DEFAULT_CONFIG_PATH",
+#     "HEIGHT_AXIS_TO_INDEX",
+#     "HEIGHT_DIRECTION_TO_SIGN",
+#     "ObjectMergerDebug",
+#     "ObjectMerger",
+# ]

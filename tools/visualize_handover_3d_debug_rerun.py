@@ -495,33 +495,118 @@ def init_rerun(rr: Any, args: argparse.Namespace) -> None:
         rr.spawn()
 
 
-def send_blueprint(rr: Any, *, include_images: bool) -> None:
+def tactile_norm_series_paths(max_mags: int) -> list[str]:
+    paths = [
+        "/tactile/total_norm",
+        "/tactile/release_ref_norm",
+        "/tactile/release_delta_norm",
+    ]
+    paths.extend(f"/tactile/mag_{mag_idx}/norm" for mag_idx in range(max(int(max_mags), 0)))
+    return paths
+
+
+def tactile_xyz_series_paths(max_mags: int) -> list[str]:
+    paths: list[str] = []
+    for mag_idx in range(max(int(max_mags), 0)):
+        paths.extend(
+            [
+                f"/tactile/mag_{mag_idx}/x",
+                f"/tactile/mag_{mag_idx}/y",
+                f"/tactile/mag_{mag_idx}/z",
+            ]
+        )
+    return paths
+
+
+def _layout_container(rrb: Any, container_name: str, children: list[Any]) -> Any | None:
+    if not children or not hasattr(rrb, container_name):
+        return None
+    container_cls = getattr(rrb, container_name)
+    try:
+        return container_cls(*children)
+    except TypeError:
+        return container_cls(contents=children)
+
+
+def _build_blueprint(rrb: Any, data: dict[str, Any], *, include_images: bool) -> Any:
+    include_tactile = has_tactile_stream(data)
+    max_tactile_mags = _max_tactile_mags(data) if include_tactile else 0
+
+    world_view = rrb.Spatial3DView(origin="/world", name="Handover 3D Debug")
+    camera_views: list[Any] = []
+    if include_images and hasattr(rrb, "Spatial2DView"):
+        camera_views = [
+            rrb.Spatial2DView(origin="/cameras/cam0/rgb", name="Cam0 RGB"),
+            rrb.Spatial2DView(origin="/cameras/cam0/depth", name="Cam0 Depth"),
+            rrb.Spatial2DView(origin="/cameras/cam1/rgb", name="Cam1 RGB"),
+            rrb.Spatial2DView(origin="/cameras/cam1/depth", name="Cam1 Depth"),
+        ]
+
+    status_views: list[Any] = []
+    if hasattr(rrb, "TextDocumentView"):
+        status_views.append(rrb.TextDocumentView(origin="/status/frame", name="Frame Status"))
+        if include_images:
+            status_views.append(rrb.TextDocumentView(origin="/status/sync", name="Sync Status"))
+        if include_tactile:
+            status_views.append(rrb.TextDocumentView(origin="/status/tactile", name="Tactile Status"))
+
+    tactile_views: list[Any] = []
+    if include_tactile:
+        if hasattr(rrb, "TimeSeriesView"):
+            tactile_views.append(
+                rrb.TimeSeriesView(
+                    origin="/tactile",
+                    contents=tactile_norm_series_paths(max_tactile_mags),
+                    name="Tactile Norms",
+                )
+            )
+            if max_tactile_mags > 0:
+                tactile_views.append(
+                    rrb.TimeSeriesView(
+                        origin="/tactile",
+                        contents=tactile_xyz_series_paths(max_tactile_mags),
+                        name="Tactile XYZ",
+                    )
+                )
+        else:
+            print(
+                "[WARN] Rerun blueprint API has no TimeSeriesView; tactile scalar data is logged but graph views were not added.",
+                file=sys.stderr,
+            )
+
+    camera_section = _layout_container(rrb, "Grid", camera_views)
+    if camera_section is None:
+        camera_section = _layout_container(rrb, "Vertical", camera_views)
+    tactile_section = _layout_container(rrb, "Vertical", tactile_views + status_views[-1:] if include_tactile else tactile_views)
+    status_section = _layout_container(rrb, "Vertical", status_views[:-1] if include_tactile else status_views)
+
+    main_sections = [section for section in (camera_section, world_view, tactile_section) if section is not None]
+    main_layout = _layout_container(rrb, "Horizontal", main_sections)
+
+    blueprint_parts: list[Any] = []
+    if main_layout is not None:
+        blueprint_parts.append(main_layout)
+    else:
+        blueprint_parts.extend(main_sections)
+    if status_section is not None:
+        blueprint_parts.append(status_section)
+    if len(blueprint_parts) > 1:
+        root_layout = _layout_container(rrb, "Vertical", blueprint_parts)
+        if root_layout is not None:
+            blueprint_parts = [root_layout]
+    if not blueprint_parts:
+        blueprint_parts = [world_view]
+    return rrb.Blueprint(*blueprint_parts, collapse_panels=True)
+
+
+def send_blueprint(rr: Any, data: dict[str, Any], *, include_images: bool) -> None:
     try:
         import rerun.blueprint as rrb
     except ImportError:
         return
 
     try:
-        views: list[Any] = [rrb.Spatial3DView(origin="/world", name="Handover 3D Debug")]
-        if include_images and hasattr(rrb, "Spatial2DView"):
-            camera_views = [
-                rrb.Spatial2DView(origin="/cameras/cam0/rgb", name="Cam0 RGB"),
-                rrb.Spatial2DView(origin="/cameras/cam0/depth", name="Cam0 Depth"),
-                rrb.Spatial2DView(origin="/cameras/cam1/rgb", name="Cam1 RGB"),
-                rrb.Spatial2DView(origin="/cameras/cam1/depth", name="Cam1 Depth"),
-            ]
-            if hasattr(rrb, "Grid"):
-                views.append(rrb.Grid(*camera_views))
-            else:
-                views.extend(camera_views)
-        if hasattr(rrb, "TextDocumentView"):
-            views.append(rrb.TextDocumentView(origin="/status", name="Frame Status"))
-            views.append(rrb.TextDocumentView(origin="/status/tactile", name="Tactile Status"))
-        if hasattr(rrb, "Horizontal") and len(views) > 1:
-            blueprint = rrb.Blueprint(rrb.Horizontal(*views), collapse_panels=True)
-        else:
-            blueprint = rrb.Blueprint(*views, collapse_panels=True)
-        rr.send_blueprint(blueprint)
+        rr.send_blueprint(_build_blueprint(rrb, data, include_images=include_images))
     except Exception as exc:  # pragma: no cover - best effort viewer layout
         print(f"[WARN] Could not send Rerun blueprint: {exc}", file=sys.stderr)
 
@@ -906,7 +991,7 @@ def main() -> int:
 
     rr = _import_rerun()
     init_rerun(rr, args)
-    send_blueprint(rr, include_images=has_image_streams(data))
+    send_blueprint(rr, data, include_images=has_image_streams(data))
 
     for idx in range(frame_count):
         log_frame(

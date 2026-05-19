@@ -7,6 +7,7 @@ import numpy as np
 
 from utils.debug_3d_recorder import Debug3DRecorder, load_debug_3d_npz
 from tools.visualize_handover_3d_debug_rerun import (
+    _build_blueprint,
     count_frame_entities,
     log_points,
     log_tactile,
@@ -178,6 +179,62 @@ class _FakeRerun:
         self.logged.append((entity, payload))
 
 
+class _FakeBlueprintNode:
+    def __init__(self, kind, *children, origin=None, name=None, contents=None, **kwargs):
+        self.kind = kind
+        if children == () and contents is not None and kind in {"Grid", "Horizontal", "Vertical"}:
+            self.children = list(contents)
+        else:
+            self.children = list(children)
+        self.origin = origin
+        self.name = name
+        self.contents = [] if contents is None or kind in {"Grid", "Horizontal", "Vertical"} else list(contents)
+        self.kwargs = kwargs
+
+
+class _FakeBlueprintModule:
+    class Blueprint(_FakeBlueprintNode):
+        def __init__(self, *children, **kwargs):
+            super().__init__("Blueprint", *children, **kwargs)
+
+    class Spatial3DView(_FakeBlueprintNode):
+        def __init__(self, **kwargs):
+            super().__init__("Spatial3DView", **kwargs)
+
+    class Spatial2DView(_FakeBlueprintNode):
+        def __init__(self, **kwargs):
+            super().__init__("Spatial2DView", **kwargs)
+
+    class TextDocumentView(_FakeBlueprintNode):
+        def __init__(self, **kwargs):
+            super().__init__("TextDocumentView", **kwargs)
+
+    class TimeSeriesView(_FakeBlueprintNode):
+        def __init__(self, **kwargs):
+            super().__init__("TimeSeriesView", **kwargs)
+
+    class Grid(_FakeBlueprintNode):
+        def __init__(self, *children, **kwargs):
+            super().__init__("Grid", *children, **kwargs)
+
+    class Horizontal(_FakeBlueprintNode):
+        def __init__(self, *children, **kwargs):
+            super().__init__("Horizontal", *children, **kwargs)
+
+    class Vertical(_FakeBlueprintNode):
+        def __init__(self, *children, **kwargs):
+            super().__init__("Vertical", *children, **kwargs)
+
+
+def _collect_blueprint_nodes(node, kind):
+    matches = []
+    if getattr(node, "kind", None) == kind:
+        matches.append(node)
+    for child in getattr(node, "children", []):
+        matches.extend(_collect_blueprint_nodes(child, kind))
+    return matches
+
+
 class Debug3DRecorderTests(unittest.TestCase):
     def test_point_coordinate_labels_format_and_precision(self):
         points = np.asarray([[0.123456, -0.045678, 0.789012], [1.0, 2.0, 3.0]], dtype=np.float32)
@@ -215,6 +272,39 @@ class Debug3DRecorderTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             log_points(fake_rr, "/world/object/cloud", points, (255, 255, 255), labels=[])
+
+    def test_blueprint_includes_tactile_graphs_and_leaf_status_views(self):
+        data = {
+            "frame_count": np.asarray(1, dtype=np.int32),
+            "tactile_enabled": np.asarray([True]),
+            "tactile_values": np.zeros((1, 2, 3), dtype=np.float32),
+            "max_tactile_mags": np.asarray(2, dtype=np.int32),
+        }
+
+        blueprint = _build_blueprint(_FakeBlueprintModule, data, include_images=True)
+
+        text_origins = [node.origin for node in _collect_blueprint_nodes(blueprint, "TextDocumentView")]
+        self.assertIn("/status/frame", text_origins)
+        self.assertIn("/status/sync", text_origins)
+        self.assertIn("/status/tactile", text_origins)
+        self.assertNotIn("/status", text_origins)
+
+        time_series = _collect_blueprint_nodes(blueprint, "TimeSeriesView")
+        self.assertEqual([node.name for node in time_series], ["Tactile Norms", "Tactile XYZ"])
+        self.assertTrue(all(node.origin == "/tactile" for node in time_series))
+        self.assertIn("/tactile/total_norm", time_series[0].contents)
+        self.assertIn("/tactile/mag_1/norm", time_series[0].contents)
+        self.assertIn("/tactile/mag_0/x", time_series[1].contents)
+        self.assertIn("/tactile/mag_1/z", time_series[1].contents)
+
+    def test_blueprint_omits_tactile_graph_without_tactile_stream(self):
+        data = {"frame_count": np.asarray(1, dtype=np.int32)}
+
+        blueprint = _build_blueprint(_FakeBlueprintModule, data, include_images=False)
+
+        self.assertEqual(_collect_blueprint_nodes(blueprint, "TimeSeriesView"), [])
+        text_origins = [node.origin for node in _collect_blueprint_nodes(blueprint, "TextDocumentView")]
+        self.assertEqual(text_origins, ["/status/frame"])
 
     def test_round_trip_variable_clouds(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -389,6 +479,38 @@ class Debug3DRecorderTests(unittest.TestCase):
             self.assertEqual(data["cam0_color_image"].shape[0], 2)
             self.assertNotEqual(int(data["cam0_color_image"][0].sum()), int(data["cam0_color_image"][1].sum()))
             self.assertNotEqual(float(data["cam1_depth_image_m"][0].mean()), float(data["cam1_depth_image_m"][1].mean()))
+
+    def test_raw_images_and_tactile_round_trip_together(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            snapshot = _make_snapshot()
+            recorder = Debug3DRecorder(output_dir=Path(temp_dir), save_images=True)
+            tactile_values = np.asarray([0.5, 1.5, 2.5], dtype=np.float32)
+            _append(
+                recorder,
+                0,
+                np.arange(6, dtype=np.float32).reshape(2, 3),
+                np.empty((0, 3), dtype=np.float32),
+                snapshot=snapshot,
+                tactile_snapshot={
+                    "values": tactile_values,
+                    "num_mags": 1,
+                    "total_norm": float(np.linalg.norm(tactile_values)),
+                    "status": "synced_with_images",
+                    "timestamp_perf_s": 10.02,
+                    "timestamp_unix_s": 100.02,
+                },
+            )
+
+            data = load_debug_3d_npz(recorder.save())
+
+            np.testing.assert_array_equal(data["cam0_color_image"][0], snapshot.cam0.color_image)
+            np.testing.assert_allclose(data["cam1_depth_image_m"][0], snapshot.cam1.depth_image_m)
+            self.assertTrue(bool(data["within_sync_tolerance"][0]))
+            self.assertTrue(bool(data["tactile_enabled"][0]))
+            self.assertEqual(data["tactile_values"].shape, (1, 1, 3))
+            np.testing.assert_allclose(data["tactile_values"][0, 0], tactile_values)
+            self.assertEqual(str(data["tactile_status"][0]), "synced_with_images")
+            self.assertAlmostEqual(float(data["tactile_frame_delta_ms"][0]), 20.0, places=3)
 
     def test_tactile_snapshot_round_trip_and_sync_delta(self):
         with tempfile.TemporaryDirectory() as temp_dir:

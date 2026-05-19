@@ -22,7 +22,7 @@ from object_pt_extraction.segmentation_engine import (
     parse_prompt_classes,
 )
 from perception.fusion import PerceptionFusion
-from perception.fill_level_estimator import FillLevelEstimator
+#from perception.fill_level_estimator import FillLevelEstimator
 from perception.grasp_target import GraspTargetPlanner
 from perception.hand_relative_fallback import HandRelativeFallbackTracker
 from perception.hand_selector import HandSelector
@@ -76,7 +76,7 @@ EEF_Y_OFFSET_MM = 0.0
 # grasp / place behavior
 HOVER_Z_OFFSET_MM = 0
 DESCEND_EXTRA_MM = 0.0
-BACKOFF_X_MM = 120.0
+BACKOFF_X_MM = 100.0
 DEFAULT_POST_RELEASE_Z_OFFSET_MM = 0.0
 HOME_PLACE_X_OFFSET_MM = 0.0
 HOME_PLACE_Y_OFFSET_MM = -3.0
@@ -207,7 +207,7 @@ def parse_args():
         help="Optional class-name filter used with selection.",
     )
     parser.add_argument("--half", action="store_true", help="Enable FP16 inference on supported devices.")
-    parser.add_argument("--show-depth", action="store_true", help="Show a second depth preview window.")
+    #parser.add_argument("--show-depth", action="store_true", help="Show a second depth preview window.")
     parser.add_argument("--depth-max-m", type=float, default=1.5, help="Upper bound for depth visualization.")
     parser.add_argument(
         "--config",
@@ -841,58 +841,58 @@ class FollowSharedState:
         )
 
         self.follow_enabled = args.enable_follow
-        self.latest_target_xyz_mm = None
-        self.latest_grasp_xyz_mm = None
-        self.latest_measurement_source = "none"
-        self.latest_target_t = 0.0
-        self.last_measured_target_xyz_mm = None
-        self.last_measured_target_t = 0.0
-        self.valid_detection_streak = 0
-        self.prediction_armed = False
-        self.predicted_target_xyz_mm = None
-        self.predicted_target_t = 0.0
-        self.prediction_age_s = None
-        self.control_target_xyz_mm = None
-        self.target_source = "none"
+        self.latest_target_xyz_mm = None # 로봇 eef가 따라갈 목표 위치 (mm 단위)
+        self.latest_grasp_xyz_mm = None # 실제 object내의 grasp point 위치 (mm 단위)
+        self.latest_measurement_source = "none" # "measured" or "hand_fallback"
+        self.latest_target_t = 0.0 # 마지막으로 타겟이 업데이트된 시간 (초 단위)
+        self.last_measured_target_xyz_mm = None # 마지막으로 측정된 타겟 위치 (mm 단위)
+        self.last_measured_target_t = 0.0 # 마지막으로 타겟이 측정된 시간 (초 단위)
+        self.valid_detection_streak = 0 # 연속적으로 유효한 타겟이 감지된 횟수
+        self.prediction_armed = False # 칼만 필터 예측이 활성화되어 있는지 여부
+        self.predicted_target_xyz_mm = None # 칼만 필터로 예측된 타겟 위치 (mm 단위)
+        self.predicted_target_t = 0.0 # 마지막으로 예측된 타겟 위치가 업데이트된 시간 (초 단위)
+        self.prediction_age_s = None # 현재 예측된 타겟 위치가 얼마나 오래되었는지 (초 단위)
+        self.control_target_xyz_mm = None # 실제로 로봇이 따라가도록 명령된 타겟 위치 (mm 단위)
+        self.target_source = "none" # "measured", "predicted", or "hand_fallback" 중 하나로, control_target_xyz_mm의 출처를 나타냄
 
-        self.reference_object_xy_mm = None
-        self.reference_object_xyz_mm = None
-        self.reference_locked = False
-        self.motion_triggered = False
-        self.reference_streak = 0
-        self.initial_object_label = None
+        self.reference_object_xy_mm = None # 로봇이 따라갈 때 참조하는 object의 xy 위치 (mm 단위)
+        self.reference_object_xyz_mm = None # 로봇이 따라갈 때 참조하는 object의 xyz 위치 (mm 단위)
+        self.reference_locked = False # 참조 위치가 고정되어 있는지 여부. True이면 reference_object_xyz_mm이 로봇의 고정된 z와 orientation과 함께 follow 제약으로 사용됨.
+        self.motion_triggered = False # follow 모드에서 로봇이 실제로 움직이기 시작했는지 여부
+        self.reference_streak = 0 # 연속적으로 참조 위치가 유효한 타겟으로 업데이트된 횟수
+        self.initial_object_label = None # follow 모드가 시작ㅂ될 때 참조로 사용된 object의 라벨 (디버그용)
 
-        self.fixed_z_mm = None
-        self.fixed_orientation_base = None
-        self.initial_pose_base = None
+        # self.fixed_z_mm = None # follow 모드에서 로봇의 z 위치를 고정하는 경우의 고정된 z 값 (mm 단위)
+        self.fixed_orientation_base = None # follow 모드에서 로봇의 orientation을 고정하는 경우의 고정된 orientation (base 좌표계, rotvec 형식)
+        self.initial_pose_base = None # follow 모드가 시작될 때 로봇의 초기 pose (base 좌표계, x/y/z in mm + rotvec)
 
-        self.stop_event = threading.Event()
-        self.follow_pause_requested = False
-        self.follow_idle_event = threading.Event()
-        self.follow_idle_event.set()
+        self.stop_event = threading.Event() # follow 스레드가 종료되어야 할 때 설정되는 이벤트
+        self.follow_pause_requested = False  # follow 스레드가 일시 중지되어야 할 때 설정되는 플래그. follow_idle_event와 함께 사용됨.
+        self.follow_idle_event = threading.Event() # follow 스레드가 현재 유휴 상태(즉, 로봇이 움직이지 않고 제어 명령을 기다리는 상태)인지 나타내는 이벤트. follow_pause_requested가 True일 때 follow_idle_event가 set되면 follow 스레드는 제어를 반환할 준비가 된 것으로 간주함. 초기값은 set된 상태로 시작하여, follow 모드가 활성화되고 제어 명령이 주어지면 clear됨. follow 모드가 비활성화되거나 일시 중지 요청이 있을 때 다시 set됨. follow_idle_event는 주로 pregrasp 단계에서 follow 스레드가 로봇 제어를 반환할 때까지 기다리는 데 사용됨.
+        self.follow_idle_event.set() # follow 스레드가 초기에는 유휴 상태로 시작하도록 설정
 
-        self.home_object_xyz_mm = None
-        self.home_object_locked = False
-        self.home_pose_buffer = deque(maxlen=8)
-        self.home_object_pixel = None
-        self.home_pixel_buffer = deque(maxlen=15)
+        self.home_object_xyz_mm = None # 홈 위치에서의 object의 xyz 위치 (mm 단위)
+        self.home_object_locked = False # 홈 위치에서 object 위치가 고정되어 있는지 여부. True이면 home_object_xyz_mm이 홈 위치에서의 object 위치로 간주되고, follow 모드에서 참조로 사용될 수 있음.
+        self.home_pose_buffer = deque(maxlen=8) # 홈 위치에서의 최근 로봇 pose 버퍼 (base 좌표계, x/y/z in mm + rotvec)
+        self.home_object_pixel = None # 홈 위치에서 object의 pixel 위치 (u/v in pixels)
+        self.home_pixel_buffer = deque(maxlen=15) #  홈 위치에서의 최근 object pixel 위치 버퍼 (u/v in pixels)
 
-        self.object_stopped = False
-        self.stop_pose_buffer = deque(maxlen=15)
+        self.object_stopped = False # 로봇이 object를 따라가다가 멈춰야 하는 상황이 발생했는지 여부. True이면 follow 모드에서 로봇이 움직이지 않고 제어 명령을 기다리는 상태로 전환됨.
+        self.stop_pose_buffer = deque(maxlen=15) # object이 멈춰야 하는 상황이 발생했을 때의 최근 로봇 pose 버퍼 (base 좌표계, x/y/z in mm + rotvec)
 
-        self.latest_object_xyz_mm = None
-        self.pregrasp_started = False
-        self.grasp_closed = False
-        self.grasp_offset_xyz_mm = None
-        self.recent_grasp_z_mm_buffer = deque(maxlen=PLACE_Z_GRASP_BUFFER_FRAMES)
-        self.recent_template_bottom_z_mm_buffer = deque(maxlen=PLACE_Z_GRASP_BUFFER_FRAMES)
-        self.frozen_place_z_mm = None
-        self.frozen_place_z_raw_mm = None
-        self.frozen_place_z_grasp_median_mm = None
-        self.frozen_place_z_template_bottom_median_mm = None
-        self.frozen_place_z_used_fallback = True
-        self.task_state = "FOLLOW"
-        self.task_epoch = 0
+        self.latest_object_xyz_mm = None # 로봇이 따라가고 있는 object의 최신 xyz 위치 (mm 단위). follow 모드에서 로봇이 실제로 따라가는 타겟 위치와는 다를 수 있음. 디버그용으로 사용됨.
+        self.pregrasp_started = False # pregrasp 단계가 시작되었는지 여부. True이면 follow 모드에서 로봇이 pregrasp 제약으로 움직이기 시작했음을 나타냄.
+        self.grasp_closed = False # grasp이 닫혔는지 여부. True이면 follow 모드에서 로봇이 grasp 제약으로 움직이기 시작했음을 나타냄.
+        self.grasp_offset_xyz_mm = None # grasp이 닫힌 후에 로봇과 object 사이의 xyz offset (mm 단위). follow 모드에서 로봇이 grasp 제약으로 움직일 때 참조로 사용됨.
+        self.recent_grasp_z_mm_buffer = deque(maxlen=PLACE_Z_GRASP_BUFFER_FRAMES) # 최근 grasp z 샘플 버퍼 (mm 단위). grasp이 닫힌 후에 place 높이 추정에 사용됨.
+        self.recent_template_bottom_z_mm_buffer = deque(maxlen=PLACE_Z_GRASP_BUFFER_FRAMES) # 최근 fitted template bottom z 샘플 버퍼 (mm 단위). grasp이 닫힌 후에 place 높이 추정에 사용됨.
+        self.frozen_place_z_mm = None # grasp이 닫힌 후에 place 높이로 고정된 z 값 (mm 단위). follow 모드에서 로봇이 place 제약으로 움직일 때 참조로 사용됨. None이면 아직 고정되지 않은 상태를 나타냄.
+        self.frozen_place_z_raw_mm = None # 고정된 place z의 원시값 (mm 단위). grasp z 샘플과 fitted template bottom z 샘플의 중앙값을 계산하여 place z로 고정할 때, 이 값은 중앙값 계산에 사용된 원시 샘플의 중앙값을 나타냄. 디버그용으로 사용됨.
+        self.frozen_place_z_grasp_median_mm = None # 고정된 place z의 grasp z 샘플 중앙값 (mm 단위). grasp이 닫힌 후에 place 높이로 고정할 때, 이 값은 중앙값 계산에 사용된 grasp z 샘플의 중앙값을 나타냄. 디버그용으로 사용됨.
+        self.frozen_place_z_template_bottom_median_mm = None # 고정된 place z의 fitted template bottom z 샘플 중앙값 (mm 단위). grasp이 닫힌 후에 place 높이로 고정할 때, 이 값은 중앙값 계산에 사용된 fitted template bottom z 샘플의 중앙값을 나타냄. 디버그용으로 사용됨.
+        self.frozen_place_z_used_fallback = True # 고정된 place z가 fallback 값(예: grasp z 샘플 중앙값)으로 고정되었는지 여부. True이면 place z가 grasp z 샘플 중앙값과 같은 fallback 값으로 고정되었음을 나타냄. False이면 place z가 grasp z 샘플과 fitted template bottom z 샘플의 중앙값 계산 결과로 고정되었음을 나타냄. 디버그용으로 사용됨.
+        self.task_state = "FOLLOW" # 현재 태스크 상태를 나타내는 문자열. 예: "FOLLOW", "PREGRASP", "GRASP", "PLACE", "RETURN", 등. follow 모드에서 로봇이 어떤 단계의 제약으로 움직이고 있는지를 나타냄.
+        self.task_epoch = 0 # 태스크 상태가 변경될 때마다 증가하는 카운터. 디버그용으로 사용됨.
 
     def set_fixed_pose_from_robot(self, controller):
         """Capture z and orientation from the robot for follow-mode constraints."""
@@ -901,12 +901,12 @@ class FollowSharedState:
         if pose is None:
             raise RuntimeError("Failed to get current robot pose for fixed pose.")
         with self.lock:
-            self.fixed_z_mm = float(pose[2] * 1000.0)
+            # self.fixed_z_mm = float(pose[2] * 1000.0)
             self.fixed_orientation_base = tuple(float(v) for v in pose[3:6])
             self.initial_pose_base = tuple(float(v) for v in pose)
         print(
             "[INFO] Fixed pose set from current robot pose: "
-            f"z={self.fixed_z_mm:.2f} mm, "
+            # f"z={self.fixed_z_mm:.2f} mm, "
             f"rotvec=({pose[3]:.4f}, {pose[4]:.4f}, {pose[5]:.4f})"
         )
 
@@ -1047,9 +1047,9 @@ class FollowSharedState:
             if follow_enabled is None:
                 follow_enabled = self.args.enable_follow
             self.follow_enabled = bool(follow_enabled)
-            self.latest_target_xyz_mm = None
-            self.latest_grasp_xyz_mm = None
-            self.latest_measurement_source = "none"
+            self.latest_target_xyz_mm = None # 로봇 eef가 따라갈 목표 위치 (mm 단위)
+            self.latest_grasp_xyz_mm = None # 실제 object내의 grasp point 위치 (mm 단위)
+            self.latest_measurement_source = "none" # "measured" or "hand_fallback"
             self.latest_target_t = 0.0
             self.last_measured_target_xyz_mm = None
             self.last_measured_target_t = 0.0
@@ -1061,7 +1061,7 @@ class FollowSharedState:
             self.motion_triggered = False
             self.reference_streak = 0
             self.initial_object_label = None
-            self.fixed_z_mm = None
+            # self.fixed_z_mm = None
             self.fixed_orientation_base = None
             self.initial_pose_base = None
             self.follow_pause_requested = False
@@ -1274,7 +1274,7 @@ class FollowSharedState:
                 "measurement_age_s": measurement_age_s,
                 "motion_triggered": self.motion_triggered,
                 "follow_pause_requested": self.follow_pause_requested,
-                "fixed_z_mm": self.fixed_z_mm,
+                # "fixed_z_mm": self.fixed_z_mm,
                 "fixed_orientation_base": None if self.fixed_orientation_base is None else tuple(self.fixed_orientation_base),
                 "latest_object_xyz_mm": None if self.latest_object_xyz_mm is None else self.latest_object_xyz_mm.copy(),
                 "initial_object_label": self.initial_object_label,
@@ -1427,7 +1427,9 @@ def robot_control_loop(controller, shared_state, args):
             snap["prediction_age_s"] is None or float(snap["prediction_age_s"]) > float(args.prediction_max_horizon_s)
         ):
             active = False
-        elif snap["fixed_z_mm"] is None or snap["fixed_orientation_base"] is None:
+        # elif snap["fixed_z_mm"] is None or snap["fixed_orientation_base"] is None:
+        #     active = False
+        elif snap["fixed_orientation_base"] is None:
             active = False
 
         if not active:
@@ -1443,7 +1445,7 @@ def robot_control_loop(controller, shared_state, args):
         shared_state.set_follow_thread_idle(False)
 
         target_xyz_mm = control_target_xyz_mm
-        fixed_z_mm = snap["fixed_z_mm"]
+        # fixed_z_mm = snap["fixed_z_mm"]
         fixed_orientation_base = snap["fixed_orientation_base"]
 
         if ref_target_xyz_mm is None:
@@ -1468,11 +1470,11 @@ def robot_control_loop(controller, shared_state, args):
             follow_z=bool(args.follow_z),
         )
 
-        if not args.follow_z:
-            ref_target_xyz_mm[2] = fixed_z_mm
+        # if not args.follow_z:
+        #     ref_target_xyz_mm[2] = fixed_z_mm
 
         ref_target_xyz_mm = ref_target_xyz_mm + ref_step_xyz
-        cmd_z = float(ref_target_xyz_mm[2]) if args.follow_z else float(fixed_z_mm)
+        cmd_z = float(ref_target_xyz_mm[2]) # if args.follow_z else float(fixed_z_mm)
         cmd_x, cmd_y, cmd_z = clamp_pose_mm(float(ref_target_xyz_mm[0]), float(ref_target_xyz_mm[1]), cmd_z, args)
         pose_mm = np.array([cmd_x, cmd_y, cmd_z], dtype=np.float32)
 
@@ -1494,16 +1496,16 @@ def robot_control_loop(controller, shared_state, args):
             )
             was_active = True
             last_sent_pose_mm = pose_mm
-            if args.verbose_robot:
-                print(
-                    f"[ROBOT] source={target_source}, "
-                    f"raw_mm={snap['latest_target_xyz_mm']}, "
-                    f"control_mm={target_xyz_mm}, "
-                    f"ref_mm={ref_target_xyz_mm}, "
-                    f"close_range_dist_xy={dist_xy:.1f}, "
-                    f"stage_axis={'xy' if dominant_axis is None else ('x' if dominant_axis == 0 else 'y')}, "
-                    f"cmd_m={target_position_base}"
-                )
+            # if args.verbose_robot:
+            #     print(
+            #         f"[ROBOT] source={target_source}, "
+            #         f"raw_mm={snap['latest_target_xyz_mm']}, "
+            #         f"control_mm={target_xyz_mm}, "
+            #         f"ref_mm={ref_target_xyz_mm}, "
+            #         f"close_range_dist_xy={dist_xy:.1f}, "
+            #         f"stage_axis={'xy' if dominant_axis is None else ('x' if dominant_axis == 0 else 'y')}, "
+            #         f"cmd_m={target_position_base}"
+            #     )
         except Exception as exc:
             print(f"[WARN] servo command failed: {exc}")
 
@@ -1904,7 +1906,9 @@ class RobotWorker:
             snap["prediction_age_s"] is None or float(snap["prediction_age_s"]) > float(self.args.prediction_max_horizon_s)
         ):
             active = False
-        elif snap["fixed_z_mm"] is None or snap["fixed_orientation_base"] is None:
+        # elif snap["fixed_z_mm"] is None or snap["fixed_orientation_base"] is None:
+        #     active = False
+        elif snap["fixed_orientation_base"] is None:
             active = False
 
         if not active:
@@ -1918,7 +1922,7 @@ class RobotWorker:
 
         self.shared_state.set_follow_thread_idle(False)
 
-        fixed_z_mm = snap["fixed_z_mm"]
+        # fixed_z_mm = snap["fixed_z_mm"]
         fixed_orientation_base = snap["fixed_orientation_base"]
         if self._ref_target_xyz_mm is None:
             pose = None if robot_state is None else getattr(robot_state, "actual_tcp_pose_base", None)
@@ -1942,11 +1946,11 @@ class RobotWorker:
             follow_z=bool(self.args.follow_z),
         )
 
-        if not self.args.follow_z:
-            self._ref_target_xyz_mm[2] = fixed_z_mm
+        # if not self.args.follow_z:
+        #     self._ref_target_xyz_mm[2] = fixed_z_mm
 
         self._ref_target_xyz_mm = self._ref_target_xyz_mm + ref_step_xyz
-        cmd_z = float(self._ref_target_xyz_mm[2]) if self.args.follow_z else float(fixed_z_mm)
+        cmd_z = float(self._ref_target_xyz_mm[2]) # if self.args.follow_z else float(fixed_z_mm)
         cmd_x, cmd_y, cmd_z = clamp_pose_mm(float(self._ref_target_xyz_mm[0]), float(self._ref_target_xyz_mm[1]), cmd_z, self.args)
         pose_mm = np.array([cmd_x, cmd_y, cmd_z], dtype=np.float32)
 
@@ -1966,16 +1970,16 @@ class RobotWorker:
             )
             self._was_follow_active = True
             self._last_sent_pose_mm = pose_mm
-            if self.args.verbose_robot:
-                print(
-                    f"[ROBOT] source={target_source}, "
-                    f"raw_mm={snap['latest_target_xyz_mm']}, "
-                    f"control_mm={control_target_xyz_mm}, "
-                    f"ref_mm={self._ref_target_xyz_mm}, "
-                    f"close_range_dist_xy={dist_xy:.1f}, "
-                    f"stage_axis={'xy' if dominant_axis is None else ('x' if dominant_axis == 0 else 'y')}, "
-                    f"cmd_m={target_position_base}"
-                )
+            # if self.args.verbose_robot:
+            #     print(
+            #         f"[ROBOT] source={target_source}, "
+            #         f"raw_mm={snap['latest_target_xyz_mm']}, "
+            #         f"control_mm={control_target_xyz_mm}, "
+            #         f"ref_mm={self._ref_target_xyz_mm}, "
+            #         f"close_range_dist_xy={dist_xy:.1f}, "
+            #         f"stage_axis={'xy' if dominant_axis is None else ('x' if dominant_axis == 0 else 'y')}, "
+            #         f"cmd_m={target_position_base}"
+            #     )
         except Exception as exc:
             self._set_status(last_error=str(exc))
             print(f"[WARN] servo command failed: {exc}")
@@ -3499,7 +3503,7 @@ def build_dual_perception_pipeline(args):
     fusion = PerceptionFusion.from_config(args.config)
     grasp_planner = GraspTargetPlanner.from_config(args.config)
     hand_relative_fallback = HandRelativeFallbackTracker.from_config(args.config)
-    fill_level_estimator = FillLevelEstimator.from_config(args.config)
+    # fill_level_estimator = FillLevelEstimator.from_config(args.config)
     transform_chain = load_transform_chain(args.config)
     t_cam0_base = np.linalg.inv(transform_chain.t_base_cam0).astype(np.float32)
     t_cam1_base = np.linalg.inv(transform_chain.t_base_cam1).astype(np.float32)
@@ -3516,7 +3520,7 @@ def build_dual_perception_pipeline(args):
         "fusion": fusion,
         "grasp_planner": grasp_planner,
         "hand_relative_fallback": hand_relative_fallback,
-        "fill_level_estimator": fill_level_estimator,
+        #"fill_level_estimator": fill_level_estimator,
         "transform_chain": transform_chain,
         "t_cam0_base": t_cam0_base,
         "t_cam1_base": t_cam1_base,
@@ -3684,11 +3688,11 @@ def append_debug_3d_frame(
     )
 
 
-def build_runtime_profile_context(args, model_label, pipeline):
+def build_runtime_profile_context(args, yolo_model, pipeline):
     """Capture static run settings that should be written with profiler output."""
     return {
         "config_path": str(Path(args.config).resolve()),
-        "model_label": model_label,
+        "yolo_model": yolo_model,
         "model": args.model,
         "device": args.device,
         "half": bool(args.half),
@@ -3943,23 +3947,26 @@ def main():
         tactile_manager.start()
     sensor_hub.start()
 
-    model_label = args.model if not pipeline["prompt_classes"] else f"{args.model} ({','.join(pipeline['prompt_classes'])})"
+    yolo_model = args.model if not pipeline["prompt_classes"] else f"{args.model} ({','.join(pipeline['prompt_classes'])})"
+    # gpu, cpu 리소스 속도 파악
     runtime_profiler = RuntimeProfiler(
         enabled=bool(args.profile_runtime),
         output_dir=args.profile_dir,
         sample_interval_s=args.profile_sample_interval_s,
         print_every_s=args.profile_print_every_s,
-        run_context=build_runtime_profile_context(args, model_label, pipeline),
+        run_context=build_runtime_profile_context(args, yolo_model, pipeline),
     )
     if runtime_profiler.enabled:
         print(f"[INFO] Runtime profiler enabled. Press 's' to save logs to {args.profile_dir}.")
-    window_name = "cam0_grasp_target_follow"
+    
+    cam0_window_name = "cam0_grasp_target_follow"
     cam1_window_name = "cam1_view"
-    depth_window_name = "cam0_depth"
+    
+    # depth_window_name = "cam0_depth"
 
     smoothed_fps = 0.0
     last_loop_time = time.perf_counter()
-    previous_hand_approach = False
+    # previous_hand_approach = False
 
     shared_state = FollowSharedState(args)
     metadata_recorder = HandoverMetadataRecorder()
@@ -4077,27 +4084,27 @@ def main():
                 merged_object = pipeline["object_merger"].process_states(
                     object_cam0,
                     object_cam1,
-                    hand_approach_detected=previous_hand_approach,
+                    # hand_approach_detected=previous_hand_approach,
                 )
             with runtime_profiler.stage("shape_fit"):
                 shape_fitting_state = pipeline["shape_fitting_tracker"].process(merged_object)
                 metadata_recorder.update_geometry(shape_fitting_state, now_perf=loop_perf)
             object_debug_cam0 = getattr(pipeline["object_worker_cam0"], "last_debug", None)
             cam0_mask = None if object_debug_cam0 is None else getattr(object_debug_cam0, "combined_mask", None)
-            with runtime_profiler.stage("fill_level"):
-                fill_estimate = pipeline["fill_level_estimator"].estimate_fill_level_from_cam0(
-                    color_image_bgr=snapshot.cam0.color_image,
-                    depth_image_m=snapshot.cam0.depth_image_m,
-                    intrinsics=snapshot.cam0.intrinsics,
-                    container_mask=cam0_mask,
-                    camera_to_base=pipeline["transform_chain"].t_base_cam0,
-                    label=object_cam0.label,
-                )
-                metadata_recorder.update_fill_and_mass(
-                    fill_estimate,
-                    shape_fitting_state=shape_fitting_state,
-                    now_perf=loop_perf,
-                )
+            # with runtime_profiler.stage("fill_level"):
+            #     fill_estimate = pipeline["fill_level_estimator"].estimate_fill_level_from_cam0(
+            #         color_image_bgr=snapshot.cam0.color_image,
+            #         depth_image_m=snapshot.cam0.depth_image_m,
+            #         intrinsics=snapshot.cam0.intrinsics,
+            #         container_mask=cam0_mask,
+            #         camera_to_base=pipeline["transform_chain"].t_base_cam0,
+            #         label=object_cam0.label,
+            #     )
+            #     metadata_recorder.update_fill_and_mass(
+            #         fill_estimate,
+            #         shape_fitting_state=shape_fitting_state,
+            #         now_perf=loop_perf,
+            #     )
             with runtime_profiler.stage("fusion_grasp"):
                 fitted_merged_object = build_fitted_merged_object(merged_object, shape_fitting_state)
                 fusion_state = pipeline["fusion"].process_states(
@@ -4110,9 +4117,9 @@ def main():
                     selected_hand,
                     fusion_state,
                 )
-                previous_hand_approach = bool(
-                    fusion_state.hand_approach_detected or fusion_state.hand_approach_latched
-                )
+                # previous_hand_approach = bool(
+                #     fusion_state.hand_approach_detected or fusion_state.hand_approach_latched
+                # )
 
                 measured_object_point_base = choose_point(
                     fusion_state.filtered_object_centroid_base,
@@ -4261,10 +4268,10 @@ def main():
                     grasp_point_base,
                     camera_label="cam1",
                 )
-                cv.imshow(window_name, annotated)
+                cv.imshow(cam0_window_name, annotated)
                 cv.imshow(cam1_window_name, cam1_preview)
-                if args.show_depth:
-                    cv.imshow(depth_window_name, render_depth(snapshot.cam0.depth_image_m, args.depth_max_m))
+                # if args.show_depth:
+                #     cv.imshow(depth_window_name, render_depth(snapshot.cam0.depth_image_m, args.depth_max_m))
 
             with runtime_profiler.stage("wait_key"):
                 key = cv.waitKey(1) & 0xFF
