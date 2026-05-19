@@ -1,5 +1,3 @@
-import threading
-import time
 import unittest
 import types
 import sys
@@ -54,7 +52,8 @@ _stub_module("utils.realsense_stream", FrameBundle=SimpleNamespace, list_realsen
 _stub_module("video_record", HandoverVideoRecorderService=_Dummy)
 
 from perception.hand_relative_fallback import HandRelativeFallbackTracker
-from robot_control_rtde_fitting_final import FollowSharedState, robot_control_loop
+from robot.robot_worker import RobotActionCallbacks, RobotWorker, RobotWorkerState
+from robot_control_rtde_fitting_final import FollowSharedState
 from system.shared_state import FusionState, SelectedHandState
 
 
@@ -537,15 +536,30 @@ class FollowSharedStateTests(unittest.TestCase):
             measurement_source="hand_fallback",
         )
 
-        def capture_send(*call_args, **call_kwargs):
+        def send_robot_command(*call_args, **call_kwargs):
             command_calls.append((call_args, call_kwargs))
+            return SimpleNamespace(
+                is_connected=True,
+                actual_tcp_pose_base=tuple(float(v) for v in controller.state.actual_tcp_pose_base),
+            )
 
-        thread = threading.Thread(target=robot_control_loop, args=(controller, shared_state, args), daemon=True)
-        with patch("robot_control_rtde_fitting_final.send_robot_command", side_effect=capture_send):
-            thread.start()
-            time.sleep(0.08)
-            shared_state.stop_event.set()
-            thread.join(timeout=1.0)
+        actions = RobotActionCallbacks(
+            init_rtde=lambda *args, **kwargs: controller,
+            move_robot_to_home_pose=lambda *args, **kwargs: None,
+            send_robot_command=send_robot_command,
+            safe_stop_rtde=lambda *args, **kwargs: None,
+            disconnect_rtde=lambda *args, **kwargs: None,
+            execute_gripper_close=lambda *args, **kwargs: True,
+            execute_gripper_open=lambda *args, **kwargs: True,
+            execute_return_and_place=lambda *args, **kwargs: True,
+            save_grasp_offset=lambda *args, **kwargs: True,
+            configure_gripper_position_threshold_from_geometry=lambda *args, **kwargs: None,
+            reset_gripper_position_threshold_to_config_default=lambda *args, **kwargs: None,
+        )
+        worker = RobotWorker(args=args, shared_state=shared_state, actions=actions)
+        worker.controller = controller
+        worker._set_status(state=RobotWorkerState.FOLLOWING)
+        worker._tick_follow()
 
         self.assertTrue(command_calls)
 

@@ -6,7 +6,15 @@ from types import SimpleNamespace
 import numpy as np
 
 from utils.debug_3d_recorder import Debug3DRecorder, load_debug_3d_npz
-from tools.visualize_handover_3d_debug_rerun import count_frame_entities, log_points, point_coordinate_labels
+from tools.visualize_handover_3d_debug_rerun import (
+    count_frame_entities,
+    frame_status_text,
+    log_frame,
+    log_points,
+    log_tactile,
+    point_coordinate_labels,
+    recording_summary_text,
+)
 
 
 def _shape_state(points=None, valid=True, template_axes_base=None):
@@ -110,6 +118,7 @@ def _append(
     hand_debug_cam0=None,
     hand_debug_cam1=None,
     shape_fitting_state=None,
+    tactile_snapshot=None,
 ):
     selected_hand = SimpleNamespace(
         valid=not missing,
@@ -142,6 +151,7 @@ def _append(
             chosen_camera=None if missing else 0,
         ),
         snapshot=snapshot,
+        tactile_snapshot=tactile_snapshot,
     )
 
 
@@ -155,11 +165,33 @@ class _FakeRerun:
         def __init__(self, recursive=False):
             self.recursive = recursive
 
+    class LineStrips3D:
+        def __init__(self, strips, **kwargs):
+            self.strips = strips
+            self.kwargs = kwargs
+
+    class Scalars:
+        def __init__(self, value):
+            self.value = float(value)
+
+    Scalar = Scalars
+
+    class TextDocument:
+        def __init__(self, text):
+            self.text = str(text)
+
     def __init__(self):
         self.logged = []
+        self.times = []
 
     def log(self, entity, payload):
         self.logged.append((entity, payload))
+
+    def set_time_sequence(self, timeline, value):
+        self.times.append((timeline, value))
+
+    def set_time_seconds(self, timeline, value):
+        self.times.append((timeline, value))
 
 
 class Debug3DRecorderTests(unittest.TestCase):
@@ -329,6 +361,168 @@ class Debug3DRecorderTests(unittest.TestCase):
             self.assertEqual(str(data["cam1_serial"][0]), "cam1_serial")
             self.assertAlmostEqual(float(data["timestamp_delta_ms"][0]), 0.5)
             self.assertTrue(bool(data["within_sync_tolerance"][0]))
+
+    def test_tactile_snapshot_round_trips_with_dense_mag_arrays(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = Debug3DRecorder(output_dir=Path(temp_dir))
+            tactile_snapshot = {
+                "values": np.asarray([1.0, 2.0, 2.0, -1.0, 0.0, 0.0], dtype=np.float32),
+                "num_mags": 2,
+                "total_norm": 3.162,
+                "release_ref_norm": 4.0,
+                "release_delta_norm": 1.5,
+                "status": "close_monitoring",
+                "error": "old warning",
+                "sample_perf_s": 123.456,
+            }
+
+            _append(
+                recorder,
+                0,
+                np.empty((0, 3), dtype=np.float32),
+                np.empty((0, 3), dtype=np.float32),
+                tactile_snapshot=tactile_snapshot,
+            )
+            data = load_debug_3d_npz(recorder.save())
+
+            self.assertTrue(bool(data["tactile_valid"][0]))
+            self.assertEqual(int(data["tactile_num_mags"][0]), 2)
+            self.assertEqual(data["tactile_values"].shape, (1, 2, 3))
+            np.testing.assert_allclose(data["tactile_values"][0, 0], np.asarray([1.0, 2.0, 2.0], dtype=np.float32))
+            np.testing.assert_allclose(data["tactile_mag_norms"][0], np.asarray([3.0, 1.0], dtype=np.float32))
+            self.assertAlmostEqual(float(data["tactile_total_norm"][0]), 3.162, places=3)
+            self.assertAlmostEqual(float(data["tactile_release_ref_norm"][0]), 4.0)
+            self.assertAlmostEqual(float(data["tactile_release_delta_norm"][0]), 1.5)
+            self.assertEqual(str(data["tactile_status"][0]), "close_monitoring")
+            self.assertEqual(str(data["tactile_error"][0]), "old warning")
+            self.assertAlmostEqual(float(data["tactile_sample_perf_s"][0]), 123.456, places=3)
+
+    def test_tactile_missing_snapshot_stores_invalid_nan_schema(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = Debug3DRecorder(output_dir=Path(temp_dir))
+            _append(
+                recorder,
+                0,
+                np.empty((0, 3), dtype=np.float32),
+                np.empty((0, 3), dtype=np.float32),
+                tactile_snapshot=None,
+            )
+            data = load_debug_3d_npz(recorder.save())
+
+            self.assertFalse(bool(data["tactile_valid"][0]))
+            self.assertEqual(int(data["tactile_num_mags"][0]), 0)
+            self.assertEqual(data["tactile_values"].shape, (1, 0, 3))
+            self.assertEqual(data["tactile_mag_norms"].shape, (1, 0))
+            self.assertTrue(np.isnan(float(data["tactile_total_norm"][0])))
+            self.assertEqual(str(data["tactile_status"][0]), "")
+
+    def test_tactile_variable_num_mags_are_padded_to_recording_max(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = Debug3DRecorder(output_dir=Path(temp_dir))
+            _append(
+                recorder,
+                0,
+                np.empty((0, 3), dtype=np.float32),
+                np.empty((0, 3), dtype=np.float32),
+                tactile_snapshot={"values": [1.0, 0.0, 0.0], "num_mags": 1, "total_norm": 1.0},
+            )
+            _append(
+                recorder,
+                1,
+                np.empty((0, 3), dtype=np.float32),
+                np.empty((0, 3), dtype=np.float32),
+                tactile_snapshot={"values": [2.0, 0.0, 0.0, 0.0, 3.0], "num_mags": 2, "total_norm": 3.0},
+            )
+
+            data = load_debug_3d_npz(recorder.save())
+
+            self.assertEqual(data["tactile_values"].shape, (2, 2, 3))
+            np.testing.assert_allclose(data["tactile_values"][0, 0], np.asarray([1.0, 0.0, 0.0], dtype=np.float32))
+            self.assertTrue(np.isnan(data["tactile_values"][0, 1]).all())
+            np.testing.assert_allclose(
+                data["tactile_values"][1, 1],
+                np.asarray([0.0, 3.0, np.nan], dtype=np.float32),
+                equal_nan=True,
+            )
+
+    def test_raw_images_and_tactile_round_trip_together(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            snapshot = _make_snapshot()
+            recorder = Debug3DRecorder(output_dir=Path(temp_dir), save_images=True)
+            _append(
+                recorder,
+                0,
+                np.arange(12, dtype=np.float32).reshape(4, 3),
+                np.arange(9, dtype=np.float32).reshape(3, 3),
+                snapshot=snapshot,
+                tactile_snapshot={"values": [1.0, 2.0, 3.0], "num_mags": 1, "total_norm": 6.0, "status": "ready"},
+            )
+
+            data = load_debug_3d_npz(recorder.save())
+
+            np.testing.assert_array_equal(data["cam0_color_image"][0], snapshot.cam0.color_image)
+            np.testing.assert_allclose(data["tactile_values"][0, 0], np.asarray([1.0, 2.0, 3.0], dtype=np.float32))
+            self.assertEqual(str(data["tactile_status"][0]), "ready")
+
+    def test_rerun_logs_tactile_scalars_and_status(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = Debug3DRecorder(output_dir=Path(temp_dir))
+            _append(
+                recorder,
+                0,
+                np.empty((0, 3), dtype=np.float32),
+                np.empty((0, 3), dtype=np.float32),
+                tactile_snapshot={
+                    "values": [1.0, 2.0, 2.0],
+                    "num_mags": 1,
+                    "total_norm": 3.0,
+                    "release_ref_norm": 2.5,
+                    "release_delta_norm": 0.5,
+                    "status": "armed",
+                },
+            )
+            data = load_debug_3d_npz(recorder.save())
+            fake_rr = _FakeRerun()
+
+            log_tactile(fake_rr, data, 0)
+            entities = [entity for entity, _payload in fake_rr.logged]
+
+            self.assertIn("/tactile/total_norm", entities)
+            self.assertIn("/tactile/mag_0/x", entities)
+            self.assertIn("/tactile/mag_0/norm", entities)
+            self.assertIn("/status/tactile", entities)
+            self.assertIn("tactile_valid_frames=1/1", recording_summary_text(data))
+            self.assertIn("tactile=", frame_status_text(data, 0))
+
+    def test_tactile_entity_count_and_old_style_data_are_supported(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = Debug3DRecorder(output_dir=Path(temp_dir))
+            _append(
+                recorder,
+                0,
+                np.empty((0, 3), dtype=np.float32),
+                np.empty((0, 3), dtype=np.float32),
+                tactile_snapshot={"values": [1.0, 0.0, 0.0], "num_mags": 1, "total_norm": 1.0},
+            )
+            data = load_debug_3d_npz(recorder.save())
+            old_style = {key: value for key, value in data.items() if not key.startswith("tactile_") and key != "max_tactile_mags"}
+
+            self.assertGreater(count_frame_entities(data, 0), count_frame_entities(old_style, 0))
+            self.assertIn("tactile_stream=missing", recording_summary_text(old_style))
+            self.assertIn("tactile=none", frame_status_text(old_style, 0))
+
+            fake_rr = _FakeRerun()
+            log_frame(
+                fake_rr,
+                old_style,
+                0,
+                normal_length_m=0.08,
+                template_axis_length_m=0.06,
+                depth_max_m=1.7,
+                include_coordinate_labels=False,
+                point_coordinate_precision=4,
+            )
+            self.assertIn("/status/tactile", [entity for entity, _payload in fake_rr.logged])
 
     def test_saved_arrays_are_not_aliased_to_mutated_sources(self):
         with tempfile.TemporaryDirectory() as temp_dir:
