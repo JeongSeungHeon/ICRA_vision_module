@@ -89,7 +89,6 @@ HOME_JOINTS_DEG = _MODULE.HOME_JOINTS_DEG
 PRE_RELEASE_MIN_Z_EPSILON_MM = _MODULE.PRE_RELEASE_MIN_Z_EPSILON_MM
 RELEASE_PARAMETER_MM = _MODULE.RELEASE_PARAMETER_MM
 apply_config_defaults = _MODULE.apply_config_defaults
-wait_for_tactile_release_trigger = _MODULE.wait_for_tactile_release_trigger
 resolve_gripper_position_stall_detection_config = _MODULE.resolve_gripper_position_stall_detection_config
 resolve_gripper_position_threshold_from_geometry = _MODULE.resolve_gripper_position_threshold_from_geometry
 reset_gripper_position_threshold_to_config_default = _MODULE.reset_gripper_position_threshold_to_config_default
@@ -738,37 +737,6 @@ class TactileConfigAndBehaviorTests(unittest.TestCase):
         self.assertTrue(result)
         self.assertEqual(controller.stop_count, 1)
         self.assertEqual(tactile.release_status, "close_tactile_stop")
-
-    def test_tactile_release_triggers_on_delta(self):
-        tactile = DummyTactile([10.0, 25.0])
-        tactile.set_release_reference(10.0)
-
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = wait_for_tactile_release_trigger(
-                tactile,
-                delta_threshold=5.0,
-                timeout_s=0.1,
-                poll_dt=0.0,
-            )
-
-        self.assertTrue(result)
-        self.assertEqual(tactile.release_status, "release_triggered")
-        self.assertAlmostEqual(tactile.release_delta_norm, 15.0)
-
-    def test_tactile_release_times_out(self):
-        tactile = DummyTactile([10.0, 12.0, 12.0])
-        tactile.set_release_reference(10.0)
-
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = wait_for_tactile_release_trigger(
-                tactile,
-                delta_threshold=5.0,
-                timeout_s=0.0,
-                poll_dt=0.0,
-            )
-
-        self.assertFalse(result)
-        self.assertEqual(tactile.release_status, "release_timeout")
 
     def test_tactile_release_descent_triggers_and_stops(self):
         tactile = DummyTactile([10.0, 20.0])

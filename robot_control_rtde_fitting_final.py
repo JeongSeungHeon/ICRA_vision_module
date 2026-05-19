@@ -20,13 +20,6 @@ from object_pt_extraction.segmentation_engine import (
     SegmentationEngine,
     parse_prompt_classes,
 )
-from perception.fdct_depth_completion import (
-    bilateral_filter_depth,
-    FDCTDepthCompleter,
-    FDCTDepthCompletionConfig,
-    format_depth_completion_stats,
-    resolve_checkpoint as resolve_fdct_checkpoint,
-)
 from perception.fusion import PerceptionFusion
 from perception.fill_level_estimator import FillLevelEstimator
 from perception.grasp_target import GraspTargetPlanner
@@ -157,41 +150,6 @@ def parse_args():
     parser.add_argument("--show-depth", action="store_true", help="Show a second depth preview window.")
     parser.add_argument("--depth-max-m", type=float, default=1.5, help="Upper bound for depth visualization.")
     parser.add_argument(
-        "--enable-fdct-depth",
-        dest="fdct_depth_enabled",
-        action="store_true",
-        help="Use FDCT completed depth for object point clouds.",
-    )
-    parser.add_argument(
-        "--disable-fdct-depth",
-        dest="fdct_depth_enabled",
-        action="store_false",
-        help="Use raw RealSense depth for object point clouds.",
-    )
-    parser.set_defaults(fdct_depth_enabled=None)
-    parser.add_argument(
-        "--fdct-cameras",
-        choices=["cam0", "cam1", "both", "none"],
-        default=None,
-        help="Camera selection for FDCT object depth completion. Defaults to config.",
-    )
-    parser.add_argument(
-        "--fdct-checkpoint",
-        default=None,
-        help="Path to FDCT checkpoint. Defaults to perception.depth_completion.fdct.checkpoint.",
-    )
-    parser.add_argument(
-        "--fdct-device",
-        default=None,
-        help="Torch device for FDCT: auto, cpu, cuda, cuda:0, etc. Defaults to config.",
-    )
-    parser.add_argument(
-        "--fdct-debug-stats",
-        action="store_true",
-        help="Print FDCT raw/completed depth stats while running.",
-    )
-
-    parser.add_argument(
         "--config",
         default=str(DEFAULT_CONFIG_PATH),
         help="YAML config used by the existing UR5 RTDE controller.",
@@ -205,7 +163,7 @@ def parse_args():
     parser.add_argument("--workspace-x", nargs=2, type=float, default=None, help="Workspace X limits in mm.")
     parser.add_argument("--workspace-y", nargs=2, type=float, default=None, help="Workspace Y limits in mm.")
     parser.add_argument("--workspace-z", nargs=2, type=float, default=None, help="Workspace Z limits in mm.")
-    parser.add_argument("--move-to-base", action="store_true", help="Reserved for compatibility; current pose is used as baseline.")
+    parser.add_argument("--move-to-base", action="store_true", help="Reserved for compatibility; HOME now uses joint targets.")
     parser.add_argument("--open-gripper", action="store_true", help="Open gripper during init.")
     parser.add_argument("--verbose-robot", action="store_true", help="Print detailed robot command logs.")
     parser.add_argument("--follow-z", dest="follow_z", action="store_true", help="Enable z-axis follow.")
@@ -342,17 +300,6 @@ def parse_args():
         default=5.0,
         help="Print a short runtime profiling summary every N seconds. Use 0 to disable.",
     )
-    parser.add_argument(
-        "--debug-tactile",
-        action="store_true",
-        help="Show a live AnySkin tactile visualization window when robot.tactile.enabled is true.",
-    )
-    parser.add_argument(
-        "--debug-tactile-scaling",
-        type=float,
-        default=10.0,
-        help="Scaling factor for --debug-tactile visualization vectors/circles.",
-    )
     return parser.parse_args()
 
 
@@ -390,7 +337,6 @@ def apply_config_defaults(args, config):
     rtde_cfg = robot_cfg.get("rtde", {})
     safety_cfg = config.get("safety", {})
     workspace_cfg = safety_cfg.get("workspace_bounds_m", {})
-    fdct_cfg = config.get("perception", {}).get("depth_completion", {}).get("fdct", {})
 
     if args.robot_ip is None:
         args.robot_ip = rtde_cfg.get("robot_ip")
@@ -421,29 +367,6 @@ def apply_config_defaults(args, config):
             setattr(args, arg_name, mm_bounds)
         else:
             setattr(args, arg_name, list(DEFAULT_WORKSPACE_MM[axis_name]))
-
-    if args.fdct_depth_enabled is None:
-        args.fdct_depth_enabled = bool(fdct_cfg.get("enabled", False))
-    if args.fdct_cameras is None:
-        args.fdct_cameras = str(fdct_cfg.get("cameras", "both")).strip().lower()
-    if args.fdct_checkpoint is None:
-        args.fdct_checkpoint = str(fdct_cfg.get("checkpoint", "FDCT/TransCG.tar"))
-    if args.fdct_device is None:
-        args.fdct_device = str(fdct_cfg.get("device", "auto"))
-    args.fdct_net_width = int(fdct_cfg.get("net_width", 320))
-    args.fdct_net_height = int(fdct_cfg.get("net_height", 240))
-    args.fdct_depth_min = float(fdct_cfg.get("depth_min", 0.3))
-    args.fdct_depth_max = float(fdct_cfg.get("depth_max", 1.5))
-    args.fdct_depth_norm = float(fdct_cfg.get("depth_norm", 1.0))
-    args.fdct_depth_coeff = float(fdct_cfg.get("depth_coeff", 10.0))
-    args.fdct_inpaint = bool(fdct_cfg.get("inpaint", True))
-    args.fdct_bilateral_enabled = bool(fdct_cfg.get("bilateral_enabled", True))
-    args.fdct_bilateral_radius = max(0, int(fdct_cfg.get("bilateral_radius", 2)))
-    args.fdct_bilateral_sigma_space = float(fdct_cfg.get("bilateral_sigma_space", 2.0))
-    args.fdct_bilateral_zfar = float(fdct_cfg.get("bilateral_zfar", 100.0))
-    args.fdct_debug_every = max(1, int(fdct_cfg.get("debug_every", 30)))
-    args.fdct_fallback_to_raw = bool(fdct_cfg.get("fallback_to_raw", True))
-    args.fdct_debug_stats = bool(args.fdct_debug_stats or fdct_cfg.get("debug_stats", False))
 
     args.tactile_enabled = bool(tactile_cfg.get("enabled", False))
     args.tactile_port = str(tactile_cfg.get("port", DEFAULT_TACTILE_PORT))
@@ -507,113 +430,6 @@ def render_depth(depth_image_m, max_depth_m):
     clipped = np.clip(depth_image_m, 0.0, max_depth_m)
     scaled = (255.0 * clipped / max_depth_m).astype(np.uint8)
     return cv.applyColorMap(255 - scaled, cv.COLORMAP_TURBO)
-
-
-def parse_fdct_camera_ids(camera_selection):
-    """Convert the FDCT camera selection string into internal camera ids."""
-    selection = str(camera_selection or "none").strip().lower()
-    if selection == "none":
-        return set()
-    if selection == "cam0":
-        return {0}
-    if selection == "cam1":
-        return {1}
-    if selection == "both":
-        return {0, 1}
-    raise ValueError(f"Unsupported --fdct-cameras value: {camera_selection}")
-
-
-def build_fdct_depth_completer(args):
-    """Create the optional FDCT depth completer used before object point extraction."""
-    if not args.fdct_depth_enabled or args.fdct_cameras == "none":
-        return None
-
-    checkpoint_path = resolve_fdct_checkpoint(args.fdct_checkpoint)
-    config = FDCTDepthCompletionConfig(
-        checkpoint_path=checkpoint_path,
-        width=int(args.width),
-        height=int(args.height),
-        net_width=int(args.fdct_net_width),
-        net_height=int(args.fdct_net_height),
-        depth_min=float(args.fdct_depth_min),
-        depth_max=float(args.fdct_depth_max),
-        depth_norm=float(args.fdct_depth_norm),
-        depth_coeff=float(args.fdct_depth_coeff),
-        inpaint=bool(args.fdct_inpaint),
-    )
-
-    try:
-        completer = FDCTDepthCompleter(config, device_arg=args.fdct_device)
-    except Exception as exc:
-        print(f"[WARN] FDCT depth completion disabled; failed to initialize: {exc}")
-        return None
-
-    print(
-        "[INFO] FDCT depth completion enabled for "
-        f"{args.fdct_cameras}: checkpoint={checkpoint_path}, device={completer.device}"
-    )
-    return completer
-
-
-def _should_log_fdct_event(pipeline, key, every=30):
-    counts = pipeline.setdefault("fdct_event_counts", {})
-    counts[key] = int(counts.get(key, 0)) + 1
-    return counts[key] <= 3 or counts[key] % max(1, int(every)) == 0
-
-
-def apply_fdct_depth_to_object_frames(snapshot, pipeline, args):
-    """Replace selected object-frame depth images with FDCT-completed depth."""
-    completer = pipeline.get("fdct_depth_completer")
-    camera_ids = pipeline.get("fdct_camera_ids", set())
-    if completer is None or not camera_ids:
-        return snapshot.cam0, snapshot.cam1
-
-    object_frames = {0: snapshot.cam0, 1: snapshot.cam1}
-    for camera_id in sorted(camera_ids):
-        frame_bundle = object_frames[camera_id]
-        try:
-            result = completer.complete(frame_bundle.color_image, frame_bundle.depth_image_m)
-        except Exception as exc:
-            if _should_log_fdct_event(pipeline, f"cam{camera_id}:exception", args.fdct_debug_every):
-                print(f"[WARN] cam{camera_id} FDCT failed; using raw depth for object frame: {exc}")
-            if not args.fdct_fallback_to_raw:
-                raise
-            continue
-
-        if result is None:
-            if _should_log_fdct_event(pipeline, f"cam{camera_id}:no_valid_depth", args.fdct_debug_every):
-                print(f"[WARN] cam{camera_id} FDCT skipped; no valid depth after preprocessing.")
-            continue
-
-        filtered_depth_m = result.completed_depth_m.astype(np.float32, copy=False)
-        if args.fdct_bilateral_enabled:
-            try:
-                filtered_depth_m = bilateral_filter_depth(
-                    filtered_depth_m,
-                    radius=args.fdct_bilateral_radius,
-                    zfar=args.fdct_bilateral_zfar,
-                    sigma_space=args.fdct_bilateral_sigma_space,
-                )
-            except Exception as exc:
-                if _should_log_fdct_event(pipeline, f"cam{camera_id}:bilateral_exception", args.fdct_debug_every):
-                    print(f"[WARN] cam{camera_id} bilateral filter failed; using FDCT output: {exc}")
-                filtered_depth_m = result.completed_depth_m.astype(np.float32, copy=False)
-
-        object_frames[camera_id] = replace(
-            frame_bundle,
-            depth_image_m=filtered_depth_m.astype(np.float32, copy=False),
-        )
-        if args.fdct_debug_stats and _should_log_fdct_event(pipeline, f"cam{camera_id}:stats", args.fdct_debug_every):
-            stats = format_depth_completion_stats(
-                frame_bundle.depth_image_m,
-                result.completed_depth_m,
-                args.fdct_depth_min,
-                args.fdct_depth_max,
-                filtered_depth_m=filtered_depth_m,
-            )
-            print(f"[FDCT] cam{camera_id} elapsed={result.elapsed_ms:.1f}ms {stats}")
-
-    return object_frames[0], object_frames[1]
 
 
 class AnySkinTactileManager:
@@ -773,165 +589,6 @@ class AnySkinTactileManager:
             print("[Tactile] AnySkin stream stopped.")
 
 
-class TactileDebugWindow:
-    """Pygame tactile visualization driven by the shared AnySkin manager."""
-
-    CHIP_LOCATIONS = np.array(
-        [
-            [455, 453],
-            [275, 451],
-            [624, 455],
-            [451, 292],
-            [454, 613],
-        ],
-        dtype=np.float32,
-    )
-    CHIP_XY_ROTATIONS = np.array([-np.pi / 2, -np.pi / 2, np.pi, np.pi / 2, 0.0], dtype=np.float32)
-
-    def __init__(self, tactile_manager, *, scaling=10.0):
-        self.tactile_manager = tactile_manager
-        self.scaling = max(float(scaling), 1e-6)
-        self.enabled = False
-        self.closed = False
-        self.pygame = None
-        self.window = None
-        self.background_surface = None
-        self.font_large = None
-        self.font_medium = None
-        self.font_small = None
-        self.clock = None
-
-    def start(self):
-        if self.tactile_manager is None or not bool(getattr(self.tactile_manager, "enabled", False)):
-            print("[WARN] --debug-tactile requested but robot.tactile.enabled is false; tactile window disabled.")
-            return False
-        try:
-            import pygame
-        except Exception as exc:
-            raise RuntimeError("--debug-tactile requires pygame to be installed.") from exc
-
-        self.pygame = pygame
-        pygame.init()
-        desired_width = 900
-        bg_image_path = Path(__file__).resolve().parent / "eFlesh" / "visualizer" / "flesh.png"
-        if bg_image_path.exists():
-            bg_image = pygame.image.load(str(bg_image_path))
-            image_width, image_height = bg_image.get_size()
-            desired_height = int(desired_width * image_height / max(image_width, 1))
-            bg_image = pygame.transform.scale(bg_image, (desired_width, desired_height))
-        else:
-            desired_height = 900
-            bg_image = None
-            print(f"[WARN] Tactile debug background image not found: {bg_image_path}")
-
-        self.window = pygame.display.set_mode((desired_width, desired_height), pygame.SRCALPHA)
-        pygame.display.set_caption("AnySkin Tactile Debug")
-        self.background_surface = pygame.Surface(self.window.get_size(), pygame.SRCALPHA)
-        self.background_surface.fill((234, 237, 232, 255))
-        if bg_image is not None:
-            self.background_surface.blit(bg_image, (0, 0))
-        self.font_large = pygame.font.Font(None, 64)
-        self.font_medium = pygame.font.Font(None, 34)
-        self.font_small = pygame.font.Font(None, 26)
-        self.clock = pygame.time.Clock()
-        self.enabled = True
-        print("[Tactile] Debug visualization window opened. Press 'b' in the window to reset baseline.")
-        return True
-
-    def update(self):
-        if not self.enabled or self.closed:
-            return
-        pygame = self.pygame
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                self.close()
-                return
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_b:
-                self.tactile_manager.reset_baseline()
-
-        if hasattr(self.tactile_manager, "snapshot"):
-            tactile_snapshot = self.tactile_manager.snapshot(refresh=False)
-            tactile_values = tactile_snapshot.get("values", [])
-        else:
-            tactile_values = self.tactile_manager.latest
-        tactile_data = np.asarray(tactile_values, dtype=np.float32).copy()
-        expected_values = int(getattr(self.tactile_manager, "num_mags", DEFAULT_TACTILE_NUM_MAGS)) * 3
-        if tactile_data.size < expected_values:
-            padded = np.zeros((expected_values,), dtype=np.float32)
-            padded[: tactile_data.size] = tactile_data
-            tactile_data = padded
-        tactile_data = tactile_data[:expected_values]
-
-        self.window.blit(self.background_surface, (0, 0))
-        self._draw_tactile_data(tactile_data)
-        pygame.display.update()
-        self.clock.tick(60)
-
-    def _draw_text(self, text, pos, font, color=(20, 20, 20)):
-        surface = font.render(str(text), True, color)
-        self.window.blit(surface, pos)
-
-    def _draw_tactile_data(self, tactile_data):
-        pygame = self.pygame
-        num_mags = int(getattr(self.tactile_manager, "num_mags", DEFAULT_TACTILE_NUM_MAGS))
-        data = tactile_data.reshape(num_mags, 3).copy()
-        data[:, :2] *= -1
-        data_mag = np.linalg.norm(data, axis=1)
-        total_norm = float(np.linalg.norm(data.flatten()))
-
-        contact_threshold = float(
-            getattr(self.tactile_manager, "contact_norm_threshold", DEFAULT_TACTILE_CONTACT_NORM_THRESHOLD)
-        )
-        contact_color = (0, 120, 0) if total_norm >= contact_threshold else (200, 0, 0)
-        contact_text = "Contact" if total_norm >= contact_threshold else "No Contact"
-        self._draw_text(contact_text, (30, 30), self.font_large, contact_color)
-        self._draw_text("b: reset baseline", (30, 90), self.font_small, (70, 70, 70))
-        self._draw_text(
-            f"norm={total_norm:.2f} status={getattr(self.tactile_manager, 'release_status', 'off')}",
-            (30, 118),
-            self.font_small,
-            (20, 20, 20),
-        )
-
-        chip_locations = self.CHIP_LOCATIONS[:num_mags]
-        chip_rotations = self.CHIP_XY_ROTATIONS[:num_mags]
-        for magid, chip_location in enumerate(chip_locations):
-            chip_xy = chip_location.astype(int)
-            z_val = float(data[magid, 2])
-            radius = max(2, int(abs(z_val) / self.scaling))
-            width = 2 if z_val < 0 else 0
-            pygame.draw.circle(self.window, (255, 0, 0), chip_xy, radius, width)
-
-            rot = float(chip_rotations[magid])
-            rotation_mat = np.array(
-                [
-                    [np.cos(rot), -np.sin(rot)],
-                    [np.sin(rot), np.cos(rot)],
-                ],
-                dtype=np.float32,
-            )
-            data_xy = rotation_mat @ data[magid, :2]
-            arrow_end = (
-                int(chip_xy[0] + data_xy[0] / self.scaling),
-                int(chip_xy[1] + data_xy[1] / self.scaling),
-            )
-            pygame.draw.line(self.window, (0, 255, 0), chip_xy, arrow_end, 8)
-            pygame.draw.circle(self.window, (20, 20, 20), chip_xy, 5)
-            self._draw_text(f"M{magid} {data_mag[magid]:.1f}", (chip_xy[0] - 38, chip_xy[1] - 42), self.font_small)
-
-    def close(self):
-        if self.closed:
-            return
-        self.closed = True
-        self.enabled = False
-        if self.pygame is not None:
-            try:
-                self.pygame.display.quit()
-            except Exception:
-                pass
-        print("[Tactile] Debug visualization window closed.")
-
-
 def clamp_value(v, low, high):
     return max(low, min(high, v))
 
@@ -1011,12 +668,6 @@ def get_home_joints_rad():
     return tuple(float(np.deg2rad(value)) for value in HOME_JOINTS_DEG)
 
 
-def get_base_pose_target(controller):
-    """Deprecated compatibility shim; HOME is now defined by joint positions."""
-    del controller
-    return (None, None)
-
-
 def make_robot_command(command_type, *, target_position_base=None, fixed_orientation_base=None, gripper_action=None, source_mode="manual"):
     """Create the shared robot command object expected by RtdeController.step()."""
     return RobotCommandState(
@@ -1068,7 +719,7 @@ def init_rtde(args):
     )
 
     if args.move_to_base:
-        print("[INFO] move-to-base requested, but this RTDE version uses the current pose as the fixed baseline.")
+        print("[INFO] --move-to-base is ignored; HOME is defined by HOME_JOINTS_DEG.")
 
     print("[INFO] Opening gripper at startup...")
     startup_open_ok = False
@@ -1556,10 +1207,6 @@ class FollowSharedState:
                 "task_state": self.task_state,
                 "task_epoch": self.task_epoch,
             }
-
-    def get_initial_object_label(self):
-        with self.lock:
-            return self.initial_object_label
 
     def try_lock_home_pose(self, object_xyz_mm, pixel_xy):
         """Lock the stable start pose used later as the delivery location."""
@@ -2703,44 +2350,6 @@ def capture_tactile_release_reference(tactile_manager, delay_s=0.0):
     return reference_norm
 
 
-def wait_for_tactile_release_trigger(tactile_manager, *, delta_threshold, timeout_s, poll_dt=0.03):
-    """Wait at PLACE until tactile delta indicates release timing, with timeout fallback."""
-    if tactile_manager is None or not bool(getattr(tactile_manager, "enabled", False)):
-        return False
-
-    delta_threshold = max(0.0, float(delta_threshold))
-    timeout_s = max(0.0, float(timeout_s))
-    deadline = time.time() + timeout_s
-    loop_start = time.time()
-    tactile_manager.release_status = "waiting_release"
-
-    while True:
-        current_norm = tactile_manager.total_norm()
-        delta_norm = tactile_manager.update_release_delta(current_norm)
-        print_tactile_frame_log(
-            tactile_manager,
-            stage="release_wait",
-            stage_time_s=time.time() - loop_start,
-        )
-        if delta_norm is not None and delta_norm > delta_threshold:
-            tactile_manager.release_status = "release_triggered"
-            print(
-                "[Tactile] Release trigger detected: "
-                f"norm={current_norm:.3f}, ref={tactile_manager.release_reference_norm:.3f}, "
-                f"delta={delta_norm:.3f} > {delta_threshold:.3f}."
-            )
-            return True
-        if time.time() >= deadline:
-            tactile_manager.release_status = "release_timeout"
-            delta_text = "n/a" if delta_norm is None else f"{delta_norm:.3f}"
-            print(
-                "[Tactile] Release trigger timeout; opening gripper normally. "
-                f"last_norm={current_norm:.3f}, delta={delta_text}, threshold={delta_threshold:.3f}."
-            )
-            return False
-        time.sleep(max(0.0, poll_dt))
-
-
 def execute_tactile_release_descent(
     controller,
     tactile_manager,
@@ -3232,8 +2841,6 @@ def build_dual_perception_pipeline(args):
     transform_chain = load_transform_chain(args.config)
     t_cam0_base = np.linalg.inv(transform_chain.t_base_cam0).astype(np.float32)
     t_cam1_base = np.linalg.inv(transform_chain.t_base_cam1).astype(np.float32)
-    fdct_camera_ids = parse_fdct_camera_ids(args.fdct_cameras)
-    fdct_depth_completer = build_fdct_depth_completer(args) if fdct_camera_ids else None
 
     return {
         "sensor_hub": sensor_hub,
@@ -3251,9 +2858,6 @@ def build_dual_perception_pipeline(args):
         "transform_chain": transform_chain,
         "t_cam0_base": t_cam0_base,
         "t_cam1_base": t_cam1_base,
-        "fdct_camera_ids": fdct_camera_ids,
-        "fdct_depth_completer": fdct_depth_completer,
-        "fdct_event_counts": {},
         "prompt_classes": prompt_classes,
     }
 
@@ -3402,9 +3006,6 @@ def build_runtime_profile_context(args, model_label, pipeline):
         "select_class": list(args.select_class or []),
         "enable_follow": bool(args.enable_follow),
         "control_hz": float(args.control_hz),
-        "fdct_depth_enabled": bool(args.fdct_depth_enabled),
-        "fdct_cameras": args.fdct_cameras,
-        "fdct_device": args.fdct_device,
         "prompt_classes": list(pipeline.get("prompt_classes", [])),
     }
 
@@ -3649,8 +3250,6 @@ def main():
     sensor_hub.start()
 
     model_label = args.model if not pipeline["prompt_classes"] else f"{args.model} ({','.join(pipeline['prompt_classes'])})"
-    if pipeline.get("fdct_depth_completer") is not None:
-        model_label = f"{model_label} + FDCT depth({args.fdct_cameras})"
     runtime_profiler = RuntimeProfiler(
         enabled=bool(args.profile_runtime),
         output_dir=args.profile_dir,
@@ -3747,13 +3346,11 @@ def main():
 
             with runtime_profiler.stage("read_pair"):
                 snapshot = sensor_hub.read_next_pair()
-            with runtime_profiler.stage("fdct"):
-                object_frame_cam0, object_frame_cam1 = apply_fdct_depth_to_object_frames(snapshot, pipeline, args)
 
             with runtime_profiler.stage("object_cam0"):
-                object_cam0 = pipeline["object_worker_cam0"].process_frame(object_frame_cam0, frame_id=snapshot.pair_index)
+                object_cam0 = pipeline["object_worker_cam0"].process_frame(snapshot.cam0, frame_id=snapshot.pair_index)
             with runtime_profiler.stage("object_cam1"):
-                object_cam1 = pipeline["object_worker_cam1"].process_frame(object_frame_cam1, frame_id=snapshot.pair_index)
+                object_cam1 = pipeline["object_worker_cam1"].process_frame(snapshot.cam1, frame_id=snapshot.pair_index)
             with runtime_profiler.stage("hand_cam0"):
                 hand_cam0 = pipeline["hand_worker_cam0"].process_frame(snapshot.cam0, frame_id=snapshot.pair_index)
             with runtime_profiler.stage("hand_cam1"):

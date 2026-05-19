@@ -69,14 +69,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--select-class", nargs="*", default=None, help="Optional class-name filter.")
     parser.add_argument("--half", action="store_true", help="Enable FP16 inference when supported.")
 
-    parser.add_argument("--enable-fdct-depth", dest="fdct_depth_enabled", action="store_true")
-    parser.add_argument("--disable-fdct-depth", dest="fdct_depth_enabled", action="store_false")
-    parser.set_defaults(fdct_depth_enabled=None)
-    parser.add_argument("--fdct-cameras", choices=["cam0", "cam1", "both", "none"], default=None)
-    parser.add_argument("--fdct-checkpoint", default=None)
-    parser.add_argument("--fdct-device", default=None)
-    parser.add_argument("--fdct-debug-stats", action="store_true")
-
     parser.add_argument("--fps", type=int, default=30, help="Timestamp fallback FPS for recordings missing timestamps.")
     parser.add_argument("--start-frame", type=int, default=0, help="First source frame index to process.")
     parser.add_argument("--end-frame", type=int, default=None, help="Exclusive source frame index stop.")
@@ -343,13 +335,8 @@ def run_replay(input_path: str | Path, args: argparse.Namespace) -> OfflineRepla
             task_epoch = int(optional_float_array_value(data, "task_epoch", source_index, 0.0))
             snapshot = build_offline_snapshot(data, source_index, replay_index, runtime_args.fps)
 
-            object_frame_cam0, object_frame_cam1 = live.apply_fdct_depth_to_object_frames(
-                snapshot,
-                pipeline,
-                runtime_args,
-            )
-            object_cam0 = pipeline["object_worker_cam0"].process_frame(object_frame_cam0, frame_id=snapshot.pair_index)
-            object_cam1 = pipeline["object_worker_cam1"].process_frame(object_frame_cam1, frame_id=snapshot.pair_index)
+            object_cam0 = pipeline["object_worker_cam0"].process_frame(snapshot.cam0, frame_id=snapshot.pair_index)
+            object_cam1 = pipeline["object_worker_cam1"].process_frame(snapshot.cam1, frame_id=snapshot.pair_index)
             hand_cam0 = pipeline["hand_worker_cam0"].process_frame(snapshot.cam0, frame_id=snapshot.pair_index)
             hand_cam1 = pipeline["hand_worker_cam1"].process_frame(snapshot.cam1, frame_id=snapshot.pair_index)
 

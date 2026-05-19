@@ -200,5 +200,6 @@ pyrightconfig.json
 *.csv
 *.mp4
 *.npz
+*.rrd
 output/debug_3d/
 archive_non_rtde_main/
