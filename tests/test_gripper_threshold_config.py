@@ -330,6 +330,120 @@ class DummyJointHomeController:
         self.stop_called = True
 
 
+class DummyWorkerController:
+    def __init__(self):
+        self.commands = []
+        self.closed = False
+        self.config = {"robot": {"gripper": {"position_complete_threshold": 40}}}
+        self.gripper_position_complete_threshold = 40
+
+    def read_robot_state(self, *, now_timestamp=None):
+        del now_timestamp
+        return SimpleNamespace(
+            is_connected=True,
+            using_mock=True,
+            actual_tcp_pose_base=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            joint_positions=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            last_error=None,
+            tcp_force_norm_n=0.0,
+            mean_joint_current_a=0.0,
+            grasp_verified_force_current=False,
+        )
+
+    def step(self, command, now_timestamp=None):
+        del now_timestamp
+        self.commands.append(command)
+        return True
+
+    def close(self):
+        self.closed = True
+
+
+class DummyWorkerSharedState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.follow_idle = True
+        self.follow_enabled = True
+        self.follow_pause_requested = False
+        self.pregrasp_ok = True
+        self.reset_count = 0
+        self.task_state = "FOLLOW"
+
+    def get_snapshot(self, now_perf=None):
+        del now_perf
+        return {
+            "follow_enabled": self.follow_enabled,
+            "follow_pause_requested": self.follow_pause_requested,
+            "control_target_xyz_mm": np.asarray([5.0, 5.0, 0.0], dtype=np.float32),
+            "target_source": "hand_fallback",
+            "valid_detection_streak": 1,
+            "prediction_armed": True,
+            "motion_triggered": True,
+            "prediction_age_s": None,
+            "fixed_z_mm": 0.0,
+            "fixed_orientation_base": (0.0, 0.0, 0.0),
+            "latest_target_xyz_mm": np.asarray([5.0, 5.0, 0.0], dtype=np.float32),
+            "latest_grasp_xyz_mm": np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+            "latest_object_xyz_mm": np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+            "initial_pose_base": (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            "task_epoch": 0,
+        }
+
+    def set_follow_thread_idle(self, is_idle):
+        self.follow_idle = bool(is_idle)
+
+    def clear_follow_pause(self):
+        self.follow_pause_requested = False
+
+    def request_follow_pause(self):
+        self.follow_pause_requested = True
+
+    def set_follow_enabled(self, follow_enabled, *, reset_prediction=True, reset_arm=True):
+        del reset_prediction, reset_arm
+        self.follow_enabled = bool(follow_enabled)
+
+    def stop_follow(self):
+        self.follow_enabled = False
+
+    def set_task_state(self, task_state, *, reset_prediction=False, reset_arm=False):
+        del reset_prediction, reset_arm
+        self.task_state = task_state
+
+    def reset_for_restart(self, *, follow_enabled=None):
+        self.reset_count += 1
+        self.follow_enabled = bool(follow_enabled)
+
+    def set_fixed_pose_from_robot(self, controller):
+        del controller
+
+    def is_pregrasp_pose_reached(self, eef_pose_base, x_tol_mm=210.0, y_tol_mm=30.0, z_tol_mm=30.0):
+        del eef_pose_base, x_tol_mm, y_tol_mm, z_tol_mm
+        return self.pregrasp_ok
+
+
+def worker_args():
+    return SimpleNamespace(
+        control_hz=30.0,
+        min_valid_count=1,
+        prediction_max_horizon_s=0.25,
+        follow_z=False,
+        verbose_robot=False,
+        gripper_close_timeout_s=0.1,
+        tactile_contact_norm_threshold=30.0,
+        tactile_extra_grasp_pos=10,
+        gripper_release_dwell_s=0.0,
+        move_timeout_s=0.1,
+        position_tolerance_m=0.0,
+        enable_follow=True,
+        workspace_x=[-1000.0, 1000.0],
+        workspace_y=[-1000.0, 1000.0],
+        workspace_z=[-1000.0, 1000.0],
+        post_release_z_offset_mm=0.0,
+        pre_release_descend_before_open=False,
+        pre_release_descend_mm=0.0,
+    )
+
+
 def config_args():
     return SimpleNamespace(
         robot_ip=None,
@@ -368,6 +482,88 @@ def place_args(*, tactile_enabled=False, pre_release_enabled=True, pre_release_d
         position_tolerance_m=0.0,
         gripper_release_dwell_s=0.0,
     )
+
+
+class RobotWorkerThreadStructureTests(unittest.TestCase):
+    def make_worker(self):
+        shared_state = DummyWorkerSharedState()
+        worker = _MODULE.RobotWorker(worker_args(), shared_state)
+        worker.controller = DummyWorkerController()
+        return worker, shared_state, worker.controller
+
+    def test_submit_marks_urgent_requests_cancelled(self):
+        worker, _shared_state, _controller = self.make_worker()
+
+        request_id = worker.submit(_MODULE.RobotRequest(_MODULE.ROBOT_REQ_RESET_HOME))
+
+        self.assertEqual(request_id, 1)
+        self.assertTrue(worker._cancel_event.is_set())
+
+    def test_worker_follow_sends_servo_command_for_hand_fallback_target(self):
+        worker, _shared_state, controller = self.make_worker()
+
+        worker._handle_start_follow()
+        worker._follow_once()
+
+        command_types = [command.command_type for command in controller.commands]
+        self.assertIn(_MODULE.ROBOT_CMD_SERVO_TO_POSITION, command_types)
+        self.assertEqual(worker.get_status().state, _MODULE.ROBOT_STATE_FOLLOWING)
+
+    def test_worker_grasp_place_advances_to_done(self):
+        worker, _shared_state, _controller = self.make_worker()
+        worker._set_status(state=_MODULE.ROBOT_STATE_FOLLOWING)
+        calls = []
+
+        def fake_gripper_close(*args, **kwargs):
+            del args, kwargs
+            calls.append("grasp")
+            return True
+
+        def fake_save_offset(*args, **kwargs):
+            del args, kwargs
+            calls.append("offset")
+            return True
+
+        def fake_return_place(*args, **kwargs):
+            del args, kwargs
+            calls.append("place")
+            return True
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            with unittest.mock.patch.object(_MODULE, "execute_gripper_close", side_effect=fake_gripper_close):
+                with unittest.mock.patch.object(_MODULE, "save_grasp_offset", side_effect=fake_save_offset):
+                    with unittest.mock.patch.object(_MODULE, "execute_return_and_place", side_effect=fake_return_place):
+                        worker._handle_start_grasp_place(
+                            {
+                                "context": _MODULE.RobotActionContext(
+                                    fitted_points_base=np.zeros((4, 3), dtype=np.float32),
+                                    grasp_point_base=(0.0, 0.0, 0.0),
+                                    object_label="cup",
+                                )
+                            }
+                        )
+
+        status = worker.get_status()
+        self.assertEqual(calls, ["grasp", "offset", "place"])
+        self.assertEqual(status.state, _MODULE.ROBOT_STATE_DONE)
+        self.assertTrue(status.grasp_ok)
+        self.assertEqual(status.task_done_epoch, 1)
+
+    def test_cancelled_wait_sends_stop_command(self):
+        controller = DummyWorkerController()
+        cancel_event = threading.Event()
+        cancel_event.set()
+
+        ok = _MODULE.wait_until_target_reached(
+            controller,
+            (0.0, 0.0, 0.0),
+            timeout_s=0.1,
+            tolerance_m=0.0,
+            cancel_event=cancel_event,
+        )
+
+        self.assertFalse(ok)
+        self.assertEqual(controller.commands[-1].command_type, _MODULE.ROBOT_CMD_STOP)
 
 
 class GripperThresholdConfigTests(unittest.TestCase):

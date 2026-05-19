@@ -1,10 +1,11 @@
 """Dual-camera grasp-target follow script adapted for UR5 RTDE control."""
 
 import argparse
+import queue
 import sys
 import time
 import threading
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from collections import deque
 
@@ -110,6 +111,65 @@ HOME_JOINT_SPEED_RAD_S = 0.5
 HOME_JOINT_ACCELERATION_RAD_S2 = 0.5
 VIDEO_RECORDER_SERIAL = "335522072904"
 VIDEO_RECORDER_PORT = 5000
+
+ROBOT_REQ_INIT_ROBOT = "INIT_ROBOT"
+ROBOT_REQ_START_FOLLOW = "START_FOLLOW"
+ROBOT_REQ_STOP_FOLLOW = "STOP_FOLLOW"
+ROBOT_REQ_START_GRASP_PLACE = "START_GRASP_PLACE"
+ROBOT_REQ_RESET_HOME = "RESET_HOME"
+ROBOT_REQ_SAVE_AND_STOP = "SAVE_AND_STOP"
+ROBOT_REQ_EMERGENCY_STOP = "EMERGENCY_STOP"
+ROBOT_REQ_SHUTDOWN = "SHUTDOWN"
+
+ROBOT_URGENT_REQUESTS = {
+    ROBOT_REQ_RESET_HOME,
+    ROBOT_REQ_SAVE_AND_STOP,
+    ROBOT_REQ_EMERGENCY_STOP,
+    ROBOT_REQ_SHUTDOWN,
+}
+
+ROBOT_STATE_IDLE = "IDLE"
+ROBOT_STATE_INITIALIZING = "INITIALIZING"
+ROBOT_STATE_FOLLOWING = "FOLLOWING"
+ROBOT_STATE_GRASPING = "GRASPING"
+ROBOT_STATE_RETURNING = "RETURNING"
+ROBOT_STATE_PLACING = "PLACING"
+ROBOT_STATE_RESETTING = "RESETTING"
+ROBOT_STATE_DONE = "DONE"
+ROBOT_STATE_ERROR = "ERROR"
+ROBOT_STATE_STOPPING = "STOPPING"
+
+
+@dataclass
+class RobotRequest:
+    type: str
+    payload: dict = field(default_factory=dict)
+    created_at: float = field(default_factory=time.time)
+    request_id: int = 0
+
+
+@dataclass
+class RobotActionContext:
+    fitted_points_base: object = None
+    grasp_point_base: object = None
+    object_label: object = None
+    template_axes_base: object = None
+
+
+@dataclass
+class RobotStatus:
+    state: str = ROBOT_STATE_IDLE
+    last_error: object = None
+    is_connected: bool = False
+    using_mock: bool = False
+    active_request: object = None
+    active_request_id: int = 0
+    last_robot_pose: object = None
+    last_command_type: object = None
+    grasp_ok: object = None
+    task_done_epoch: int = 0
+    reset_done_epoch: int = 0
+    task_ready_epoch: int = 0
 
 
 def parse_args():
@@ -856,6 +916,13 @@ class FollowSharedState:
             if reset_prediction:
                 self._reset_prediction_locked(reset_arm=reset_arm)
 
+    def set_follow_enabled(self, follow_enabled, *, reset_prediction=True, reset_arm=True):
+        with self.lock:
+            self.follow_enabled = bool(follow_enabled)
+            if reset_prediction:
+                self._reset_prediction_locked(reset_arm=reset_arm)
+            print(f"[INFO] follow_enabled = {self.follow_enabled}")
+
     def toggle_follow(self):
         with self.lock:
             self.follow_enabled = not self.follow_enabled
@@ -1267,28 +1334,23 @@ class FollowSharedState:
         else:
             self.object_stopped = False
 
-    def should_start_pregrasp(
+    def is_pregrasp_pose_reached(
         self,
-        controller,
+        eef_pose_base,
         x_tol_mm=210.0,
         y_tol_mm=30.0,
         z_tol_mm=30.0,
     ):
-        """Check whether the tool is close enough to close the gripper directly."""
+        """Check whether a robot pose is close enough to close the gripper."""
         snapshot = self.get_snapshot()
         target_xyz = snapshot["latest_grasp_xyz_mm"]
         if target_xyz is None:
             target_xyz = snapshot["latest_object_xyz_mm"]
 
-        if target_xyz is None:
+        if target_xyz is None or eef_pose_base is None:
             return False
 
-        state = controller.read_robot_state(now_timestamp=time.time())
-        cur_pose = state.actual_tcp_pose_base
-        if cur_pose is None:
-            return False
-
-        eef_x, eef_y, eef_z = meters_to_mm(cur_pose[:3])
+        eef_x, eef_y, eef_z = meters_to_mm(eef_pose_base[:3])
         obj_x, obj_y, obj_z = target_xyz[:3]
 
         dx = float(obj_x - eef_x)
@@ -1306,6 +1368,22 @@ class FollowSharedState:
         #     f"|dz|={abs(dz):.1f} <= {z_tol_mm:.1f} -> {z_ok}"
         # )
         return x_ok and y_ok and z_ok
+
+    def should_start_pregrasp(
+        self,
+        controller,
+        x_tol_mm=210.0,
+        y_tol_mm=30.0,
+        z_tol_mm=30.0,
+    ):
+        """Compatibility wrapper for tests and legacy callers."""
+        state = controller.read_robot_state(now_timestamp=time.time())
+        return self.is_pregrasp_pose_reached(
+            state.actual_tcp_pose_base,
+            x_tol_mm=x_tol_mm,
+            y_tol_mm=y_tol_mm,
+            z_tol_mm=z_tol_mm,
+        )
 
 def robot_control_loop(controller, shared_state, args):
     """Servo the UR5 toward the current control target while follow mode is active."""
@@ -1423,12 +1501,485 @@ def robot_control_loop(controller, shared_state, args):
         time.sleep(max(0.0, interval - elapsed))
 
 
-def wait_until_target_reached(controller, target_position_base, *, timeout_s, tolerance_m, poll_dt=0.05):
+class RobotWorker:
+    """Single thread that owns all RTDE and gripper commands."""
+
+    def __init__(self, args, shared_state, metadata_recorder=None, tactile_manager=None):
+        self.args = args
+        self.shared_state = shared_state
+        self.metadata_recorder = metadata_recorder
+        self.tactile_manager = tactile_manager
+        self.controller = None
+        self._request_queue = queue.Queue()
+        self._status = RobotStatus()
+        self._status_lock = threading.Lock()
+        self._cancel_event = threading.Event()
+        self._shutdown_event = threading.Event()
+        self._thread = None
+        self._request_seq = 0
+        self._request_seq_lock = threading.Lock()
+        self._last_sent_pose_mm = None
+        self._ref_target_xyz_mm = None
+        self._was_follow_active = False
+        self._next_follow_tick_t = 0.0
+        self._last_status_read_t = 0.0
+
+    def start(self):
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run, name="robot-worker", daemon=True)
+        self._thread.start()
+
+    def join(self, timeout=None):
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+
+    def submit(self, request):
+        if not isinstance(request, RobotRequest):
+            request = RobotRequest(str(request))
+        payload = {} if request.payload is None else dict(request.payload)
+        with self._request_seq_lock:
+            self._request_seq += 1
+            request_id = self._request_seq
+        queued_request = RobotRequest(
+            type=str(request.type),
+            payload=payload,
+            created_at=float(request.created_at),
+            request_id=request_id,
+        )
+        if queued_request.type in ROBOT_URGENT_REQUESTS:
+            self._cancel_event.set()
+        self._request_queue.put(queued_request)
+        return request_id
+
+    def get_status(self):
+        with self._status_lock:
+            return replace(self._status)
+
+    def _set_status(self, **updates):
+        with self._status_lock:
+            for key, value in updates.items():
+                setattr(self._status, key, value)
+
+    def _bump_status_counter(self, field_name):
+        with self._status_lock:
+            setattr(self._status, field_name, int(getattr(self._status, field_name)) + 1)
+            return int(getattr(self._status, field_name))
+
+    def _current_state(self):
+        with self._status_lock:
+            return self._status.state
+
+    def _set_active_request(self, request):
+        self._set_status(active_request=request.type, active_request_id=int(request.request_id))
+
+    def _clear_active_request(self):
+        self._set_status(active_request=None, active_request_id=0)
+
+    def _reset_follow_tracking(self):
+        self._last_sent_pose_mm = None
+        self._ref_target_xyz_mm = None
+        self._was_follow_active = False
+        self.shared_state.set_follow_thread_idle(True)
+
+    def _read_robot_state(self):
+        if self.controller is None:
+            self._set_status(is_connected=False, using_mock=False)
+            return None
+        try:
+            state = self.controller.read_robot_state(now_timestamp=time.time())
+        except Exception as exc:
+            self._set_status(last_error=str(exc), is_connected=False)
+            return None
+
+        pose = getattr(state, "actual_tcp_pose_base", None)
+        pose_tuple = None if pose is None else tuple(float(v) for v in pose)
+        using_mock = bool(getattr(state, "using_mock", getattr(self.controller, "using_mock", False)))
+        self._set_status(
+            is_connected=bool(getattr(state, "is_connected", False)),
+            using_mock=using_mock,
+            last_robot_pose=pose_tuple,
+            last_error=getattr(state, "last_error", None),
+        )
+        self._last_status_read_t = time.time()
+        return state
+
+    def _send_robot_command(self, command_type, **kwargs):
+        if self.controller is None:
+            return None
+        self._set_status(last_command_type=command_type)
+        return send_robot_command(self.controller, command_type, **kwargs)
+
+    def _safe_stop(self, source_mode="worker_stop"):
+        if self.controller is None:
+            return
+        try:
+            self._send_robot_command(ROBOT_CMD_STOP, source_mode=source_mode)
+        except Exception as exc:
+            self._set_status(last_error=str(exc))
+
+    def _disconnect(self):
+        if self.controller is None:
+            return
+        disconnect_rtde(self.controller)
+        self.controller = None
+        self._set_status(is_connected=False, using_mock=False, last_robot_pose=None)
+
+    def _publish_task_ready(self):
+        self._bump_status_counter("task_ready_epoch")
+
+    def _run(self):
+        while not self._shutdown_event.is_set():
+            try:
+                request = self._request_queue.get(timeout=0.01)
+                self._handle_request(request)
+                if request.type == ROBOT_REQ_SHUTDOWN:
+                    break
+                continue
+            except queue.Empty:
+                pass
+
+            if self._current_state() == ROBOT_STATE_FOLLOWING:
+                self._follow_once()
+            elif self.controller is not None and time.time() - self._last_status_read_t >= 0.1:
+                self._read_robot_state()
+
+        self._shutdown_event.set()
+
+    def _handle_request(self, request):
+        self._set_active_request(request)
+        try:
+            if request.type == ROBOT_REQ_INIT_ROBOT:
+                self._handle_init_robot()
+            elif request.type == ROBOT_REQ_START_FOLLOW:
+                self._handle_start_follow()
+            elif request.type == ROBOT_REQ_STOP_FOLLOW:
+                self._handle_stop_follow()
+            elif request.type == ROBOT_REQ_START_GRASP_PLACE:
+                self._handle_start_grasp_place(request.payload)
+            elif request.type == ROBOT_REQ_RESET_HOME:
+                self._handle_reset_home()
+            elif request.type == ROBOT_REQ_SAVE_AND_STOP:
+                self._handle_save_and_stop()
+            elif request.type == ROBOT_REQ_EMERGENCY_STOP:
+                self._handle_emergency_stop()
+            elif request.type == ROBOT_REQ_SHUTDOWN:
+                self._handle_shutdown()
+            else:
+                self._reject_request(request, f"unknown request type {request.type}")
+        finally:
+            self._clear_active_request()
+
+    def _reject_request(self, request, reason):
+        message = f"Rejected robot request {request.type}: {reason}"
+        print(f"[WARN] {message}")
+        self._set_status(last_error=message)
+
+    def _handle_init_robot(self):
+        if self.controller is not None:
+            self._set_status(last_error=None)
+            return
+        self._cancel_event.clear()
+        self._set_status(state=ROBOT_STATE_INITIALIZING, last_error=None, grasp_ok=None)
+        try:
+            self.controller = init_rtde(self.args)
+            self._read_robot_state()
+            home_ok = move_robot_to_home_pose(self.controller, self.args, cancel_event=self._cancel_event)
+            if home_ok is False:
+                self._set_status(state=ROBOT_STATE_IDLE, last_error="robot initialization cancelled")
+                return
+            self.shared_state.set_fixed_pose_from_robot(self.controller)
+            self._read_robot_state()
+            self._publish_task_ready()
+            self._set_status(state=ROBOT_STATE_IDLE, last_error=None)
+        except Exception as exc:
+            self._set_status(state=ROBOT_STATE_ERROR, last_error=str(exc))
+            print(f"[WARN] Robot initialization failed: {exc}")
+
+    def _handle_start_follow(self):
+        if self.controller is None:
+            self._reject_request(RobotRequest(ROBOT_REQ_START_FOLLOW), "robot is not initialized")
+            return
+        state = self._current_state()
+        if state in {ROBOT_STATE_GRASPING, ROBOT_STATE_RETURNING, ROBOT_STATE_PLACING, ROBOT_STATE_RESETTING, ROBOT_STATE_STOPPING}:
+            self._reject_request(RobotRequest(ROBOT_REQ_START_FOLLOW), f"state is {state}")
+            return
+        self._cancel_event.clear()
+        self.shared_state.clear_follow_pause()
+        self.shared_state.set_follow_enabled(True, reset_prediction=True, reset_arm=True)
+        self.shared_state.set_task_state("FOLLOW", reset_prediction=False, reset_arm=False)
+        self._reset_follow_tracking()
+        self._next_follow_tick_t = 0.0
+        self._set_status(state=ROBOT_STATE_FOLLOWING, last_error=None, grasp_ok=None)
+
+    def _handle_stop_follow(self):
+        self.shared_state.request_follow_pause()
+        self.shared_state.stop_follow()
+        if self._was_follow_active:
+            self._safe_stop(source_mode="stop_follow")
+        self._reset_follow_tracking()
+        if self._current_state() == ROBOT_STATE_FOLLOWING:
+            self._set_status(state=ROBOT_STATE_IDLE)
+
+    def _handle_start_grasp_place(self, payload):
+        if self.controller is None:
+            self._reject_request(RobotRequest(ROBOT_REQ_START_GRASP_PLACE), "robot is not initialized")
+            return
+        if self._current_state() != ROBOT_STATE_FOLLOWING:
+            self._reject_request(RobotRequest(ROBOT_REQ_START_GRASP_PLACE), f"state is {self._current_state()}")
+            return
+
+        robot_state = self._read_robot_state()
+        robot_pose = None if robot_state is None else getattr(robot_state, "actual_tcp_pose_base", None)
+        if not self.shared_state.is_pregrasp_pose_reached(robot_pose):
+            self._set_status(last_error="grasp request ignored because final pose check failed")
+            return
+
+        context = payload.get("context")
+        if context is None:
+            context = RobotActionContext()
+        elif isinstance(context, dict):
+            context = RobotActionContext(**context)
+
+        self.shared_state.request_follow_pause()
+        self.shared_state.stop_follow()
+        self._safe_stop(source_mode="pregrasp_handoff")
+        self._reset_follow_tracking()
+
+        tactile_enabled = self.tactile_manager is not None and bool(getattr(self.tactile_manager, "enabled", False))
+        if tactile_enabled:
+            reset_gripper_position_threshold_to_config_default(self.controller)
+        else:
+            configure_gripper_position_threshold_from_geometry(
+                self.controller,
+                context.fitted_points_base,
+                context.grasp_point_base,
+                object_label=context.object_label,
+                template_axes_base=context.template_axes_base,
+            )
+
+        self._set_status(state=ROBOT_STATE_GRASPING, grasp_ok=None, last_error=None)
+        grasp_ok = execute_gripper_close(
+            self.controller,
+            timeout_s=self.args.gripper_close_timeout_s,
+            verbose=True,
+            metadata_recorder=self.metadata_recorder,
+            tactile_manager=self.tactile_manager,
+            tactile_contact_threshold=self.args.tactile_contact_norm_threshold,
+            tactile_extra_grasp_pos=self.args.tactile_extra_grasp_pos,
+            cancel_event=self._cancel_event,
+        )
+        self._set_status(grasp_ok=bool(grasp_ok))
+        print(f"[INFO] grasp_ok = {grasp_ok}")
+        if self._cancel_event.is_set():
+            self._safe_stop(source_mode="grasp_cancelled")
+            self._set_status(state=ROBOT_STATE_IDLE)
+            return
+        if not grasp_ok:
+            self._set_status(state=ROBOT_STATE_ERROR, last_error="gripper close did not verify grasp")
+            return
+
+        save_grasp_offset(self.controller, self.shared_state)
+        if self._cancel_event.is_set():
+            self._safe_stop(source_mode="post_grasp_cancelled")
+            self._set_status(state=ROBOT_STATE_IDLE)
+            return
+
+        self._set_status(state=ROBOT_STATE_RETURNING)
+        self._set_status(state=ROBOT_STATE_PLACING)
+        place_ok = execute_return_and_place(
+            self.controller,
+            self.shared_state,
+            self.args,
+            metadata_recorder=self.metadata_recorder,
+            tactile_manager=self.tactile_manager,
+            cancel_event=self._cancel_event,
+        )
+        if self._cancel_event.is_set():
+            self._safe_stop(source_mode="place_cancelled")
+            self._set_status(state=ROBOT_STATE_IDLE)
+            return
+        if not place_ok:
+            self._set_status(state=ROBOT_STATE_ERROR, last_error="return/place failed")
+            return
+
+        self._bump_status_counter("task_done_epoch")
+        self._set_status(state=ROBOT_STATE_DONE, last_error=None)
+
+    def _handle_reset_home(self):
+        self._cancel_event.clear()
+        self._set_status(state=ROBOT_STATE_RESETTING, last_error=None, grasp_ok=None)
+        try:
+            self.shared_state.request_follow_pause()
+            self.shared_state.stop_follow()
+            self._safe_stop(source_mode="reset_home")
+            self._reset_follow_tracking()
+            if self.controller is not None:
+                execute_gripper_open(
+                    self.controller,
+                    dwell_s=self.args.gripper_release_dwell_s,
+                    cancel_event=self._cancel_event,
+                )
+                home_ok = move_robot_to_home_pose(self.controller, self.args, cancel_event=self._cancel_event)
+                if home_ok is False:
+                    self._set_status(state=ROBOT_STATE_IDLE, last_error="reset cancelled")
+                    return
+                reset_tactile_state_for_system_reset(self.tactile_manager)
+                self.shared_state.reset_for_restart(follow_enabled=self.args.enable_follow)
+                self.shared_state.set_fixed_pose_from_robot(self.controller)
+                self.shared_state.clear_follow_pause()
+                self._read_robot_state()
+                self._publish_task_ready()
+                self._set_status(state=ROBOT_STATE_FOLLOWING if self.args.enable_follow else ROBOT_STATE_IDLE)
+            else:
+                reset_tactile_state_for_system_reset(self.tactile_manager)
+                self.shared_state.reset_for_restart(follow_enabled=False)
+                self._set_status(state=ROBOT_STATE_IDLE)
+            self._bump_status_counter("reset_done_epoch")
+        except Exception as exc:
+            self._set_status(state=ROBOT_STATE_ERROR, last_error=str(exc))
+            print(f"[WARN] Robot reset failed: {exc}")
+
+    def _handle_save_and_stop(self):
+        self._set_status(state=ROBOT_STATE_STOPPING)
+        self.shared_state.request_follow_pause()
+        self.shared_state.stop_follow()
+        self._safe_stop(source_mode="save_and_stop")
+        self._reset_follow_tracking()
+        self._cancel_event.clear()
+        self._set_status(state=ROBOT_STATE_IDLE)
+
+    def _handle_emergency_stop(self):
+        self._set_status(state=ROBOT_STATE_STOPPING)
+        self.shared_state.request_follow_pause()
+        self.shared_state.stop_follow()
+        self._safe_stop(source_mode="emergency_stop")
+        self._reset_follow_tracking()
+
+    def _handle_shutdown(self):
+        self._set_status(state=ROBOT_STATE_STOPPING)
+        self.shared_state.request_follow_pause()
+        self.shared_state.stop_follow()
+        self._safe_stop(source_mode="shutdown")
+        self._reset_follow_tracking()
+        self._disconnect()
+        self._shutdown_event.set()
+
+    def _follow_once(self):
+        now = time.time()
+        interval = 1.0 / max(float(self.args.control_hz), 1e-6)
+        if now < self._next_follow_tick_t:
+            return
+        self._next_follow_tick_t = now + interval
+
+        robot_state = self._read_robot_state()
+        snap = self.shared_state.get_snapshot()
+        control_target_xyz_mm = snap["control_target_xyz_mm"]
+        target_source = snap["target_source"]
+
+        active = True
+        if snap["follow_pause_requested"]:
+            active = False
+        elif not snap["follow_enabled"]:
+            active = False
+        elif control_target_xyz_mm is None:
+            active = False
+        elif target_source != "predicted" and snap["valid_detection_streak"] < self.args.min_valid_count and not snap["prediction_armed"]:
+            active = False
+        elif target_source == "predicted" and not snap["prediction_armed"]:
+            active = False
+        elif not snap["motion_triggered"]:
+            active = False
+        elif target_source == "predicted" and (
+            snap["prediction_age_s"] is None or float(snap["prediction_age_s"]) > float(self.args.prediction_max_horizon_s)
+        ):
+            active = False
+        elif snap["fixed_z_mm"] is None or snap["fixed_orientation_base"] is None:
+            active = False
+
+        if not active:
+            if self._was_follow_active:
+                self._safe_stop(source_mode="follow_inactive")
+                self._ref_target_xyz_mm = None
+                self._last_sent_pose_mm = None
+            self._was_follow_active = False
+            self.shared_state.set_follow_thread_idle(True)
+            return
+
+        self.shared_state.set_follow_thread_idle(False)
+
+        fixed_z_mm = snap["fixed_z_mm"]
+        fixed_orientation_base = snap["fixed_orientation_base"]
+        if self._ref_target_xyz_mm is None:
+            pose = None if robot_state is None else getattr(robot_state, "actual_tcp_pose_base", None)
+            if pose is None:
+                return
+            self._ref_target_xyz_mm = meters_to_mm(pose[:3]).astype(np.float32)
+            print(f"[INFO] ref_target initialized from current EEF xyz: {self._ref_target_xyz_mm}")
+
+        max_step_mm = MAX_XY_SPEED_MM_S / max(float(self.args.control_hz), 1e-6)
+        max_step_z_mm = MAX_Z_SPEED_MM_S / max(float(self.args.control_hz), 1e-6)
+        ref_err_xyz = control_target_xyz_mm - self._ref_target_xyz_mm
+        max_step_xy, max_step_z, dist_xy = get_close_range_step_mm(
+            ref_err_xyz,
+            max_step_mm,
+            max_step_z_mm,
+        )
+        ref_step_xyz, dominant_axis = compute_close_range_ref_step_xyz(
+            ref_err_xyz,
+            max_step_xy,
+            max_step_z,
+            follow_z=bool(self.args.follow_z),
+        )
+
+        if not self.args.follow_z:
+            self._ref_target_xyz_mm[2] = fixed_z_mm
+
+        self._ref_target_xyz_mm = self._ref_target_xyz_mm + ref_step_xyz
+        cmd_z = float(self._ref_target_xyz_mm[2]) if self.args.follow_z else float(fixed_z_mm)
+        cmd_x, cmd_y, cmd_z = clamp_pose_mm(float(self._ref_target_xyz_mm[0]), float(self._ref_target_xyz_mm[1]), cmd_z, self.args)
+        pose_mm = np.array([cmd_x, cmd_y, cmd_z], dtype=np.float32)
+
+        if self._last_sent_pose_mm is not None:
+            pos_delta = np.linalg.norm(pose_mm - self._last_sent_pose_mm)
+            if pos_delta < 0.2:
+                return
+
+        target_position_base = mm_to_m_tuple(pose_mm)
+        try:
+            self._send_robot_command(
+                ROBOT_CMD_SERVO_TO_POSITION,
+                target_position_base=target_position_base,
+                fixed_orientation_base=fixed_orientation_base,
+                gripper_action=GRIPPER_HOLD,
+                source_mode="follow_servo",
+            )
+            self._was_follow_active = True
+            self._last_sent_pose_mm = pose_mm
+            if self.args.verbose_robot:
+                print(
+                    f"[ROBOT] source={target_source}, "
+                    f"raw_mm={snap['latest_target_xyz_mm']}, "
+                    f"control_mm={control_target_xyz_mm}, "
+                    f"ref_mm={self._ref_target_xyz_mm}, "
+                    f"close_range_dist_xy={dist_xy:.1f}, "
+                    f"stage_axis={'xy' if dominant_axis is None else ('x' if dominant_axis == 0 else 'y')}, "
+                    f"cmd_m={target_position_base}"
+                )
+        except Exception as exc:
+            self._set_status(last_error=str(exc))
+            print(f"[WARN] servo command failed: {exc}")
+
+
+def wait_until_target_reached(controller, target_position_base, *, timeout_s, tolerance_m, poll_dt=0.05, cancel_event=None):
     """Poll the robot pose until a blocking move reaches its target or times out."""
     deadline = time.time() + timeout_s
     target = np.asarray(target_position_base, dtype=np.float32).reshape(3)
 
     while time.time() < deadline:
+        if cancel_event is not None and cancel_event.is_set():
+            safe_stop_rtde(controller)
+            return False
         state = controller.read_robot_state(now_timestamp=time.time())
         pose = state.actual_tcp_pose_base
         if pose is not None:
@@ -1440,12 +1991,18 @@ def wait_until_target_reached(controller, target_position_base, *, timeout_s, to
     return False
 
 
-def wait_until_joint_target_reached(controller, target_joints_rad, *, timeout_s, tolerance_rad, poll_dt=0.05):
+def wait_until_joint_target_reached(controller, target_joints_rad, *, timeout_s, tolerance_rad, poll_dt=0.05, cancel_event=None):
     """Poll the robot joints until the target is reached or the move times out."""
     deadline = time.time() + timeout_s
     target = np.asarray(target_joints_rad, dtype=np.float64).reshape(6)
 
     while time.time() < deadline:
+        if cancel_event is not None and cancel_event.is_set():
+            if hasattr(controller, "stop_joint_motion"):
+                controller.stop_joint_motion()
+            else:
+                safe_stop_rtde(controller)
+            return False
         state = controller.read_robot_state(now_timestamp=time.time())
         joints = getattr(state, "joint_positions", None)
         if joints is not None:
@@ -1458,8 +2015,11 @@ def wait_until_joint_target_reached(controller, target_joints_rad, *, timeout_s,
     return False
 
 
-def move_robot_and_wait(controller, target_position_base, fixed_orientation_base, *, timeout_s, tolerance_m, source_mode):
+def move_robot_and_wait(controller, target_position_base, fixed_orientation_base, *, timeout_s, tolerance_m, source_mode, cancel_event=None):
     """Issue one blocking position move and wait for completion."""
+    if cancel_event is not None and cancel_event.is_set():
+        safe_stop_rtde(controller)
+        return False
     send_robot_command(
         controller,
         ROBOT_CMD_MOVE_TO_POSITION,
@@ -1473,6 +2033,7 @@ def move_robot_and_wait(controller, target_position_base, fixed_orientation_base
         target_position_base,
         timeout_s=timeout_s,
         tolerance_m=tolerance_m,
+        cancel_event=cancel_event,
     )
 
 
@@ -1487,8 +2048,11 @@ def stop_follow_for_handoff(shared_state, timeout_s):
     return True
 
 
-def move_robot_to_home_pose(controller, args):
+def move_robot_to_home_pose(controller, args, cancel_event=None):
     """Move the robot to the configured HOME joint target before or between tasks."""
+    if cancel_event is not None and cancel_event.is_set():
+        safe_stop_rtde(controller)
+        return False
     home_joints_rad = get_home_joints_rad()
     home_text = ", ".join(f"{value:.1f}" for value in HOME_JOINTS_DEG)
     print(
@@ -1515,6 +2079,7 @@ def move_robot_to_home_pose(controller, args):
         home_joints_rad,
         timeout_s=args.move_timeout_s,
         tolerance_rad=float(np.deg2rad(HOME_JOINT_TOLERANCE_DEG)),
+        cancel_event=cancel_event,
     )
     if not ok:
         if hasattr(controller, "stop_joint_motion"):
@@ -1523,6 +2088,7 @@ def move_robot_to_home_pose(controller, args):
             safe_stop_rtde(controller)
         raise RuntimeError("Failed to reach HOME joints during startup.")
     print("[INFO] HOME joints reached")
+    return True
 
 
 def resolve_default_gripper_position_threshold(gripper_cfg):
@@ -1964,6 +2530,47 @@ def reset_tactile_state_for_system_reset(tactile_manager):
     return baseline_reset
 
 
+def reset_perception_pipeline_for_system_reset(pipeline):
+    """Reset perception-only state after the robot worker finishes a reset."""
+    if pipeline is None:
+        return
+
+    shape_fitting_tracker = pipeline.get("shape_fitting_tracker")
+    if shape_fitting_tracker is not None and hasattr(shape_fitting_tracker, "reset"):
+        shape_fitting_tracker.reset()
+        print("[INFO] Shape fitting tracker reset. ICP initialization will restart.")
+
+    object_merger = pipeline.get("object_merger")
+    if object_merger is not None and hasattr(object_merger, "reset_initial_centroid"):
+        object_merger.reset_initial_centroid()
+
+    for object_worker_key in ("object_worker_cam0", "object_worker_cam1"):
+        object_worker = pipeline.get(object_worker_key)
+        if object_worker is not None and hasattr(object_worker, "reset"):
+            object_worker.reset()
+    print("[INFO] Object workers reset. Temporal class locks will be reacquired.")
+
+    for hand_worker_key in ("hand_worker_cam0", "hand_worker_cam1"):
+        hand_worker = pipeline.get(hand_worker_key)
+        if hand_worker is not None and hasattr(hand_worker, "reset"):
+            hand_worker.reset()
+    print("[INFO] Hand workers reset. MediaPipe tracking and hand smoothing will restart.")
+
+    hand_selector = pipeline.get("hand_selector")
+    if hand_selector is not None and hasattr(hand_selector, "reset"):
+        hand_selector.reset()
+        print("[INFO] Hand selector reset. Locked hand camera will be reacquired.")
+
+    fusion = pipeline.get("fusion")
+    if fusion is not None and hasattr(fusion, "reset"):
+        fusion.reset()
+        print("[INFO] Perception fusion reset. Filtered hand/object centers cleared.")
+
+    hand_relative_fallback = pipeline.get("hand_relative_fallback")
+    if hand_relative_fallback is not None and hasattr(hand_relative_fallback, "reset"):
+        hand_relative_fallback.reset()
+
+
 def reset_system_to_start_state(
     controller,
     shared_state,
@@ -1977,41 +2584,7 @@ def reset_system_to_start_state(
     print("[INFO] Reset requested: returning to startup state")
     task_start_perf = None
     discard_video_recording_for_reset(video_recorder)
-    if pipeline is not None:
-        shape_fitting_tracker = pipeline.get("shape_fitting_tracker")
-        if shape_fitting_tracker is not None and hasattr(shape_fitting_tracker, "reset"):
-            shape_fitting_tracker.reset()
-            print("[INFO] Shape fitting tracker reset. ICP initialization will restart.")
-
-        object_merger = pipeline.get("object_merger")
-        if object_merger is not None and hasattr(object_merger, "reset_initial_centroid"):
-            object_merger.reset_initial_centroid()
-
-        for object_worker_key in ("object_worker_cam0", "object_worker_cam1"):
-            object_worker = pipeline.get(object_worker_key)
-            if object_worker is not None and hasattr(object_worker, "reset"):
-                object_worker.reset()
-        print("[INFO] Object workers reset. Temporal class locks will be reacquired.")
-
-        for hand_worker_key in ("hand_worker_cam0", "hand_worker_cam1"):
-            hand_worker = pipeline.get(hand_worker_key)
-            if hand_worker is not None and hasattr(hand_worker, "reset"):
-                hand_worker.reset()
-        print("[INFO] Hand workers reset. MediaPipe tracking and hand smoothing will restart.")
-
-        hand_selector = pipeline.get("hand_selector")
-        if hand_selector is not None and hasattr(hand_selector, "reset"):
-            hand_selector.reset()
-            print("[INFO] Hand selector reset. Locked hand camera will be reacquired.")
-
-        fusion = pipeline.get("fusion")
-        if fusion is not None and hasattr(fusion, "reset"):
-            fusion.reset()
-            print("[INFO] Perception fusion reset. Filtered hand/object centers cleared.")
-
-        hand_relative_fallback = pipeline.get("hand_relative_fallback")
-        if hand_relative_fallback is not None and hasattr(hand_relative_fallback, "reset"):
-            hand_relative_fallback.reset()
+    reset_perception_pipeline_for_system_reset(pipeline)
 
     if controller is None:
         reset_tactile_state_for_system_reset(tactile_manager)
@@ -2102,10 +2675,15 @@ def execute_gripper_close(
     tactile_manager=None,
     tactile_contact_threshold=None,
     tactile_extra_grasp_pos=None,
+    cancel_event=None,
 ):
     """Close the gripper and stop when force or position indicates contact."""
     if verbose:
         print("[INFO] GRIPPER CLOSE start")
+
+    if cancel_event is not None and cancel_event.is_set():
+        stop_gripper_motion_safely(controller, "cancel before close")
+        return False
 
     baseline_state = controller.read_robot_state(now_timestamp=time.time())
     baseline_force_norm = baseline_state.tcp_force_norm_n
@@ -2152,6 +2730,11 @@ def execute_gripper_close(
         tactile_manager.release_status = "close_monitoring"
 
     while time.time() < deadline:
+        if cancel_event is not None and cancel_event.is_set():
+            stop_gripper_motion_safely(controller, "cancel")
+            if tactile_enabled:
+                tactile_manager.release_status = "close_cancelled"
+            return False
         state = controller.read_robot_state(now_timestamp=time.time())
         force_norm = state.tcp_force_norm_n
         elapsed = time.time() - loop_start
@@ -2319,8 +2902,11 @@ def execute_gripper_close(
     return False
 
 
-def execute_gripper_open(controller, dwell_s=0.5, metadata_recorder=None):
+def execute_gripper_open(controller, dwell_s=0.5, metadata_recorder=None, cancel_event=None):
     """Open the gripper and optionally record the last-contact timestamp."""
+    if cancel_event is not None and cancel_event.is_set():
+        stop_gripper_motion_safely(controller, "cancel before open")
+        return False
     if metadata_recorder is not None:
         last_contact_timestamp = metadata_recorder.note_robot_last_contact()
         if last_contact_timestamp is not None:
@@ -2331,18 +2917,29 @@ def execute_gripper_open(controller, dwell_s=0.5, metadata_recorder=None):
         gripper_action=GRIPPER_OPEN,
         source_mode="gripper_open",
     )
-    time.sleep(max(dwell_s, 0.0))
+    deadline = time.time() + max(dwell_s, 0.0)
+    while time.time() < deadline:
+        if cancel_event is not None and cancel_event.is_set():
+            stop_gripper_motion_safely(controller, "cancel during open dwell")
+            return False
+        time.sleep(min(0.05, max(deadline - time.time(), 0.0)))
     return True
 
 
-def capture_tactile_release_reference(tactile_manager, delay_s=0.0):
+def capture_tactile_release_reference(tactile_manager, delay_s=0.0, cancel_event=None):
     """Capture the held-object tactile norm used to gate release timing."""
     if tactile_manager is None or not bool(getattr(tactile_manager, "enabled", False)):
+        return None
+    if cancel_event is not None and cancel_event.is_set():
         return None
     delay_s = max(0.0, float(delay_s))
     if delay_s > 0.0:
         tactile_manager.release_status = "ref_delay"
-        time.sleep(delay_s)
+        deadline = time.time() + delay_s
+        while time.time() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                return None
+            time.sleep(min(0.05, max(deadline - time.time(), 0.0)))
     reference_norm = tactile_manager.total_norm()
     tactile_manager.set_release_reference(reference_norm)
     print_tactile_frame_log(tactile_manager, stage="release_reference", stage_time_s=0.0)
@@ -2356,6 +2953,7 @@ def execute_tactile_release_descent(
     fixed_orientation_base,
     start_pose_mm,
     args,
+    cancel_event=None,
 ):
     """Descend in -Z until tactile release trigger or the configured lower bound."""
     start_x, start_y, start_z = [float(v) for v in start_pose_mm[:3]]
@@ -2376,6 +2974,15 @@ def execute_tactile_release_descent(
     descent_start = time.time()
     deadline = time.time() + max(0.0, float(getattr(args, "move_timeout_s", 0.0)))
     tactile_manager.release_status = "release_descending"
+    if cancel_event is not None and cancel_event.is_set():
+        safe_stop_rtde(controller)
+        tactile_manager.release_status = "release_cancelled"
+        return {
+            "triggered": False,
+            "timed_out": False,
+            "reached_min_z": False,
+            "release_pose_mm": current_pose_mm,
+        }
 
     print(
         "[Tactile] Release descent start: "
@@ -2421,6 +3028,15 @@ def execute_tactile_release_descent(
         return False
 
     while True:
+        if cancel_event is not None and cancel_event.is_set():
+            safe_stop_rtde(controller)
+            tactile_manager.release_status = "release_cancelled"
+            return {
+                "triggered": False,
+                "timed_out": False,
+                "reached_min_z": False,
+                "release_pose_mm": current_pose_mm,
+            }
         pose_mm = read_current_pose_mm()
         if pose_mm is None:
             tactile_manager.release_status = "release_descent_pose_missing"
@@ -2477,14 +3093,20 @@ def execute_tactile_release_descent(
             time.sleep(poll_dt)
 
 
-def reset_tactile_baseline_after_open(tactile_manager, delay_s):
+def reset_tactile_baseline_after_open(tactile_manager, delay_s, cancel_event=None):
     if tactile_manager is None or not bool(getattr(tactile_manager, "enabled", False)):
+        return
+    if cancel_event is not None and cancel_event.is_set():
         return
     delay_s = max(0.0, float(delay_s))
     if delay_s <= 0.0:
         return
     tactile_manager.release_status = "baseline_reset_delay"
-    time.sleep(delay_s)
+    deadline = time.time() + delay_s
+    while time.time() < deadline:
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        time.sleep(min(0.05, max(deadline - time.time(), 0.0)))
     if tactile_manager.reset_baseline():
         tactile_manager.release_status = "baseline_reset"
 
@@ -2605,8 +3227,11 @@ def compute_pre_release_descend_target_mm(place_x, place_y, place_z, args):
     }
 
 
-def execute_return_and_place(controller, shared_state, args, metadata_recorder=None, tactile_manager=None):
+def execute_return_and_place(controller, shared_state, args, metadata_recorder=None, tactile_manager=None, cancel_event=None):
     """Run the post-grasp return, release, backoff, and HOME sequence."""
+    if cancel_event is not None and cancel_event.is_set():
+        safe_stop_rtde(controller)
+        return False
     target_eef_xyz, place_target_debug = compute_place_target(shared_state)
     if target_eef_xyz is None:
         print("[WARN] Cannot compute place target.")
@@ -2620,6 +3245,21 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
         return False
 
     tactile_enabled = tactile_manager is not None and bool(getattr(tactile_manager, "enabled", False))
+
+    def move_with_optional_cancel(target_position_base, fixed_orientation_base, *, timeout_s, tolerance_m, source_mode):
+        kwargs = {
+            "timeout_s": timeout_s,
+            "tolerance_m": tolerance_m,
+            "source_mode": source_mode,
+        }
+        if cancel_event is not None:
+            kwargs["cancel_event"] = cancel_event
+        return move_robot_and_wait(
+            controller,
+            target_position_base,
+            fixed_orientation_base,
+            **kwargs,
+        )
 
     target_x, target_y, target_z = target_eef_xyz
     target_x, target_y, target_z = clamp_pose_mm(target_x, target_y, target_z, args)
@@ -2677,8 +3317,10 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
         ("return_place", [place_x, place_y, place_z]),
     ]
     for source_mode, pose_mm in move_sequence:
-        ok = move_robot_and_wait(
-            controller,
+        if cancel_event is not None and cancel_event.is_set():
+            safe_stop_rtde(controller)
+            return False
+        ok = move_with_optional_cancel(
             mm_to_m_tuple(pose_mm),
             fixed_orientation_base,
             timeout_s=args.move_timeout_s,
@@ -2693,18 +3335,25 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
         capture_tactile_release_reference(
             tactile_manager,
             delay_s=getattr(args, "tactile_release_ref_delay_s", DEFAULT_TACTILE_RELEASE_REF_DELAY_S),
+            cancel_event=cancel_event,
         )
+        if cancel_event is not None and cancel_event.is_set():
+            safe_stop_rtde(controller)
+            return False
+        descent_kwargs = {}
+        if cancel_event is not None:
+            descent_kwargs["cancel_event"] = cancel_event
         descent_result = execute_tactile_release_descent(
             controller,
             tactile_manager,
             fixed_orientation_base,
             [place_x, place_y, place_z],
             args,
+            **descent_kwargs,
         )
         release_x, release_y, release_z = descent_result["release_pose_mm"]
     elif pre_release_debug["enabled"]:
-        ok = move_robot_and_wait(
-            controller,
+        ok = move_with_optional_cancel(
             mm_to_m_tuple([release_x, release_y, release_z]),
             fixed_orientation_base,
             timeout_s=args.move_timeout_s,
@@ -2719,7 +3368,10 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
         controller,
         dwell_s=args.gripper_release_dwell_s,
         metadata_recorder=metadata_recorder,
+        cancel_event=cancel_event,
     )
+    if cancel_event is not None and cancel_event.is_set():
+        return False
     if tactile_enabled:
         reset_tactile_baseline_after_open(
             tactile_manager,
@@ -2728,6 +3380,7 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
                 "tactile_auto_baseline_reset_after_open_s",
                 DEFAULT_TACTILE_AUTO_BASELINE_RESET_AFTER_OPEN_S,
             ),
+            cancel_event=cancel_event,
         )
 
     post_release_z = max(release_z + float(args.post_release_z_offset_mm), HOME_PLACE_MIN_Z_MM)
@@ -2738,8 +3391,7 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
             f"({post_release_x:.1f}, {post_release_y:.1f}, {post_release_z:.1f}), "
             f"offset={float(args.post_release_z_offset_mm):.1f} mm"
         )
-        ok = move_robot_and_wait(
-            controller,
+        ok = move_with_optional_cancel(
             mm_to_m_tuple([post_release_x, post_release_y, post_release_z]),
             fixed_orientation_base,
             timeout_s=args.move_timeout_s,
@@ -2752,8 +3404,7 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
 
     backoff_x = place_x - BACKOFF_X_MM
     backoff_x, backoff_y, backoff_z = clamp_pose_mm(backoff_x, place_y, post_release_z, args)
-    ok = move_robot_and_wait(
-        controller,
+    ok = move_with_optional_cancel(
         mm_to_m_tuple([backoff_x, backoff_y, backoff_z]),
         fixed_orientation_base,
         timeout_s=args.move_timeout_s,
@@ -2765,15 +3416,16 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
         return False
 
     try:
-        move_robot_to_home_pose(controller, args)
+        home_ok = move_robot_to_home_pose(controller, args, cancel_event=cancel_event)
+        if home_ok is False:
+            return False
     except Exception as exc:
         print(f"[WARN] Return to HOME joints failed: {exc}")
         if initial_pose_base is None:
             return False
         initial_target = tuple(float(v) for v in initial_pose_base[:3])
         initial_orientation = tuple(float(v) for v in initial_pose_base[3:6])
-        ok = move_robot_and_wait(
-            controller,
+        ok = move_with_optional_cancel(
             initial_target,
             initial_orientation,
             timeout_s=args.move_timeout_s,
@@ -3267,11 +3919,16 @@ def main():
     last_loop_time = time.perf_counter()
     previous_hand_approach = False
 
-    controller = None
     shared_state = FollowSharedState(args)
     metadata_recorder = HandoverMetadataRecorder()
     video_recorder = None
-    control_thread = None
+    robot_worker = None
+    robot_status = RobotStatus()
+    last_task_ready_epoch = 0
+    last_reset_done_epoch = 0
+    last_task_done_epoch = 0
+    pending_reset_reason = None
+    grasp_request_pending = False
     active_task_epoch = None
     task_record_start_perf = None
     debug_3d_enabled = bool(args.debug_3d) and not bool(args.disable_debug_3d_recording)
@@ -3316,20 +3973,15 @@ def main():
             print(f"[WARN] Failed to start video recorder service: {exc}")
 
     if args.enable_follow:
-        controller = init_rtde(args)
-        move_robot_to_home_pose(controller, args)
-        shared_state.set_fixed_pose_from_robot(controller)
-        task_ready_timestamp = metadata_recorder.mark_task_ready(shared_state)
-        task_record_start_perf = time.perf_counter()
-        print(f"[INFO] Metadata task start timestamp={task_ready_timestamp}")
-        start_task_video_recording(video_recorder, task_ready_timestamp)
-
-        control_thread = threading.Thread(
-            target=robot_control_loop,
-            args=(controller, shared_state, args),
-            daemon=True,
+        robot_worker = RobotWorker(
+            args,
+            shared_state,
+            metadata_recorder=metadata_recorder,
+            tactile_manager=tactile_manager,
         )
-        control_thread.start()
+        robot_worker.start()
+        robot_worker.submit(RobotRequest(ROBOT_REQ_INIT_ROBOT))
+        robot_worker.submit(RobotRequest(ROBOT_REQ_START_FOLLOW))
 
     try:
         while True:
@@ -3339,6 +3991,29 @@ def main():
             with shared_state.lock:
                 current_task_epoch = int(shared_state.task_epoch)
                 motion_triggered = bool(shared_state.motion_triggered)
+            if robot_worker is not None:
+                robot_status = robot_worker.get_status()
+                if robot_status.reset_done_epoch != last_reset_done_epoch:
+                    last_reset_done_epoch = int(robot_status.reset_done_epoch)
+                    reset_perception_pipeline_for_system_reset(pipeline)
+                    if debug_3d_recorder is not None:
+                        debug_3d_recorder.clear()
+                    if pending_reset_reason is not None:
+                        discard_runtime_profile(runtime_profiler, reason=pending_reset_reason)
+                        pending_reset_reason = None
+                    grasp_request_pending = False
+                    print("[INFO] Main-thread perception reset complete after robot reset.")
+                if robot_status.task_ready_epoch != last_task_ready_epoch:
+                    last_task_ready_epoch = int(robot_status.task_ready_epoch)
+                    task_ready_timestamp = metadata_recorder.mark_task_ready(shared_state)
+                    task_record_start_perf = time.perf_counter()
+                    print(f"[INFO] Metadata task start timestamp={task_ready_timestamp}")
+                    start_task_video_recording(video_recorder, task_ready_timestamp)
+                if robot_status.task_done_epoch != last_task_done_epoch:
+                    last_task_done_epoch = int(robot_status.task_done_epoch)
+                    grasp_request_pending = False
+                if robot_status.state == ROBOT_STATE_ERROR:
+                    grasp_request_pending = False
             runtime_profiler.start_frame(timestamp_unix_s=current_time, task_epoch=current_task_epoch)
             if current_task_epoch != active_task_epoch:
                 pipeline["hand_relative_fallback"].reset()
@@ -3442,11 +4117,11 @@ def main():
             eef_pose_base = None
             eef_xyz_mm = None
             need_robot_pose = object_point_base is not None or debug_3d_recorder is not None
-            if controller is not None and need_robot_pose:
+            if robot_worker is not None and need_robot_pose:
                 with runtime_profiler.stage("robot_read"):
-                    robot_state = controller.read_robot_state(now_timestamp=time.time())
-                if robot_state.actual_tcp_pose_base is not None:
-                    eef_pose_base = tuple(float(v) for v in robot_state.actual_tcp_pose_base)
+                    robot_status = robot_worker.get_status()
+                if robot_status.last_robot_pose is not None:
+                    eef_pose_base = tuple(float(v) for v in robot_status.last_robot_pose)
                     eef_xyz_mm = meters_to_mm(eef_pose_base[:3])
 
             if debug_3d_recorder is not None:
@@ -3484,39 +4159,32 @@ def main():
                         measurement_source=measurement_source,
                         object_label=merged_object.label,
                     )
-                if controller is not None and shared_state.should_start_pregrasp(controller):
+                if (
+                    robot_worker is not None
+                    and not grasp_request_pending
+                    and robot_status.state == ROBOT_STATE_FOLLOWING
+                    and shared_state.is_pregrasp_pose_reached(robot_status.last_robot_pose)
+                ):
                     print("[INFO] DIRECT GRASP trigger")
-                    shared_state.stop_follow()
-                    if stop_follow_for_handoff(shared_state, args.follow_handoff_timeout_s):
-                        if tactile_manager is not None and bool(getattr(tactile_manager, "enabled", False)):
-                            reset_gripper_position_threshold_to_config_default(controller)
-                        else:
-                            configure_gripper_position_threshold_from_geometry(
-                                controller,
-                                shape_fitting_state.fitted_points_base,
-                                grasp_point_base,
-                                object_label=shape_fitting_state.label,
-                                template_axes_base=getattr(shape_fitting_state, "template_axes_base", None),
-                            )
-                        grasp_ok = execute_gripper_close(
-                            controller,
-                            timeout_s=args.gripper_close_timeout_s,
-                            verbose=True,
-                            metadata_recorder=metadata_recorder,
-                            tactile_manager=tactile_manager,
-                            tactile_contact_threshold=args.tactile_contact_norm_threshold,
-                            tactile_extra_grasp_pos=args.tactile_extra_grasp_pos,
+                    fitted_points_copy = None
+                    if shape_fitting_state.fitted_points_base is not None:
+                        fitted_points_copy = np.asarray(shape_fitting_state.fitted_points_base, dtype=np.float32).copy()
+                    grasp_point_copy = None if grasp_point_base is None else tuple(float(v) for v in grasp_point_base)
+                    template_axes = getattr(shape_fitting_state, "template_axes_base", None)
+                    template_axes_copy = None if template_axes is None else np.asarray(template_axes, dtype=np.float32).copy()
+                    action_context = RobotActionContext(
+                        fitted_points_base=fitted_points_copy,
+                        grasp_point_base=grasp_point_copy,
+                        object_label=shape_fitting_state.label,
+                        template_axes_base=template_axes_copy,
+                    )
+                    robot_worker.submit(
+                        RobotRequest(
+                            ROBOT_REQ_START_GRASP_PLACE,
+                            payload={"context": action_context},
                         )
-                        print(f"[INFO] grasp_ok = {grasp_ok}")
-                        if grasp_ok:
-                            save_grasp_offset(controller, shared_state)
-                            execute_return_and_place(
-                                controller,
-                                shared_state,
-                                args,
-                                metadata_recorder=metadata_recorder,
-                                tactile_manager=tactile_manager,
-                            )
+                    )
+                    grasp_request_pending = True
             else:
                 shared_state.clear_target(reset_prediction=False, reset_arm=False)
 
@@ -3581,26 +4249,27 @@ def main():
             if key in (27, ord("q")):
                 break
             if key == ord("f"):
-                shared_state.clear_follow_pause()
-                shared_state.toggle_follow()
+                if robot_worker is not None:
+                    follow_enabled = bool(shared_state.get_snapshot()["follow_enabled"])
+                    request_type = ROBOT_REQ_STOP_FOLLOW if follow_enabled else ROBOT_REQ_START_FOLLOW
+                    robot_worker.submit(RobotRequest(request_type))
+                else:
+                    shared_state.clear_follow_pause()
+                    shared_state.toggle_follow()
             elif key == ord("r"):
-                try:
-                    reset_task_start_perf = reset_system_to_start_state(
-                        controller,
-                        shared_state,
-                        args,
-                        metadata_recorder=metadata_recorder,
-                        pipeline=pipeline,
-                        video_recorder=video_recorder,
-                        tactile_manager=tactile_manager,
-                    )
-                    if reset_task_start_perf is not None:
-                        task_record_start_perf = reset_task_start_perf
+                print("[INFO] Reset requested: returning to startup state")
+                discard_video_recording_for_reset(video_recorder)
+                task_record_start_perf = None
+                if robot_worker is not None:
+                    pending_reset_reason = "r_key_reset"
+                    robot_worker.submit(RobotRequest(ROBOT_REQ_RESET_HOME))
+                else:
+                    reset_tactile_state_for_system_reset(tactile_manager)
+                    shared_state.reset_for_restart(follow_enabled=False)
+                    reset_perception_pipeline_for_system_reset(pipeline)
                     if debug_3d_recorder is not None:
                         debug_3d_recorder.clear()
                     discard_runtime_profile(runtime_profiler, reason="r_key_reset")
-                except Exception as exc:
-                    print(f"[WARN] Reset failed: {exc}")
             elif key == ord("d"):
                 if debug_3d_recorder is None:
                     print("[WARN] 3D debug recording is disabled; launch with --3d-debug.")
@@ -3612,27 +4281,23 @@ def main():
                 except Exception as exc:
                     print(f"[WARN] 3D debug save failed; keeping buffered frames and skipping reset: {exc}")
                     continue
-                try:
-                    debug_3d_recorder.clear()
-                    reset_task_start_perf = reset_system_to_start_state(
-                        controller,
-                        shared_state,
-                        args,
-                        metadata_recorder=metadata_recorder,
-                        pipeline=pipeline,
-                        video_recorder=video_recorder,
-                        tactile_manager=tactile_manager,
-                    )
-                    if reset_task_start_perf is not None:
-                        task_record_start_perf = reset_task_start_perf
+                debug_3d_recorder.clear()
+                discard_video_recording_for_reset(video_recorder)
+                task_record_start_perf = None
+                if robot_worker is not None:
+                    pending_reset_reason = "d_key_debug_reset"
+                    robot_worker.submit(RobotRequest(ROBOT_REQ_RESET_HOME))
+                else:
+                    reset_tactile_state_for_system_reset(tactile_manager)
+                    shared_state.reset_for_restart(follow_enabled=False)
+                    reset_perception_pipeline_for_system_reset(pipeline)
                     discard_runtime_profile(runtime_profiler, reason="d_key_debug_reset")
-                except Exception as exc:
-                    print(f"[WARN] Reset after 3D debug save failed: {exc}")
             elif key == ord("s"):
-                shared_state.request_follow_pause()
-                shared_state.stop_follow()
-                shared_state.wait_for_follow_idle(args.follow_handoff_timeout_s)
-                safe_stop_rtde(controller)
+                if robot_worker is not None:
+                    robot_worker.submit(RobotRequest(ROBOT_REQ_SAVE_AND_STOP))
+                else:
+                    shared_state.request_follow_pause()
+                    shared_state.stop_follow()
                 if metadata_recorder is not None:
                     csv_path = metadata_recorder.record_completion()
                     if csv_path is not None:
@@ -3655,10 +4320,9 @@ def main():
         if debug_3d_recorder is not None:
             debug_3d_recorder.close()
         shared_state.stop_event.set()
-        if control_thread is not None:
-            control_thread.join(timeout=1.0)
-        safe_stop_rtde(controller)
-        disconnect_rtde(controller)
+        if robot_worker is not None:
+            robot_worker.submit(RobotRequest(ROBOT_REQ_SHUTDOWN))
+            robot_worker.join(timeout=2.0)
         if tactile_manager is not None:
             tactile_manager.close()
         try:
