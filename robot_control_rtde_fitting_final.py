@@ -516,6 +516,8 @@ class AnySkinTactileManager:
         self.release_reference_norm = None
         self.release_delta_norm = None
         self.release_status = "off"
+        self.last_sample_perf_s = np.nan
+        self.last_sample_unix_s = np.nan
 
     def start(self):
         if not self.enabled:
@@ -555,6 +557,8 @@ class AnySkinTactileManager:
                 self.baseline = np.mean(baseline_data[:, 1 : 1 + self.num_mags * 3], axis=0)
                 self.latest = np.zeros(self.num_mags * 3, dtype=np.float32)
                 self.latest_norm = 0.0
+                self.last_sample_perf_s = time.perf_counter()
+                self.last_sample_unix_s = time.time()
                 self.last_error = None
                 if self.debug:
                     print("[Tactile] Baseline reset.")
@@ -578,6 +582,8 @@ class AnySkinTactileManager:
                     raise RuntimeError(f"Unexpected AnySkin sample length: {sensor_data.shape[0]}")
                 self.latest = sensor_data - self.baseline
                 self.latest_norm = float(np.linalg.norm(self.latest))
+                self.last_sample_perf_s = time.perf_counter()
+                self.last_sample_unix_s = time.time()
                 self.last_error = None
                 if self.status == "read_error":
                     self.status = "ready"
@@ -605,6 +611,8 @@ class AnySkinTactileManager:
                 "release_delta_norm": self.release_delta_norm,
                 "status": str(self.release_status),
                 "error": self.last_error,
+                "timestamp_perf_s": float(self.last_sample_perf_s),
+                "timestamp_unix_s": float(self.last_sample_unix_s),
             }
 
     def clear_runtime_state(self, *, release_status="reset_cleared"):
@@ -614,6 +622,8 @@ class AnySkinTactileManager:
             self.release_status = str(release_status)
             self.latest = np.zeros(self.num_mags * 3, dtype=np.float32)
             self.latest_norm = 0.0
+            self.last_sample_perf_s = time.perf_counter()
+            self.last_sample_unix_s = time.time()
             self.last_error = None
 
     def set_release_reference(self, reference_norm):
@@ -3620,8 +3630,39 @@ def append_debug_3d_frame(
     grasp_point_base,
     eef_pose_base,
     measurement_source,
+    tactile_manager=None,
 ):
     """Record one synchronized perception/debug frame for later 3D inspection."""
+    tactile_snapshot = None
+    if tactile_manager is not None and bool(getattr(tactile_manager, "enabled", False)):
+        try:
+            if hasattr(tactile_manager, "snapshot"):
+                tactile_snapshot = tactile_manager.snapshot(refresh=True)
+            else:
+                if hasattr(tactile_manager, "total_norm"):
+                    tactile_manager.total_norm()
+                values = np.asarray(getattr(tactile_manager, "latest", []), dtype=np.float32).flatten()
+                tactile_snapshot = {
+                    "values": values,
+                    "num_mags": int(getattr(tactile_manager, "num_mags", max(values.size // 3, 0))),
+                    "total_norm": float(getattr(tactile_manager, "latest_norm", float(np.linalg.norm(values)))),
+                    "release_ref_norm": getattr(tactile_manager, "release_reference_norm", None),
+                    "release_delta_norm": getattr(tactile_manager, "release_delta_norm", None),
+                    "status": str(getattr(tactile_manager, "release_status", getattr(tactile_manager, "status", ""))),
+                    "error": getattr(tactile_manager, "last_error", None),
+                    "timestamp_perf_s": float(getattr(tactile_manager, "last_sample_perf_s", np.nan)),
+                    "timestamp_unix_s": float(getattr(tactile_manager, "last_sample_unix_s", np.nan)),
+                }
+        except Exception as exc:
+            tactile_snapshot = {
+                "values": np.empty((0,), dtype=np.float32),
+                "num_mags": int(getattr(tactile_manager, "num_mags", 0)),
+                "total_norm": np.nan,
+                "release_ref_norm": getattr(tactile_manager, "release_reference_norm", None),
+                "release_delta_norm": getattr(tactile_manager, "release_delta_norm", None),
+                "status": "snapshot_error",
+                "error": str(exc),
+            }
     debug_3d_recorder.append_frame(
         frame_index=int(snapshot.pair_index),
         timestamp_unix_s=current_time,
@@ -3638,6 +3679,7 @@ def append_debug_3d_frame(
         eef_pose_base=eef_pose_base,
         measurement_source=measurement_source,
         hand_selector_debug=getattr(pipeline["hand_selector"], "last_debug", None),
+        tactile_snapshot=tactile_snapshot,
         snapshot=snapshot if debug_3d_recorder.save_images else None,
     )
 
@@ -4141,6 +4183,7 @@ def main():
                         grasp_point_base=grasp_point_base,
                         eef_pose_base=eef_pose_base,
                         measurement_source=measurement_source,
+                        tactile_manager=tactile_manager,
                     )
 
             if object_point_base is not None:

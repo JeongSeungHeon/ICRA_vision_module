@@ -881,6 +881,39 @@ class TactileConfigAndBehaviorTests(unittest.TestCase):
         self.assertIsNone(tactile.last_error)
         np.testing.assert_allclose(tactile.latest, np.zeros((15,), dtype=np.float32))
 
+    def test_anyskin_snapshot_includes_sample_timestamps(self):
+        class FakeAnySkinStream:
+            def __init__(self):
+                self.calls = 0
+
+            def get_data(self, num_samples):
+                del num_samples
+                self.calls += 1
+                if self.calls == 1:
+                    return np.asarray([[0.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+                return np.asarray([[0.0, 1.0, 2.0, 2.0]], dtype=np.float32)
+
+        tactile = AnySkinTactileManager(
+            SimpleNamespace(
+                tactile_enabled=True,
+                tactile_port="/dev/null",
+                tactile_num_mags=1,
+                tactile_baseline_samples=1,
+                tactile_startup_delay_s=0.0,
+                tactile_contact_norm_threshold=30.0,
+                tactile_debug=False,
+            )
+        )
+        tactile.stream = FakeAnySkinStream()
+        self.assertTrue(tactile.reset_baseline())
+
+        snapshot = tactile.snapshot(refresh=True)
+
+        np.testing.assert_allclose(snapshot["values"], np.asarray([1.0, 2.0, 2.0], dtype=np.float32))
+        self.assertAlmostEqual(float(snapshot["total_norm"]), 3.0)
+        self.assertTrue(np.isfinite(float(snapshot["timestamp_perf_s"])))
+        self.assertTrue(np.isfinite(float(snapshot["timestamp_unix_s"])))
+
     def test_tactile_disabled_preserves_existing_close_stall_fallback(self):
         controller = DummyCloseController([10, 20, 25, 25, 25], threshold=40)
 

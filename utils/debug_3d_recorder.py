@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 IMAGE_ARRAY_KEYS = (
     "cam0_color_image",
     "cam0_depth_image_m",
@@ -164,6 +164,84 @@ def _safe_load_array(path: Path, *, dtype: Any) -> np.ndarray:
     return np.load(path).astype(dtype, copy=False)
 
 
+def _optional_float(value: Any) -> float:
+    if value is None:
+        return np.nan
+    try:
+        output = float(value)
+    except Exception:
+        return np.nan
+    return output if np.isfinite(output) else np.nan
+
+
+def _normalize_tactile_snapshot(tactile_snapshot: Any, *, frame_timestamp_perf_s: float) -> dict[str, Any]:
+    if tactile_snapshot is None:
+        return {
+            "tactile_enabled": False,
+            "tactile_num_mags": 0,
+            "tactile_values": np.empty((0, 3), dtype=np.float32),
+            "tactile_mag_norms": np.empty((0,), dtype=np.float32),
+            "tactile_total_norm": np.nan,
+            "tactile_release_ref_norm": np.nan,
+            "tactile_release_delta_norm": np.nan,
+            "tactile_status": "disabled",
+            "tactile_error": "",
+            "tactile_timestamp_perf_s": np.nan,
+            "tactile_timestamp_unix_s": np.nan,
+            "tactile_frame_delta_ms": np.nan,
+        }
+
+    values = np.asarray(tactile_snapshot.get("values", []), dtype=np.float32).reshape(-1)
+    num_mags = int(tactile_snapshot.get("num_mags", 0) or 0)
+    if num_mags <= 0 and values.size > 0:
+        num_mags = max(values.size // 3, 1)
+
+    expected_values = max(num_mags, 0) * 3
+    if expected_values > 0:
+        if values.size < expected_values:
+            padded = np.full((expected_values,), np.nan, dtype=np.float32)
+            padded[: values.size] = values
+            values = padded
+        values = values[:expected_values].reshape((num_mags, 3)).copy()
+    else:
+        values = np.empty((0, 3), dtype=np.float32)
+
+    if len(values) > 0:
+        mag_norms = np.linalg.norm(values, axis=1).astype(np.float32, copy=False)
+    else:
+        mag_norms = np.empty((0,), dtype=np.float32)
+
+    total_norm = _optional_float(tactile_snapshot.get("total_norm"))
+    if not np.isfinite(total_norm) and len(values) > 0:
+        total_norm = float(np.linalg.norm(values.reshape(-1)))
+
+    tactile_timestamp_perf_s = _optional_float(
+        tactile_snapshot.get("timestamp_perf_s", tactile_snapshot.get("sample_perf_s"))
+    )
+    tactile_timestamp_unix_s = _optional_float(
+        tactile_snapshot.get("timestamp_unix_s", tactile_snapshot.get("sample_unix_s"))
+    )
+    frame_delta_ms = np.nan
+    if np.isfinite(tactile_timestamp_perf_s) and np.isfinite(float(frame_timestamp_perf_s)):
+        frame_delta_ms = (float(tactile_timestamp_perf_s) - float(frame_timestamp_perf_s)) * 1000.0
+
+    error = tactile_snapshot.get("error")
+    return {
+        "tactile_enabled": True,
+        "tactile_num_mags": int(num_mags),
+        "tactile_values": np.ascontiguousarray(values, dtype=np.float32),
+        "tactile_mag_norms": np.ascontiguousarray(mag_norms, dtype=np.float32),
+        "tactile_total_norm": float(total_norm),
+        "tactile_release_ref_norm": _optional_float(tactile_snapshot.get("release_ref_norm")),
+        "tactile_release_delta_norm": _optional_float(tactile_snapshot.get("release_delta_norm")),
+        "tactile_status": str(tactile_snapshot.get("status", "")),
+        "tactile_error": "" if error is None else str(error),
+        "tactile_timestamp_perf_s": float(tactile_timestamp_perf_s),
+        "tactile_timestamp_unix_s": float(tactile_timestamp_unix_s),
+        "tactile_frame_delta_ms": float(frame_delta_ms),
+    }
+
+
 @dataclass
 class Debug3DRecorder:
     """Recorder that saves one compressed 3D debug session on demand."""
@@ -173,7 +251,7 @@ class Debug3DRecorder:
     save_images: bool = False
     max_object_points: int = 8000
     max_template_points: int = 8000
-    record_template_axes: bool = False
+    record_template_axes: bool = True
     frames: list[dict[str, Any]] = field(default_factory=list)
     session_index: int = 0
     _image_spool_dir: Path | None = field(default=None, init=False, repr=False)
@@ -224,6 +302,7 @@ class Debug3DRecorder:
         eef_pose_base: Any,
         measurement_source: str,
         hand_selector_debug: Any = None,
+        tactile_snapshot: Any = None,
         snapshot: Any = None,
     ) -> None:
         if not self.enabled:
@@ -236,6 +315,10 @@ class Debug3DRecorder:
         fitted_points = _points(
             getattr(shape_fitting_state, "fitted_points_base", None),
             max_points=self.max_template_points,
+        )
+        tactile_fields = _normalize_tactile_snapshot(
+            tactile_snapshot,
+            frame_timestamp_perf_s=float(timestamp_perf_s),
         )
 
         frame = {
@@ -297,6 +380,7 @@ class Debug3DRecorder:
             "eef_pose_base": _vec(eef_pose_base, 6),
             "object_point_base": _vec(object_point_base, 3),
             "grasp_point_base": _vec(grasp_point_base, 3),
+            **tactile_fields,
         }
         if self.record_template_axes:
             frame["template_axes_base"] = _matrix(getattr(shape_fitting_state, "template_axes_base", None), (3, 3))
@@ -359,7 +443,12 @@ class Debug3DRecorder:
             "record_clock_text",
             "cam0_serial",
             "cam1_serial",
+            "tactile_status",
+            "tactile_error",
         )
+        max_tactile_mags = 0
+        if "tactile_num_mags" in frames[0]:
+            max_tactile_mags = max(int(frame.get("tactile_num_mags", 0)) for frame in frames)
         payload: dict[str, Any] = {
             "schema_version": np.asarray(SCHEMA_VERSION, dtype=np.int32),
             "saved_path": np.asarray(str(path)),
@@ -367,6 +456,7 @@ class Debug3DRecorder:
             "frame_count": np.asarray(len(frames), dtype=np.int32),
             "max_object_points": np.asarray(int(self.max_object_points), dtype=np.int32),
             "max_template_points": np.asarray(int(self.max_template_points), dtype=np.int32),
+            "max_tactile_mags": np.asarray(int(max_tactile_mags), dtype=np.int32),
         }
 
         keys = sorted(frames[0].keys())
@@ -377,6 +467,10 @@ class Debug3DRecorder:
                 payload[f"{key}_flat"] = _flatten_point_frames(values)
             elif key in IMAGE_ARRAY_KEYS:
                 payload[key] = _stack_image_values(values, key)
+            elif key == "tactile_values":
+                payload[key] = _stack_tactile_values(values)
+            elif key == "tactile_mag_norms":
+                payload[key] = _stack_tactile_mag_norms(values)
             elif key in string_keys:
                 payload[key] = np.asarray(["" if value is None else str(value) for value in values])
             else:
@@ -411,6 +505,26 @@ def _stack_image_values(values: list[Any], key: str) -> np.ndarray:
         else:
             arrays.append(np.array(value, dtype=dtype, copy=True))
     return np.stack(arrays, axis=0)
+
+
+def _stack_tactile_values(values: list[Any]) -> np.ndarray:
+    arrays = [np.asarray(value, dtype=np.float32).reshape((-1, 3)) for value in values]
+    max_mags = max((len(array) for array in arrays), default=0)
+    output = np.full((len(arrays), max_mags, 3), np.nan, dtype=np.float32)
+    for index, array in enumerate(arrays):
+        if len(array) > 0:
+            output[index, : len(array), :] = array
+    return output
+
+
+def _stack_tactile_mag_norms(values: list[Any]) -> np.ndarray:
+    arrays = [np.asarray(value, dtype=np.float32).reshape(-1) for value in values]
+    max_mags = max((len(array) for array in arrays), default=0)
+    output = np.full((len(arrays), max_mags), np.nan, dtype=np.float32)
+    for index, array in enumerate(arrays):
+        if len(array) > 0:
+            output[index, : len(array)] = array
+    return output
 
 
 def _reconstruct_point_frames(flat_points: np.ndarray, offsets: np.ndarray) -> np.ndarray:

@@ -122,6 +122,35 @@ def _finite_float_at(data: dict[str, Any], key: str, index: int) -> float | None
     return value if np.isfinite(value) else None
 
 
+def has_tactile_stream(data: dict[str, Any]) -> bool:
+    return "tactile_values" in data and "tactile_enabled" in data
+
+
+def _tactile_enabled_at(data: dict[str, Any], index: int) -> bool:
+    if "tactile_enabled" not in data:
+        return False
+    return bool(data["tactile_enabled"][index])
+
+
+def _tactile_values_at(data: dict[str, Any], index: int) -> np.ndarray:
+    if "tactile_values" not in data:
+        return np.empty((0, 3), dtype=np.float32)
+    values = np.asarray(data["tactile_values"][index], dtype=np.float32).reshape((-1, 3))
+    num_mags = int(data["tactile_num_mags"][index]) if "tactile_num_mags" in data else len(values)
+    num_mags = max(min(num_mags, len(values)), 0)
+    return values[:num_mags]
+
+
+def _max_tactile_mags(data: dict[str, Any]) -> int:
+    if "max_tactile_mags" in data:
+        return int(data["max_tactile_mags"])
+    if "tactile_values" in data:
+        values = np.asarray(data["tactile_values"])
+        if values.ndim >= 2:
+            return int(values.shape[1])
+    return 0
+
+
 def _rgb(color: tuple[int, int, int] | tuple[float, float, float]) -> tuple[int, int, int]:
     values = np.asarray(color, dtype=np.float32).reshape(3)
     if float(np.nanmax(values)) <= 1.0:
@@ -221,6 +250,34 @@ def sync_status_text(data: dict[str, Any], frame_index: int) -> str:
     return " ".join(parts)
 
 
+def tactile_status_text(data: dict[str, Any], frame_index: int) -> str:
+    idx = int(frame_index)
+    if not has_tactile_stream(data):
+        return "No tactile data in this recording."
+
+    enabled = _tactile_enabled_at(data, idx)
+    num_mags = int(data["tactile_num_mags"][idx]) if "tactile_num_mags" in data else 0
+    total_norm = _finite_float_at(data, "tactile_total_norm", idx)
+    release_ref = _finite_float_at(data, "tactile_release_ref_norm", idx)
+    release_delta = _finite_float_at(data, "tactile_release_delta_norm", idx)
+    delta_ms = _finite_float_at(data, "tactile_frame_delta_ms", idx)
+    status = _string_at(data, "tactile_status", idx) or "-"
+    error = _string_at(data, "tactile_error", idx) or "-"
+    parts = [
+        f"[TACTILE {idx + 1}/{int(data['frame_count'])}]",
+        f"enabled={enabled}",
+        f"mags={num_mags}",
+        f"total_norm={total_norm:.3f}" if total_norm is not None else "total_norm=None",
+        f"release_ref={release_ref:.3f}" if release_ref is not None else "release_ref=None",
+        f"release_delta={release_delta:.3f}" if release_delta is not None else "release_delta=None",
+        f"frame_delta_ms={delta_ms:.3f}" if delta_ms is not None else "frame_delta_ms=None",
+        f"status={status}",
+    ]
+    if error != "-":
+        parts.append(f"error={error}")
+    return " ".join(parts)
+
+
 def has_camera_images(data: dict[str, Any], camera_id: int) -> bool:
     prefix = f"cam{camera_id}"
     return f"{prefix}_color_image" in data and f"{prefix}_depth_image_m" in data
@@ -282,6 +339,21 @@ def recording_summary_text(data: dict[str, Any]) -> str:
     if "hand_selector_cam0_reject_reason" in data:
         lines.append(f"frame0_hand_reject_cam0={_string_at(data, 'hand_selector_cam0_reject_reason', 0) or '-'}")
         lines.append(f"frame0_hand_reject_cam1={_string_at(data, 'hand_selector_cam1_reject_reason', 0) or '-'}")
+    if has_tactile_stream(data):
+        tactile_enabled = np.asarray(data["tactile_enabled"], dtype=bool)
+        tactile_counts = np.asarray(data.get("tactile_num_mags", np.zeros(frame_count, dtype=np.int32)), dtype=np.int32)
+        max_norm = None
+        if "tactile_total_norm" in data:
+            finite_norms = np.asarray(data["tactile_total_norm"], dtype=np.float32)
+            finite_norms = finite_norms[np.isfinite(finite_norms)]
+            if len(finite_norms) > 0:
+                max_norm = float(np.max(finite_norms))
+        max_norm_text = "-" if max_norm is None else f"{max_norm:.3f}"
+        lines.append(
+            f"tactile_enabled_frames={int(tactile_enabled.sum())}/{frame_count} "
+            f"max_mags={int(tactile_counts.max()) if len(tactile_counts) else 0} max_total_norm={max_norm_text}"
+        )
+        lines.append(f"frame0_tactile={tactile_status_text(data, 0)}")
     if has_image_streams(data):
         indices = sorted(set([0, min(frame_count - 1, 1), frame_count // 2, frame_count - 1]))
         for key in ("cam0_color_image", "cam1_color_image", "cam0_depth_image_m", "cam1_depth_image_m"):
@@ -373,6 +445,13 @@ def count_frame_entities(data: dict[str, Any], frame_index: int) -> int:
     count += int(_valid_palm_normal(data, idx))
     count += int(_is_valid_vec(data["eef_pose_base"][idx], 6))
     count += int(_valid_template_axes(data, idx))
+    if has_tactile_stream(data):
+        count += 1  # tactile status text
+        if _tactile_enabled_at(data, idx):
+            count += int(_finite_float_at(data, "tactile_total_norm", idx) is not None)
+            count += int(_finite_float_at(data, "tactile_release_ref_norm", idx) is not None)
+            count += int(_finite_float_at(data, "tactile_release_delta_norm", idx) is not None)
+            count += int(len(_tactile_values_at(data, idx)) * 4)
     if has_image_streams(data):
         count += 1  # sync status text
         for camera_id in (0, 1):
@@ -437,6 +516,7 @@ def send_blueprint(rr: Any, *, include_images: bool) -> None:
                 views.extend(camera_views)
         if hasattr(rrb, "TextDocumentView"):
             views.append(rrb.TextDocumentView(origin="/status", name="Frame Status"))
+            views.append(rrb.TextDocumentView(origin="/status/tactile", name="Tactile Status"))
         if hasattr(rrb, "Horizontal") and len(views) > 1:
             blueprint = rrb.Blueprint(rrb.Horizontal(*views), collapse_panels=True)
         else:
@@ -668,6 +748,54 @@ def log_status(rr: Any, text: str) -> None:
     log_text(rr, "/status/frame", text)
 
 
+def log_scalar(rr: Any, entity: str, value: float | None) -> None:
+    if value is None or not np.isfinite(float(value)):
+        log_clear(rr, entity)
+        return
+    scalar_cls = getattr(rr, "Scalars", None)
+    if scalar_cls is None:
+        scalar_cls = getattr(rr, "Scalar", None)
+    if scalar_cls is None:
+        return
+    rr.log(entity, scalar_cls(float(value)))
+
+
+def log_tactile(rr: Any, data: dict[str, Any], idx: int) -> None:
+    if not has_tactile_stream(data):
+        log_clear(rr, "/status/tactile")
+        return
+
+    log_text(rr, "/status/tactile", tactile_status_text(data, idx))
+    if not _tactile_enabled_at(data, idx):
+        log_clear(rr, "/tactile/total_norm")
+        log_clear(rr, "/tactile/release_ref_norm")
+        log_clear(rr, "/tactile/release_delta_norm")
+        for mag_idx in range(_max_tactile_mags(data)):
+            log_clear(rr, f"/tactile/mag_{mag_idx}/x")
+            log_clear(rr, f"/tactile/mag_{mag_idx}/y")
+            log_clear(rr, f"/tactile/mag_{mag_idx}/z")
+            log_clear(rr, f"/tactile/mag_{mag_idx}/norm")
+        return
+
+    log_scalar(rr, "/tactile/total_norm", _finite_float_at(data, "tactile_total_norm", idx))
+    log_scalar(rr, "/tactile/release_ref_norm", _finite_float_at(data, "tactile_release_ref_norm", idx))
+    log_scalar(rr, "/tactile/release_delta_norm", _finite_float_at(data, "tactile_release_delta_norm", idx))
+
+    values = _tactile_values_at(data, idx)
+    for mag_idx, mag_values in enumerate(values):
+        bx, by, bz = [float(value) for value in mag_values]
+        mag_norm = float(np.linalg.norm(mag_values)) if np.isfinite(mag_values).all() else np.nan
+        log_scalar(rr, f"/tactile/mag_{mag_idx}/x", bx)
+        log_scalar(rr, f"/tactile/mag_{mag_idx}/y", by)
+        log_scalar(rr, f"/tactile/mag_{mag_idx}/z", bz)
+        log_scalar(rr, f"/tactile/mag_{mag_idx}/norm", mag_norm)
+    for mag_idx in range(len(values), _max_tactile_mags(data)):
+        log_clear(rr, f"/tactile/mag_{mag_idx}/x")
+        log_clear(rr, f"/tactile/mag_{mag_idx}/y")
+        log_clear(rr, f"/tactile/mag_{mag_idx}/z")
+        log_clear(rr, f"/tactile/mag_{mag_idx}/norm")
+
+
 def log_frame(
     rr: Any,
     data: dict[str, Any],
@@ -713,6 +841,7 @@ def log_frame(
     log_palm_normal(rr, data, idx, normal_length_m)
     log_eef_axes(rr, data["eef_pose_base"][idx])
     log_template_axes(rr, data, idx, template_axis_length_m)
+    log_tactile(rr, data, idx)
     log_status(rr, frame_status_text(data, idx) + "\n\n" + recording_summary_text(data))
     if has_image_streams(data):
         for camera_id in (0, 1):
@@ -744,6 +873,11 @@ def dry_run(data: dict[str, Any], *, normal_length_m: float, template_axis_lengt
         print("[INFO] Template local axes: not recorded or no valid axes.")
     else:
         print(f"[INFO] Template local axes first valid frame: {axes_first}; axis length: {float(template_axis_length_m):.3f} m.")
+    if has_tactile_stream(data):
+        print("[INFO] Tactile stream detected.")
+        print(tactile_status_text(data, 0))
+    else:
+        print("[INFO] No tactile stream found in this recording.")
     if has_image_streams(data):
         print(f"[INFO] RGB/depth image streams detected. Depth display range: 0.000-{max(float(depth_max_m), 1e-6):.3f} m.")
         for camera_id in (0, 1):
