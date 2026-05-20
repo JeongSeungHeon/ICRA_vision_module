@@ -11,50 +11,89 @@ import yaml
 
 from system.shared_state import FusionState, GraspTargetState, MergedObjectState, SelectedHandState
 
+# Grasp target planner가 기본으로 읽는 handover/grasp 설정 파일.
 DEFAULT_CONFIG_PATH = Path("configs/handover.yaml")
+
+# 설정 파일의 height_axis 이름을 numpy point 배열의 축 인덱스로 변환한다.
 HEIGHT_AXIS_TO_INDEX = {"x": 0, "y": 1, "z": 2}
 
 
 @dataclass
 class GraspPlannerDebug:
+    """최근 grasp target 선택 과정에서 필터링/hold가 어떻게 적용됐는지 기록한다."""
+
+    # merged object point cloud에서 NaN/Inf를 제거한 뒤 남은 원본 후보 수.
     raw_candidate_count: int
+
+    # object centroid 주변 탐색 반경 필터를 통과한 후보 수.
     search_radius_candidate_count: int
+
+    # 손과의 높이축 간격 필터를 통과해 실제 선택 가능한 후보 수.
     clearance_candidate_count: int
+
+    # centroid/hand center가 fusion filter 결과에서 왔는지 여부.
     used_filtered_object_centroid: bool
     used_filtered_hand_center: bool
+
+    # 최종 선택 후보의 centroid 거리와 손 높이축 clearance. 실패/hold 시 None일 수 있다.
     chosen_distance_to_centroid_m: float | None
     chosen_hand_height_clearance_m: float | None
+
+    # 선택/실패/hold가 발생한 이유를 문자열로 남겨 downstream 로그에서 확인한다.
     selection_reason: str
+
+    # 후보가 급격히 바뀌지 않도록 이전 후보를 유지했는지 여부.
     used_temporal_hold: bool = False
+
+    # 최종 선택된 후보의 candidate_points 기준 인덱스. 선택 실패 시 -1이다.
     selected_candidate_index: int = -1
+
+    # target의 x/y가 object centroid에 고정됐는지 여부.
     target_xy_locked: bool = False
+
+    # 후보가 순간적으로 사라졌을 때 이전 grasp point를 임시 유지했는지 여부.
     dropout_hold_active: bool = False
 
 
 class GraspTargetPlanner:
+    """Object point cloud와 선택된 손 위치로부터 robot base 기준 grasp target을 계산한다."""
+
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
 
         grasp_cfg = config.get("grasp", {})
         frame_cfg = config.get("frames", {}).get("height_axis", {})
 
+        # Robot controller에 넘길 고정 orientation. 현재 모듈은 위치만 계산하고 자세는 설정값을 사용한다.
         self.fixed_orientation_format = str(grasp_cfg.get("fixed_orientation_format", "rotvec"))
         self.fixed_orientation_base = tuple(float(v) for v in grasp_cfg.get("fixed_orientation_base", [0.0, 0.0, 0.0]))
+
+        # Object centroid 근처의 표면점만 grasp 후보로 우선 고려하는 반경.
         self.candidate_search_radius_from_centroid_m = float(
             grasp_cfg.get("candidate_search_radius_from_centroid_m", 0.05)
         )
+
+        # 선택된 손과 너무 가까운 높이축 후보를 제거해 hand/object 충돌 가능성을 낮춘다.
         self.min_hand_height_clearance_m = float(grasp_cfg.get("min_hand_height_clearance_m", 0.03))
+
+        # 후보가 없을 때의 정책값. 현재 구현에서는 hold 가능 시 유지하고, 아니면 invalid로 전환한다.
         self.no_candidate_action = str(grasp_cfg.get("no_candidate_action", "hold"))
+
+        # Temporal selection은 프레임 간 target 튐을 줄이기 위한 hysteresis/hold 설정이다.
         selection_cfg = grasp_cfg.get("target_selection", {})
         self.temporal_selection_enabled = bool(selection_cfg.get("enabled", True))
         self.switch_margin = float(selection_cfg.get("switch_margin", 0.01))
         self.hold_frames = max(0, int(selection_cfg.get("hold_frames", 6)))
         self.dropout_hold_frames = max(0, int(selection_cfg.get("dropout_hold_frames", 8)))
-        self.score_previous_distance_weight = float(selection_cfg.get("score_previous_distance_weight", 0.10))
+        self.score_previous_distance_weight = float(selection_cfg.get("score_previous_distance_weight", 0.9))
+
+        # height_axis는 hand clearance를 계산할 축이다. 보통 base frame의 z축을 사용한다.
         self.height_axis_name = str(frame_cfg.get("name", "z")).strip().lower()
         if self.height_axis_name not in HEIGHT_AXIS_TO_INDEX:
             raise ValueError(f"Unsupported height axis: {self.height_axis_name}")
         self.height_axis_index = HEIGHT_AXIS_TO_INDEX[self.height_axis_name]
+
+        # 아래 상태값들은 이전 프레임과 현재 프레임의 선택을 비교하기 위한 내부 메모리다.
         self.last_debug: GraspPlannerDebug | None = None
         self._previous_candidate_index: int = -1
         self._previous_candidate_point: np.ndarray | None = None
@@ -74,12 +113,17 @@ class GraspTargetPlanner:
         selected_hand: SelectedHandState,
         fusion_state: FusionState | None = None,
     ) -> GraspTargetState:
+        """한 프레임의 object/hand 상태를 받아 최종 grasp target 상태로 변환한다."""
+
         points = np.asarray(merged_object.merged_points_base, dtype=np.float32).reshape((-1, 3))
+
+        # Object나 hand가 유효하지 않으면 target을 만들 수 없으므로 invalid 상태를 반환한다.
         if len(points) == 0 or not merged_object.valid:
             return self._invalid_state(merged_object, selected_hand, reason="no_merged_object")
         if not selected_hand.valid or selected_hand.palm_center_base is None:
             return self._invalid_state(merged_object, selected_hand, reason="no_selected_hand")
 
+        # FusionState가 신선하면 필터링된 centroid/hand center를 우선 사용하고, 없으면 raw state로 fallback한다.
         object_centroid, used_filtered_object_centroid = self._resolve_object_centroid(merged_object, fusion_state)
         hand_center, used_filtered_hand_center = self._resolve_hand_center(selected_hand, fusion_state)
         if object_centroid is None:
@@ -87,6 +131,7 @@ class GraspTargetPlanner:
         if hand_center is None:
             return self._invalid_state(merged_object, selected_hand, reason="no_hand_center")
 
+        # Point cloud의 NaN/Inf는 거리 계산을 망가뜨리므로 후보 생성 전에 제거한다.
         finite_mask = np.isfinite(points).all(axis=1)
         points = points[finite_mask]
         raw_candidate_count = int(len(points))
@@ -103,6 +148,7 @@ class GraspTargetPlanner:
                 clearance_candidate_count=0,
             )
 
+        # 1차 필터: object centroid 주변의 표면점만 우선 후보로 사용한다.
         centroid_distances = np.linalg.norm(points - object_centroid.reshape(1, 3), axis=1)
         within_radius_mask = centroid_distances <= self.candidate_search_radius_from_centroid_m
         if np.any(within_radius_mask):
@@ -110,11 +156,13 @@ class GraspTargetPlanner:
             candidate_distances = centroid_distances[within_radius_mask]
             selection_reason = "selected_within_search_radius"
         else:
+            # 반경 안에 후보가 전혀 없으면 전체 point cloud에서라도 target을 찾는다.
             candidate_points = points
             candidate_distances = centroid_distances
             selection_reason = "fallback_to_all_candidates"
         search_radius_candidate_count = int(len(candidate_points))
 
+        # 2차 필터: 손과 height axis 방향으로 너무 가까운 후보는 제외한다.
         hand_axis_values = np.abs(candidate_points[:, self.height_axis_index] - hand_center[self.height_axis_index])
         clearance_mask = hand_axis_values >= self.min_hand_height_clearance_m
         clearance_candidate_count = int(np.count_nonzero(clearance_mask))
@@ -135,8 +183,11 @@ class GraspTargetPlanner:
         valid_distances = candidate_distances[clearance_mask]
         valid_clearances = hand_axis_values[clearance_mask]
         valid_indices = np.nonzero(clearance_mask)[0]
+
+        # 기본 score는 centroid에 가까울수록 높다. 즉 object 중심 근처의 안정적인 z 후보를 선호한다.
         scores = -valid_distances.astype(np.float32)
         if self.temporal_selection_enabled and self._previous_candidate_point is not None:
+            # 이전 후보에서 멀리 떨어진 새 후보에는 penalty를 주어 프레임 간 target 튐을 줄인다.
             previous_distances = np.linalg.norm(valid_points - self._previous_candidate_point.reshape(1, 3), axis=1)
             scores = scores - (self.score_previous_distance_weight * previous_distances.astype(np.float32))
 
@@ -152,6 +203,7 @@ class GraspTargetPlanner:
                 if best_local_index == previous_local_index:
                     self._hold_counter = 0
                 elif best_score <= (previous_score + self.switch_margin) and self._hold_counter < self.hold_frames:
+                    # 새 후보가 충분히 더 좋지 않으면 몇 프레임 동안 이전 후보를 유지한다.
                     selected_local_index = previous_local_index
                     used_temporal_hold = True
                     self._hold_counter += 1
@@ -166,6 +218,8 @@ class GraspTargetPlanner:
         selected_candidate_point = valid_points[selected_local_index]
         selected_distance = float(valid_distances[selected_local_index])
         selected_clearance = float(valid_clearances[selected_local_index])
+
+        # 최종 target은 x/y를 object centroid에 고정하고, z는 선택된 표면 후보의 높이를 사용한다.
         grasp_point = np.asarray(
             [object_centroid[0], object_centroid[1], selected_candidate_point[2]],
             dtype=np.float32,
@@ -184,6 +238,8 @@ class GraspTargetPlanner:
             timestamp=max(float(merged_object.timestamp), float(selected_hand.timestamp)),
             valid=True,
         )
+
+        # 다음 프레임에서 temporal hold/dropout hold 판단에 사용할 선택 이력을 갱신한다.
         self._previous_candidate_index = selected_global_index
         self._previous_candidate_point = np.asarray(selected_candidate_point, dtype=np.float32).reshape(3)
         self._previous_grasp_point = grasp_point.reshape(3)
@@ -209,6 +265,8 @@ class GraspTargetPlanner:
         merged_object: MergedObjectState,
         fusion_state: FusionState | None,
     ) -> tuple[np.ndarray | None, bool]:
+        """필터링된 object centroid를 우선 사용하고, 없으면 merged object centroid로 대체한다."""
+
         if fusion_state is not None and fusion_state.valid and fusion_state.object_fresh and fusion_state.filtered_object_centroid_base is not None:
             return np.asarray(fusion_state.filtered_object_centroid_base, dtype=np.float32).reshape(3), True
         if merged_object.centroid_base is not None:
@@ -220,6 +278,8 @@ class GraspTargetPlanner:
         selected_hand: SelectedHandState,
         fusion_state: FusionState | None,
     ) -> tuple[np.ndarray | None, bool]:
+        """필터링된 hand center를 우선 사용하고, 없으면 selected hand palm center로 대체한다."""
+
         if fusion_state is not None and fusion_state.valid and fusion_state.hand_fresh and fusion_state.filtered_hand_center_base is not None:
             return np.asarray(fusion_state.filtered_hand_center_base, dtype=np.float32).reshape(3), True
         if selected_hand.palm_center_base is not None:
@@ -238,6 +298,8 @@ class GraspTargetPlanner:
         used_filtered_object_centroid: bool = False,
         used_filtered_hand_center: bool = False,
     ) -> GraspTargetState:
+        """Target 산출이 불가능할 때 invalid GraspTargetState와 debug reason을 만든다."""
+
         self.last_debug = GraspPlannerDebug(
             raw_candidate_count=raw_candidate_count,
             search_radius_candidate_count=search_radius_candidate_count,
@@ -275,6 +337,8 @@ class GraspTargetPlanner:
         search_radius_candidate_count: int,
         clearance_candidate_count: int,
     ) -> GraspTargetState:
+        """후보가 사라진 경우 이전 target을 잠깐 유지하거나 invalid 상태로 전환한다."""
+
         if (
             self.temporal_selection_enabled
             and self._previous_grasp_point is not None
@@ -283,6 +347,7 @@ class GraspTargetPlanner:
             self._dropout_hold_counter += 1
             held_point = self._previous_grasp_point.copy()
             if object_centroid is not None:
+                # Object centroid는 계속 갱신해 x/y tracking은 유지하고, grasp height만 이전 값을 쓴다.
                 held_point[0] = float(object_centroid[0])
                 held_point[1] = float(object_centroid[1])
             self._previous_grasp_point = held_point.copy()
@@ -314,6 +379,7 @@ class GraspTargetPlanner:
                 valid=True,
             )
 
+        # 허용된 dropout hold 기간도 지나면 이전 선택 이력을 비우고 invalid 상태를 반환한다.
         self._hold_counter = 0
         self._dropout_hold_counter = 0
         self._previous_candidate_index = -1

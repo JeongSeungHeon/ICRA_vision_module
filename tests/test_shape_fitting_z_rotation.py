@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import yaml
 
 import perception.shape_fitting_tracker_v2 as shape_fitting_tracker_module
 from perception.shape_fitting_tracker_v2 import (
@@ -67,6 +68,28 @@ def rotate_z_points(points: np.ndarray, angle_deg: float, *, center=(0.0, 0.0, 0
 
 
 class ShapeFittingZRotationTests(unittest.TestCase):
+    def test_handover_config_registers_bottle_template(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        config_path = repo_root / "configs" / "handover.yaml"
+        with open(config_path, "r", encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
+
+        segmentation_cfg = config["perception"]["object"]["segmentation"]
+        self.assertIn("bottle", segmentation_cfg["prompt_classes"])
+        self.assertIn("bottle", segmentation_cfg["selection_class_names"])
+
+        template_cfg = config["perception"]["shape_fitting"]["template_library"]
+        loader = SimpleNamespace(_config_path=config_path)
+        templates = ShapeFittingTracker._load_template_library(loader, template_cfg)
+
+        self.assertIn("bottle", templates)
+        bottle_template = templates["bottle"]
+        self.assertEqual(bottle_template.template_id, "bottle_shape_fit")
+        self.assertEqual(bottle_template.asset_path, repo_root / "shape_fitting" / "beer_bottle.npy")
+        self.assertEqual(bottle_template.unit_scale_m, 0.001)
+        self.assertEqual(bottle_template.scale_mode, SCALE_MODE_AXIS_XYZ)
+        self.assertFalse(bottle_template.z_rotation_enabled)
+
     def test_template_z_rotation_is_per_object(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

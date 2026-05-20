@@ -66,7 +66,7 @@ MOTION_TRIGGER_Z_MM = 40.0
 
 # control loop
 DEFAULT_CONTROL_HZ = 30.0
-MAX_XY_SPEED_MM_S = 200.0 # 80
+MAX_XY_SPEED_MM_S = 250.0 # 80
 MAX_Z_SPEED_MM_S = 250.0  # 80
 
 # EEF target offset from detected object center (robot base frame)
@@ -80,7 +80,7 @@ BACKOFF_X_MM = 100.0
 DEFAULT_POST_RELEASE_Z_OFFSET_MM = 0.0
 HOME_PLACE_X_OFFSET_MM = 0.0
 HOME_PLACE_Y_OFFSET_MM = -3.0
-HOME_PLACE_MIN_Z_MM = 45.0
+HOME_PLACE_MIN_Z_MM = 30.0
 PRE_RELEASE_MIN_Z_EPSILON_MM = 1e-3
 GRASP_POINT_Y_OFFSET_MM = 10.0
 PLACE_Z_GRASP_BUFFER_FRAMES = 5
@@ -105,6 +105,10 @@ DEFAULT_TACTILE_RELEASE_TIMEOUT_S = 1.0
 DEFAULT_TACTILE_RELEASE_DESCENT_STEP_MM = 2.0
 DEFAULT_TACTILE_RELEASE_DESCENT_POLL_DT_S = 0.03
 DEFAULT_TACTILE_AUTO_BASELINE_RESET_AFTER_OPEN_S = 1.5
+DEFAULT_TACTILE_RELEASE_STOP_TIMING_DEBUG = False
+DEFAULT_TACTILE_RELEASE_STOP_SPEED_THRESHOLD_MPS = 0.002
+DEFAULT_TACTILE_RELEASE_STOP_MONITOR_TIMEOUT_S = 1.0
+DEFAULT_TACTILE_RELEASE_STOP_MONITOR_POLL_DT_S = 0.005
 HOME_JOINTS_DEG = [0.0, -135.0, 135.0, 0.0, 90.0, 0.0]
 HOME_JOINT_TOLERANCE_DEG = 1.0
 HOME_JOINT_SPEED_RAD_S = 0.5
@@ -455,10 +459,10 @@ def apply_config_defaults(args, config):
         0.0,
         float(tactile_cfg.get("release_ref_delay_s", DEFAULT_TACTILE_RELEASE_REF_DELAY_S)),
     )
-    args.tactile_release_timeout_s = max(
-        0.0,
-        float(tactile_cfg.get("release_timeout_s", DEFAULT_TACTILE_RELEASE_TIMEOUT_S)),
-    )
+    # args.tactile_release_timeout_s = max(
+    #     0.0,
+    #     float(tactile_cfg.get("release_timeout_s", DEFAULT_TACTILE_RELEASE_TIMEOUT_S)),
+    # )
     args.tactile_release_descent_min_z_mm = max(
         HOME_PLACE_MIN_Z_MM,
         float(tactile_cfg.get("release_descent_min_z_mm", HOME_PLACE_MIN_Z_MM)),
@@ -477,6 +481,36 @@ def apply_config_defaults(args, config):
             tactile_cfg.get(
                 "auto_baseline_reset_after_open_s",
                 DEFAULT_TACTILE_AUTO_BASELINE_RESET_AFTER_OPEN_S,
+            )
+        ),
+    )
+    args.tactile_release_stop_timing_debug = bool(
+        tactile_cfg.get("release_stop_timing_debug", DEFAULT_TACTILE_RELEASE_STOP_TIMING_DEBUG)
+    )
+    args.tactile_release_stop_speed_threshold_mps = max(
+        0.0,
+        float(
+            tactile_cfg.get(
+                "release_stop_speed_threshold_mps",
+                DEFAULT_TACTILE_RELEASE_STOP_SPEED_THRESHOLD_MPS,
+            )
+        ),
+    )
+    args.tactile_release_stop_monitor_timeout_s = max(
+        0.0,
+        float(
+            tactile_cfg.get(
+                "release_stop_monitor_timeout_s",
+                DEFAULT_TACTILE_RELEASE_STOP_MONITOR_TIMEOUT_S,
+            )
+        ),
+    )
+    args.tactile_release_stop_monitor_poll_dt_s = max(
+        0.0,
+        float(
+            tactile_cfg.get(
+                "release_stop_monitor_poll_dt_s",
+                DEFAULT_TACTILE_RELEASE_STOP_MONITOR_POLL_DT_S,
             )
         ),
     )
@@ -752,7 +786,7 @@ def make_robot_command(command_type, *, target_position_base=None, fixed_orienta
     )
 
 
-def send_robot_command(controller, command_type, *, target_position_base=None, fixed_orientation_base=None, gripper_action=None, source_mode="manual"):
+def send_robot_command( controller, command_type, *, target_position_base=None, fixed_orientation_base=None, gripper_action=None, source_mode="manual"):
     """Send one robot command through the RTDE controller with a fresh timestamp."""
     command = make_robot_command(
         command_type,
@@ -1517,251 +1551,356 @@ class RobotWorker:
     """Single thread that owns all RTDE and gripper commands."""
 
     def __init__(self, args, shared_state, metadata_recorder=None, tactile_manager=None):
+        # 로봇 제어 주기, timeout, gripper/tactile 설정 등 실행 옵션을 보관한다.
         self.args = args
+        # perception main loop와 target/follow 상태를 주고받는 공유 상태 객체다.
         self.shared_state = shared_state
+        # grasp/place 결과와 task 이벤트를 기록하는 metadata recorder다.
         self.metadata_recorder = metadata_recorder
+        # tactile grasp 판정 또는 tactile 로그 저장에 사용할 manager다.
         self.tactile_manager = tactile_manager
+        # RTDE controller 인스턴스이며, init 전이나 disconnect 후에는 None이다.
         self.controller = None
+        # main thread가 submit한 RobotRequest를 worker thread가 순서대로 처리하는 큐다.
         self._request_queue = queue.Queue()
+        # 외부에서 get_status()로 읽는 로봇 worker 상태 snapshot이다.
         self._status = RobotStatus()
+        # _status를 여러 thread가 동시에 읽고 쓰지 않도록 보호하는 lock이다.
         self._status_lock = threading.Lock()
+        # 긴 동작 중 reset/stop/shutdown 같은 요청이 들어왔을 때 취소 신호로 사용한다.
         self._cancel_event = threading.Event()
+        # worker thread의 main loop 종료 조건으로 사용하는 event다.
         self._shutdown_event = threading.Event()
+        # 실제 로봇 명령을 소유하는 background thread 핸들이다.
         self._thread = None
+        # request에 고유 ID를 붙이기 위한 단조 증가 counter다.
         self._request_seq = 0
+        # request ID 발급이 thread-safe 하도록 보호하는 lock이다.
         self._request_seq_lock = threading.Lock()
+        # follow servo 중 마지막으로 로봇에 보낸 TCP 목표 위치[mm]다.
         self._last_sent_pose_mm = None
+        # follow servo가 한 번에 움직일 reference target 위치[mm]다.
         self._ref_target_xyz_mm = None
+        # 직전 follow tick에서 실제 servo 명령이 활성 상태였는지 추적한다.
         self._was_follow_active = False
+        # control_hz에 맞춰 다음 follow tick을 실행할 wall-clock 시각이다.
         self._next_follow_tick_t = 0.0
+        # FOLLOWING이 아닐 때도 주기적으로 robot state를 읽기 위한 마지막 read 시각이다.
         self._last_status_read_t = 0.0
 
     def start(self):
+        # 이미 worker thread가 살아 있으면 중복으로 시작하지 않는다.
         if self._thread is not None and self._thread.is_alive():
             return
+        # 모든 RTDE/gripper 명령은 이 daemon thread 안에서만 실행된다.
         self._thread = threading.Thread(target=self._run, name="robot-worker", daemon=True)
+        # background worker loop를 시작한다.
         self._thread.start()
 
     def join(self, timeout=None):
+        # 종료 시 main thread가 worker thread 정리를 기다릴 때 사용한다.
         if self._thread is not None:
             self._thread.join(timeout=timeout)
 
     def submit(self, request):
+        # 문자열 등으로 들어온 요청도 RobotRequest 형태로 정규화한다.
         if not isinstance(request, RobotRequest):
             request = RobotRequest(str(request))
+        # payload는 queue에 넣기 전에 shallow copy해서 호출자 변경과 분리한다.
         payload = {} if request.payload is None else dict(request.payload)
+        # 요청마다 고유 request_id를 부여한다.
         with self._request_seq_lock:
             self._request_seq += 1
             request_id = self._request_seq
+        # worker queue에 들어갈 immutable에 가까운 request 객체를 새로 만든다.
         queued_request = RobotRequest(
             type=str(request.type),
             payload=payload,
             created_at=float(request.created_at),
             request_id=request_id,
         )
+        # 긴 로봇 동작을 끊어야 하는 긴급 요청이면 cancel_event를 먼저 세운다.
         if queued_request.type in ROBOT_URGENT_REQUESTS:
             self._cancel_event.set()
+        # worker thread가 처리할 수 있도록 request queue에 넣는다.
         self._request_queue.put(queued_request)
+        # 호출자가 로그나 디버깅에 사용할 수 있게 request_id를 반환한다.
         return request_id
 
     def get_status(self):
+        # RobotStatus를 복사해서 반환해 외부 thread가 내부 상태를 직접 바꾸지 못하게 한다.
         with self._status_lock:
             return replace(self._status)
 
     def _set_status(self, **updates):
+        # 여러 status field를 lock 안에서 원자적으로 갱신한다.
         with self._status_lock:
             for key, value in updates.items():
                 setattr(self._status, key, value)
 
     def _bump_status_counter(self, field_name):
+        # task_ready/reset_done/task_done 같은 edge-trigger 이벤트 epoch를 1 증가시킨다.
         with self._status_lock:
             setattr(self._status, field_name, int(getattr(self._status, field_name)) + 1)
             return int(getattr(self._status, field_name))
 
     def _current_state(self):
+        # 현재 robot worker state만 안전하게 읽는다.
         with self._status_lock:
             return self._status.state
 
     def _set_active_request(self, request):
+        # 지금 처리 중인 request type/id를 status에 노출한다.
         self._set_status(active_request=request.type, active_request_id=int(request.request_id))
 
     def _clear_active_request(self):
+        # request 처리가 끝나면 active request 표시를 비운다.
         self._set_status(active_request=None, active_request_id=0)
 
     def _reset_follow_tracking(self):
+        # follow servo의 이전 목표와 활성 상태를 모두 초기화한다.
         self._last_sent_pose_mm = None
         self._ref_target_xyz_mm = None
         self._was_follow_active = False
+        # robot worker가 servo 명령을 쥐고 있지 않음을 shared state에 알린다.
         self.shared_state.set_follow_thread_idle(True)
 
     def _read_robot_state(self):
+        # controller가 없으면 연결되지 않은 상태로 status를 갱신한다.
         if self.controller is None:
             self._set_status(is_connected=False, using_mock=False)
             return None
+        # RTDE controller에서 현재 TCP pose, 연결 상태, 에러 등을 읽는다.
         try:
             state = self.controller.read_robot_state(now_timestamp=time.time())
         except Exception as exc:
+            # read 실패는 status에 에러로 남기고 이번 frame은 상태 없음으로 처리한다.
             self._set_status(last_error=str(exc), is_connected=False)
             return None
 
+        # actual_tcp_pose_base를 tuple(float)로 정규화해 status에 저장한다.
         pose = getattr(state, "actual_tcp_pose_base", None)
         pose_tuple = None if pose is None else tuple(float(v) for v in pose)
+        # mock controller 사용 여부를 state 또는 controller 속성에서 확인한다.
         using_mock = bool(getattr(state, "using_mock", getattr(self.controller, "using_mock", False)))
+        # 외부 main loop가 볼 수 있도록 최신 robot status를 publish한다.
         self._set_status(
             is_connected=bool(getattr(state, "is_connected", False)),
             using_mock=using_mock,
             last_robot_pose=pose_tuple,
             last_error=getattr(state, "last_error", None),
         )
+        # non-follow 상태에서 status read 주기를 제한하기 위한 timestamp다.
         self._last_status_read_t = time.time()
         return state
 
     def _send_robot_command(self, command_type, **kwargs):
+        # controller가 없으면 명령을 보낼 대상이 없으므로 no-op 처리한다.
         if self.controller is None:
             return None
+        # 마지막으로 보낸 command type을 status에 남긴다.
         self._set_status(last_command_type=command_type)
+        # 실제 RTDE/gripper command helper로 명령을 전달한다.
         return send_robot_command(self.controller, command_type, **kwargs)
 
     def _safe_stop(self, source_mode="worker_stop"):
+        # controller가 없으면 멈출 로봇 연결도 없다.
         if self.controller is None:
             return
+        # stop 명령 자체가 실패해도 worker가 죽지 않도록 보호한다.
         try:
             self._send_robot_command(ROBOT_CMD_STOP, source_mode=source_mode)
         except Exception as exc:
             self._set_status(last_error=str(exc))
 
     def _disconnect(self):
+        # 이미 disconnect 상태면 아무것도 하지 않는다.
         if self.controller is None:
             return
+        # RTDE 연결과 gripper/controller 리소스를 닫는다.
         disconnect_rtde(self.controller)
         self.controller = None
+        # 외부 status에도 연결 해제 상태를 반영한다.
         self._set_status(is_connected=False, using_mock=False, last_robot_pose=None)
 
     def _publish_task_ready(self):
+        # main loop가 새 trial 시작을 감지하도록 task_ready_epoch를 증가시킨다.
         self._bump_status_counter("task_ready_epoch")
 
     def _run(self):
+        # shutdown event가 세워질 때까지 request 처리와 follow servo를 반복한다.
         while not self._shutdown_event.is_set():
             try:
+                # request queue를 짧게 기다려서 명령 처리 지연과 follow 주기를 균형 있게 유지한다.
                 request = self._request_queue.get(timeout=0.01)
+                # 들어온 request type에 맞는 handler를 실행한다.
                 self._handle_request(request)
+                # shutdown request를 처리했다면 worker loop를 즉시 빠져나간다.
                 if request.type == ROBOT_REQ_SHUTDOWN:
                     break
+                # request를 처리한 tick에서는 아래 follow_once를 건너뛰고 다음 loop로 간다.
                 continue
             except queue.Empty:
+                # 처리할 request가 없으면 현재 state에 따라 follow 또는 status polling을 한다.
                 pass
 
+            # FOLLOWING 상태에서는 control_hz에 맞춰 target servo를 한 tick 실행한다.
             if self._current_state() == ROBOT_STATE_FOLLOWING:
                 self._follow_once()
+            # FOLLOWING이 아니어도 연결이 살아 있으면 10Hz 정도로 robot state를 갱신한다.
             elif self.controller is not None and time.time() - self._last_status_read_t >= 0.1:
                 self._read_robot_state()
 
+        # loop를 빠져나오면 shutdown event를 확실히 세워 외부 상태와 맞춘다.
         self._shutdown_event.set()
 
     def _handle_request(self, request):
+        # 현재 처리 중인 request를 status에 표시한다.
         self._set_active_request(request)
         try:
+            # 로봇 연결과 HOME 이동을 수행한다.
             if request.type == ROBOT_REQ_INIT_ROBOT:
                 self._handle_init_robot()
+            # perception target을 따라가는 servo follow를 시작한다.
             elif request.type == ROBOT_REQ_START_FOLLOW:
                 self._handle_start_follow()
+            # follow servo를 정지하고 idle로 돌아간다.
             elif request.type == ROBOT_REQ_STOP_FOLLOW:
                 self._handle_stop_follow()
+            # pregrasp 도달 후 gripper close, return, place sequence를 수행한다.
             elif request.type == ROBOT_REQ_START_GRASP_PLACE:
                 self._handle_start_grasp_place(request.payload)
+            # gripper를 열고 HOME으로 돌아간 뒤 새 task 준비 상태로 reset한다.
             elif request.type == ROBOT_REQ_RESET_HOME:
                 self._handle_reset_home()
+            # 현재 task 저장 흐름을 위해 follow를 멈추고 idle로 둔다.
             elif request.type == ROBOT_REQ_SAVE_AND_STOP:
                 self._handle_save_and_stop()
+            # 즉시 follow를 멈추고 stop command를 보낸다.
             elif request.type == ROBOT_REQ_EMERGENCY_STOP:
                 self._handle_emergency_stop()
+            # worker 종료와 controller disconnect를 수행한다.
             elif request.type == ROBOT_REQ_SHUTDOWN:
                 self._handle_shutdown()
+            # 알 수 없는 request type은 reject하고 status에 에러를 남긴다.
             else:
                 self._reject_request(request, f"unknown request type {request.type}")
         finally:
+            # handler 성공/실패와 관계없이 active request 표시는 지운다.
             self._clear_active_request()
 
     def _reject_request(self, request, reason):
+        # 현재 state에서 처리할 수 없는 요청을 명시적으로 기록한다.
         message = f"Rejected robot request {request.type}: {reason}"
         print(f"[WARN] {message}")
         self._set_status(last_error=message)
 
     def _handle_init_robot(self):
+        # 이미 controller가 있으면 중복 초기화를 하지 않는다.
         if self.controller is not None:
             self._set_status(last_error=None)
             return
+        # 이전 긴급 취소 신호가 남아 있으면 초기화 전에 해제한다.
         self._cancel_event.clear()
+        # 초기화 중임을 외부 status에 알린다.
         self._set_status(state=ROBOT_STATE_INITIALIZING, last_error=None, grasp_ok=None)
         try:
+            # RTDE controller를 생성하고 로봇/그리퍼 연결을 초기화한다.
             self.controller = init_rtde(self.args)
+            # 초기 연결 상태와 TCP pose를 읽어 status에 반영한다.
             self._read_robot_state()
+            # task 시작 전 HOME joint pose로 이동한다.
             home_ok = move_robot_to_home_pose(self.controller, self.args, cancel_event=self._cancel_event)
+            # HOME 이동이 취소된 경우 idle 상태로 돌아간다.
             if home_ok is False:
                 self._set_status(state=ROBOT_STATE_IDLE, last_error="robot initialization cancelled")
                 return
+            # 현재 로봇 TCP orientation을 follow 중 고정 orientation 기준으로 저장한다.
             self.shared_state.set_fixed_pose_from_robot(self.controller)
+            # HOME 이동 후 최신 pose를 다시 읽는다.
             self._read_robot_state()
+            # main loop가 metadata/video recording 시작을 준비하도록 task_ready를 publish한다.
             self._publish_task_ready()
+            # 초기화가 끝났으므로 idle 상태로 전환한다.
             self._set_status(state=ROBOT_STATE_IDLE, last_error=None)
         except Exception as exc:
+            # 초기화 실패는 로봇 제어 state를 ERROR로 전환한다.
             self._set_status(state=ROBOT_STATE_ERROR, last_error=str(exc))
             print(f"[WARN] Robot initialization failed: {exc}")
 
     def _handle_start_follow(self):
+        # follow는 controller 초기화 이후에만 시작할 수 있다.
         if self.controller is None:
             self._reject_request(RobotRequest(ROBOT_REQ_START_FOLLOW), "robot is not initialized")
             return
+        # grasp/place/reset/stop 같은 blocking sequence 중에는 follow 시작을 거부한다.
         state = self._current_state()
         if state in {ROBOT_STATE_GRASPING, ROBOT_STATE_RETURNING, ROBOT_STATE_PLACING, ROBOT_STATE_RESETTING, ROBOT_STATE_STOPPING}:
             self._reject_request(RobotRequest(ROBOT_REQ_START_FOLLOW), f"state is {state}")
             return
+        # 이전 취소 신호를 해제하고 follow 가능 상태로 shared state를 설정한다.
         self._cancel_event.clear()
         self.shared_state.clear_follow_pause()
         self.shared_state.set_follow_enabled(True, reset_prediction=True, reset_arm=True)
+        # UI/debug용 task state를 FOLLOW로 표시한다.
         self.shared_state.set_task_state("FOLLOW", reset_prediction=False, reset_arm=False)
+        # 이전 follow 기준점과 마지막 명령을 지운다.
         self._reset_follow_tracking()
+        # 다음 loop에서 바로 follow tick이 실행되도록 tick timestamp를 초기화한다.
         self._next_follow_tick_t = 0.0
+        # worker state를 FOLLOWING으로 전환한다.
         self._set_status(state=ROBOT_STATE_FOLLOWING, last_error=None, grasp_ok=None)
 
     def _handle_stop_follow(self):
+        # shared state에 follow 중지를 요청해 main/follow 양쪽 상태를 맞춘다.
         self.shared_state.request_follow_pause()
         self.shared_state.stop_follow()
+        # 실제 servo 명령을 보낸 적이 있다면 로봇에 stop command를 보낸다.
         if self._was_follow_active:
             self._safe_stop(source_mode="stop_follow")
+        # follow 내부 기준점을 초기화하고 idle 상태를 publish한다.
         self._reset_follow_tracking()
+        # FOLLOWING 상태에서 온 stop 요청이면 worker state를 IDLE로 바꾼다.
         if self._current_state() == ROBOT_STATE_FOLLOWING:
             self._set_status(state=ROBOT_STATE_IDLE)
 
     def _handle_start_grasp_place(self, payload):
+        # grasp/place sequence는 초기화된 controller가 있어야 실행할 수 있다.
         if self.controller is None:
             self._reject_request(RobotRequest(ROBOT_REQ_START_GRASP_PLACE), "robot is not initialized")
             return
+        # follow 중 pregrasp에 도달한 순간에만 grasp/place 요청을 받아들인다.
         if self._current_state() != ROBOT_STATE_FOLLOWING:
             self._reject_request(RobotRequest(ROBOT_REQ_START_GRASP_PLACE), f"state is {self._current_state()}")
             return
 
+        # 요청 처리 직전 실제 로봇 pose를 다시 읽어 최종 pregrasp 도달 여부를 확인한다.
         robot_state = self._read_robot_state()
         robot_pose = None if robot_state is None else getattr(robot_state, "actual_tcp_pose_base", None)
+        # shared_state 기준 final pose check가 실패하면 grasp를 시작하지 않는다.
         if not self.shared_state.is_pregrasp_pose_reached(robot_pose):
             self._set_status(last_error="grasp request ignored because final pose check failed")
             return
 
+        # main loop가 넘긴 geometry/action context를 RobotActionContext로 정규화한다.
         context = payload.get("context")
         if context is None:
             context = RobotActionContext()
         elif isinstance(context, dict):
             context = RobotActionContext(**context)
 
+        # follow servo에서 grasp/place blocking sequence로 제어권을 넘기기 위해 follow를 멈춘다.
         self.shared_state.request_follow_pause()
         self.shared_state.stop_follow()
         self._safe_stop(source_mode="pregrasp_handoff")
         self._reset_follow_tracking()
 
+        # tactile grasp 판정이 있으면 geometry 기반 threshold 대신 config 기본값을 사용한다.
         tactile_enabled = self.tactile_manager is not None and bool(getattr(self.tactile_manager, "enabled", False))
         if tactile_enabled:
             reset_gripper_position_threshold_to_config_default(self.controller)
         else:
+            # tactile이 없으면 fitted geometry로 gripper close 완료 threshold를 조정한다.
             configure_gripper_position_threshold_from_geometry(
                 self.controller,
                 context.fitted_points_base,
@@ -1770,7 +1909,9 @@ class RobotWorker:
                 template_axes_base=context.template_axes_base,
             )
 
+        # gripper close 단계로 state를 바꾸고 grasp 판정값을 초기화한다.
         self._set_status(state=ROBOT_STATE_GRASPING, grasp_ok=None, last_error=None)
+        # 그리퍼를 닫고 position/tactile 조건으로 grasp 성공 여부를 판정한다.
         grasp_ok = execute_gripper_close(
             self.controller,
             timeout_s=self.args.gripper_close_timeout_s,
@@ -1781,24 +1922,31 @@ class RobotWorker:
             tactile_extra_grasp_pos=self.args.tactile_extra_grasp_pos,
             cancel_event=self._cancel_event,
         )
+        # grasp 판정 결과를 status에 기록한다.
         self._set_status(grasp_ok=bool(grasp_ok))
         print(f"[INFO] grasp_ok = {grasp_ok}")
+        # 도중에 cancel/reset/shutdown이 들어왔으면 로봇을 멈추고 idle로 돌아간다.
         if self._cancel_event.is_set():
             self._safe_stop(source_mode="grasp_cancelled")
             self._set_status(state=ROBOT_STATE_IDLE)
             return
+        # grasp 검증이 실패하면 ERROR 상태로 전환하고 place sequence는 실행하지 않는다.
         if not grasp_ok:
             self._set_status(state=ROBOT_STATE_ERROR, last_error="gripper close did not verify grasp")
             return
 
+        # grasp 성공 후 현재 TCP와 object target 간 offset을 저장해 place 계산에 사용한다.
         save_grasp_offset(self.controller, self.shared_state)
+        # offset 저장 직후 취소가 들어왔는지 다시 확인한다.
         if self._cancel_event.is_set():
             self._safe_stop(source_mode="post_grasp_cancelled")
             self._set_status(state=ROBOT_STATE_IDLE)
             return
 
+        # return/place sequence 상태를 외부에 알린다.
         self._set_status(state=ROBOT_STATE_RETURNING)
         self._set_status(state=ROBOT_STATE_PLACING)
+        # object를 들고 return pose로 이동한 뒤 place 동작을 실행한다.
         place_ok = execute_return_and_place(
             self.controller,
             self.shared_state,
@@ -1807,61 +1955,83 @@ class RobotWorker:
             tactile_manager=self.tactile_manager,
             cancel_event=self._cancel_event,
         )
+        # place 중 취소되면 stop 후 idle로 돌아간다.
         if self._cancel_event.is_set():
             self._safe_stop(source_mode="place_cancelled")
             self._set_status(state=ROBOT_STATE_IDLE)
             return
+        # return/place 실패는 ERROR로 보고 main loop가 추가 grasp 요청을 막게 한다.
         if not place_ok:
             self._set_status(state=ROBOT_STATE_ERROR, last_error="return/place failed")
             return
 
+        # main loop가 task 완료를 감지하도록 task_done_epoch를 증가시킨다.
         self._bump_status_counter("task_done_epoch")
+        # 전체 grasp/place sequence가 정상 종료됐음을 표시한다.
         self._set_status(state=ROBOT_STATE_DONE, last_error=None)
 
     def _handle_reset_home(self):
+        # reset 요청 자체는 새로운 sequence이므로 이전 cancel 신호를 지운다.
         self._cancel_event.clear()
+        # reset 진행 중임을 status에 반영한다.
         self._set_status(state=ROBOT_STATE_RESETTING, last_error=None, grasp_ok=None)
         try:
+            # follow servo를 먼저 정지해 reset sequence가 로봇 제어권을 갖게 한다.
             self.shared_state.request_follow_pause()
             self.shared_state.stop_follow()
             self._safe_stop(source_mode="reset_home")
             self._reset_follow_tracking()
+            # controller가 연결되어 있으면 gripper open과 HOME 이동까지 수행한다.
             if self.controller is not None:
                 execute_gripper_open(
                     self.controller,
                     dwell_s=self.args.gripper_release_dwell_s,
                     cancel_event=self._cancel_event,
                 )
+                # HOME joint pose로 복귀한다.
                 home_ok = move_robot_to_home_pose(self.controller, self.args, cancel_event=self._cancel_event)
+                # HOME 이동 취소 시 idle로만 돌아간다.
                 if home_ok is False:
                     self._set_status(state=ROBOT_STATE_IDLE, last_error="reset cancelled")
                     return
+                # tactile, shared perception/follow 상태를 새 trial 기준으로 초기화한다.
                 reset_tactile_state_for_system_reset(self.tactile_manager)
                 self.shared_state.reset_for_restart(follow_enabled=self.args.enable_follow)
+                # reset 후 현재 robot pose에서 고정 orientation 기준을 다시 잡는다.
                 self.shared_state.set_fixed_pose_from_robot(self.controller)
                 self.shared_state.clear_follow_pause()
+                # 최신 robot pose를 status에 반영한다.
                 self._read_robot_state()
+                # main loop가 새 metadata/video task를 시작하게 task_ready를 publish한다.
                 self._publish_task_ready()
+                # enable_follow 설정에 따라 reset 직후 follow를 재개하거나 idle로 둔다.
                 self._set_status(state=ROBOT_STATE_FOLLOWING if self.args.enable_follow else ROBOT_STATE_IDLE)
+            # controller가 없으면 로봇 동작 없이 software state만 reset한다.
             else:
                 reset_tactile_state_for_system_reset(self.tactile_manager)
                 self.shared_state.reset_for_restart(follow_enabled=False)
                 self._set_status(state=ROBOT_STATE_IDLE)
+            # main loop가 perception/debug/profile reset 후처리를 하도록 reset_done_epoch를 증가시킨다.
             self._bump_status_counter("reset_done_epoch")
         except Exception as exc:
+            # reset 실패는 안전하게 ERROR 상태로 노출한다.
             self._set_status(state=ROBOT_STATE_ERROR, last_error=str(exc))
             print(f"[WARN] Robot reset failed: {exc}")
 
     def _handle_save_and_stop(self):
+        # 저장 단축키 처리 중에는 follow를 멈추는 STOPPING 상태로 둔다.
         self._set_status(state=ROBOT_STATE_STOPPING)
         self.shared_state.request_follow_pause()
         self.shared_state.stop_follow()
+        # servo motion이 남아 있을 수 있으므로 stop command를 보낸다.
         self._safe_stop(source_mode="save_and_stop")
+        # follow 내부 상태와 cancel 신호를 정리한 뒤 idle로 둔다.
         self._reset_follow_tracking()
         self._cancel_event.clear()
         self._set_status(state=ROBOT_STATE_IDLE)
 
     def _handle_emergency_stop(self):
+        # 긴급 정지는 저장/복귀 없이 즉시 follow를 끊고 stop command를 보낸다.
         self._set_status(state=ROBOT_STATE_STOPPING)
         self.shared_state.request_follow_pause()
         self.shared_state.stop_follow()
@@ -1869,6 +2039,7 @@ class RobotWorker:
         self._reset_follow_tracking()
 
     def _handle_shutdown(self):
+        # 프로그램 종료 시 follow를 멈추고 controller 연결까지 닫는다.
         self._set_status(state=ROBOT_STATE_STOPPING)
         self.shared_state.request_follow_pause()
         self.shared_state.stop_follow()
@@ -1878,30 +2049,42 @@ class RobotWorker:
         self._shutdown_event.set()
 
     def _follow_once(self):
+        # follow servo는 control_hz를 넘지 않도록 tick 간격을 제한한다.
         now = time.time()
         interval = 1.0 / max(float(self.args.control_hz), 1e-6)
         if now < self._next_follow_tick_t:
             return
         self._next_follow_tick_t = now + interval
 
+        # 최신 robot pose와 shared perception target snapshot을 읽는다.
         robot_state = self._read_robot_state()
         snap = self.shared_state.get_snapshot()
+        # shared_state가 smoothing/prediction을 거쳐 만든 최종 follow target[mm]이다.
         control_target_xyz_mm = snap["control_target_xyz_mm"]
+        # target이 measured인지 predicted인지에 따라 안전 조건이 달라진다.
         target_source = snap["target_source"]
 
+        # 아래 조건 중 하나라도 실패하면 이번 tick에서는 servo 명령을 보내지 않는다.
         active = True
+        # grasp/place/reset 등에서 pause를 요청한 경우 follow를 멈춘다.
         if snap["follow_pause_requested"]:
             active = False
+        # follow 자체가 꺼져 있으면 비활성화한다.
         elif not snap["follow_enabled"]:
             active = False
+        # 따라갈 target이 아직 없으면 비활성화한다.
         elif control_target_xyz_mm is None:
             active = False
+        # measured target은 최소 유효 detection streak을 만족하거나 prediction이 arm된 뒤에만 사용한다.
         elif target_source != "predicted" and snap["valid_detection_streak"] < self.args.min_valid_count and not snap["prediction_armed"]:
             active = False
+        # predicted target은 prediction이 명시적으로 arm된 경우에만 사용한다.
         elif target_source == "predicted" and not snap["prediction_armed"]:
             active = False
+        # hand/object motion trigger 전에는 로봇이 움직이지 않도록 막는다.
         elif not snap["motion_triggered"]:
             active = False
+        # prediction target이 너무 오래된 경우 안전하게 follow를 끊는다.
         elif target_source == "predicted" and (
             snap["prediction_age_s"] is None or float(snap["prediction_age_s"]) > float(self.args.prediction_max_horizon_s)
         ):
@@ -1911,34 +2094,45 @@ class RobotWorker:
         elif snap["fixed_orientation_base"] is None:
             active = False
 
+        # active 조건을 만족하지 못하면 필요 시 stop을 보내고 idle 상태를 publish한다.
         if not active:
+            # 직전 tick까지 servo가 나가고 있었다면 로봇에 stop command를 한 번 보낸다.
             if self._was_follow_active:
                 self._safe_stop(source_mode="follow_inactive")
                 self._ref_target_xyz_mm = None
                 self._last_sent_pose_mm = None
+            # 이번 tick부터는 follow 명령이 비활성 상태임을 기록한다.
             self._was_follow_active = False
             self.shared_state.set_follow_thread_idle(True)
             return
 
+        # 이 tick에서는 로봇 servo 제어권을 worker가 사용 중임을 표시한다.
         self.shared_state.set_follow_thread_idle(False)
 
         # fixed_z_mm = snap["fixed_z_mm"]
+        # follow 중 자세는 초기 robot pose에서 잡은 orientation을 고정해서 사용한다.
         fixed_orientation_base = snap["fixed_orientation_base"]
+        # reference target이 없으면 현재 TCP 위치를 시작점으로 초기화한다.
         if self._ref_target_xyz_mm is None:
             pose = None if robot_state is None else getattr(robot_state, "actual_tcp_pose_base", None)
+            # 현재 robot pose를 읽지 못하면 안전하게 이번 tick을 건너뛴다.
             if pose is None:
                 return
             self._ref_target_xyz_mm = meters_to_mm(pose[:3]).astype(np.float32)
             print(f"[INFO] ref_target initialized from current EEF xyz: {self._ref_target_xyz_mm}")
 
+        # control_hz 기준 한 tick에서 허용할 최대 XY/Z 이동량을 계산한다.
         max_step_mm = MAX_XY_SPEED_MM_S / max(float(self.args.control_hz), 1e-6)
         max_step_z_mm = MAX_Z_SPEED_MM_S / max(float(self.args.control_hz), 1e-6)
+        # 현재 reference와 perception target 사이의 오차[mm]다.
         ref_err_xyz = control_target_xyz_mm - self._ref_target_xyz_mm
+        # close-range에서는 XY 거리와 Z 속도 제한을 반영한 step limit을 얻는다.
         max_step_xy, max_step_z, dist_xy = get_close_range_step_mm(
             ref_err_xyz,
             max_step_mm,
             max_step_z_mm,
         )
+        # dominant axis와 follow_z 설정을 고려해 이번 tick에서 이동할 reference step을 계산한다.
         ref_step_xyz, dominant_axis = compute_close_range_ref_step_xyz(
             ref_err_xyz,
             max_step_xy,
@@ -1949,17 +2143,24 @@ class RobotWorker:
         # if not self.args.follow_z:
         #     self._ref_target_xyz_mm[2] = fixed_z_mm
 
+        # reference target을 target 방향으로 한 step 전진시킨다.
         self._ref_target_xyz_mm = self._ref_target_xyz_mm + ref_step_xyz
+        # 현재 코드는 follow_z 여부와 관계없이 reference z를 command z로 사용한다.
         cmd_z = float(self._ref_target_xyz_mm[2]) # if self.args.follow_z else float(fixed_z_mm)
+        # workspace/safety boundary에 맞춰 command pose를 clamp한다.
         cmd_x, cmd_y, cmd_z = clamp_pose_mm(float(self._ref_target_xyz_mm[0]), float(self._ref_target_xyz_mm[1]), cmd_z, self.args)
+        # robot command helper에 넘기기 위한 xyz[mm] 배열이다.
         pose_mm = np.array([cmd_x, cmd_y, cmd_z], dtype=np.float32)
 
+        # 이전에 보낸 pose와 거의 같으면 불필요한 servo command를 보내지 않는다.
         if self._last_sent_pose_mm is not None:
             pos_delta = np.linalg.norm(pose_mm - self._last_sent_pose_mm)
             if pos_delta < 0.2:
                 return
 
+        # RTDE 명령은 meter 단위를 사용하므로 mm target을 m tuple로 변환한다.
         target_position_base = mm_to_m_tuple(pose_mm)
+        # servo command 전송 실패가 worker thread 종료로 이어지지 않도록 보호한다.
         try:
             self._send_robot_command(
                 ROBOT_CMD_SERVO_TO_POSITION,
@@ -1968,7 +2169,9 @@ class RobotWorker:
                 gripper_action=GRIPPER_HOLD,
                 source_mode="follow_servo",
             )
+            # servo 명령이 성공했음을 기록해 비활성화 시 stop을 보낼 수 있게 한다.
             self._was_follow_active = True
+            # 다음 tick에서 중복 명령을 줄이기 위해 마지막 command pose를 저장한다.
             self._last_sent_pose_mm = pose_mm
             # if self.args.verbose_robot:
             #     print(
@@ -1981,6 +2184,7 @@ class RobotWorker:
             #         f"cmd_m={target_position_base}"
             #     )
         except Exception as exc:
+            # servo 전송 실패를 status와 콘솔 로그에 남긴다.
             self._set_status(last_error=str(exc))
             print(f"[WARN] servo command failed: {exc}")
 
@@ -2970,24 +3174,69 @@ def execute_tactile_release_descent(
     cancel_event=None,
 ):
     """Descend in -Z until tactile release trigger or the configured lower bound."""
+    # 시작 pose[mm]에서 x, y, z만 float으로 꺼낸다.
     start_x, start_y, start_z = [float(v) for v in start_pose_mm[:3]]
+    # tactile release 하강이 내려갈 수 있는 최저 z[mm]다.
+    # HOME_PLACE_MIN_Z_MM보다 낮아지지 않게 해서 바닥/홈 안전 높이를 지킨다.
     min_z_mm = max(
         HOME_PLACE_MIN_Z_MM,
         float(getattr(args, "tactile_release_descent_min_z_mm", HOME_PLACE_MIN_Z_MM)),
     )
+    # tactile 값과 로봇 pose를 확인하는 polling 주기[sec]다.
     poll_dt = max(
         0.0,
         float(getattr(args, "tactile_release_descent_poll_dt_s", DEFAULT_TACTILE_RELEASE_DESCENT_POLL_DT_S)),
     )
+    # release reference 대비 tactile norm 변화량이 이 값보다 커지면 release trigger로 판단한다.
     delta_threshold = max(
         0.0,
         float(getattr(args, "tactile_release_delta_threshold", DEFAULT_TACTILE_RELEASE_DELTA_THRESHOLD)),
     )
+    release_stop_timing_debug = bool(
+        getattr(args, "tactile_release_stop_timing_debug", DEFAULT_TACTILE_RELEASE_STOP_TIMING_DEBUG)
+    )
+    release_stop_speed_threshold_mps = max(
+        0.0,
+        float(
+            getattr(
+                args,
+                "tactile_release_stop_speed_threshold_mps",
+                DEFAULT_TACTILE_RELEASE_STOP_SPEED_THRESHOLD_MPS,
+            )
+        ),
+    )
+    release_stop_monitor_timeout_s = max(
+        0.0,
+        float(
+            getattr(
+                args,
+                "tactile_release_stop_monitor_timeout_s",
+                DEFAULT_TACTILE_RELEASE_STOP_MONITOR_TIMEOUT_S,
+            )
+        ),
+    )
+    release_stop_monitor_poll_dt_s = max(
+        0.0,
+        float(
+            getattr(
+                args,
+                "tactile_release_stop_monitor_poll_dt_s",
+                DEFAULT_TACTILE_RELEASE_STOP_MONITOR_POLL_DT_S,
+            )
+        ),
+    )
+    # 로봇 위치 도달 판정 tolerance를 meter에서 millimeter로 변환한다.
     tolerance_mm = max(0.0, float(getattr(args, "position_tolerance_m", 0.0)) * 1000.0)
+    # 현재 release 후보 pose다. 시작 z가 min_z보다 낮으면 min_z로 올려 안전 범위 안에 둔다.
     current_pose_mm = (start_x, start_y, max(start_z, min_z_mm))
-    descent_start = time.time()
-    deadline = time.time() + max(0.0, float(getattr(args, "move_timeout_s", 0.0)))
+    # tactile descent 로그의 상대 시간을 계산하기 위한 시작 시각이다.
+    descent_start_unix = time.time()
+    descent_start_perf = time.perf_counter()
+    # 하강 move가 너무 오래 걸릴 때 빠져나오기 위한 deadline이다.
+    deadline = descent_start_unix + max(0.0, float(getattr(args, "move_timeout_s", 0.0)))
+    # tactile manager에 현재 release 하강 중임을 기록한다.
     tactile_manager.release_status = "release_descending"
+    # 하강 시작 전에 이미 cancel 요청이 있으면 로봇을 멈추고 현재 pose에서 종료한다.
     if cancel_event is not None and cancel_event.is_set():
         safe_stop_rtde(controller)
         tactile_manager.release_status = "release_cancelled"
@@ -2998,6 +3247,7 @@ def execute_tactile_release_descent(
             "release_pose_mm": current_pose_mm,
         }
 
+    # 하강 시작 조건을 콘솔에 남긴다.
     print(
         "[Tactile] Release descent start: "
         f"start=({start_x:.1f}, {start_y:.1f}, {start_z:.1f}), "
@@ -3005,6 +3255,8 @@ def execute_tactile_release_descent(
         f"delta_threshold={delta_threshold:.3f}."
     )
 
+    # 로봇에게 현재 x/y와 고정 orientation을 유지한 채 min_z까지 내려가라고 명령한다.
+    # 아래 while loop는 이 이동이 진행되는 동안 tactile trigger를 계속 감시한다.
     send_robot_command(
         controller,
         ROBOT_CMD_MOVE_TO_POSITION,
@@ -3014,34 +3266,243 @@ def execute_tactile_release_descent(
         source_mode="tactile_release_descent",
     )
 
+    def fmt_debug_value(value, precision=6, suffix=""):
+        if value is None:
+            return "-"
+        try:
+            value_float = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        if not np.isfinite(value_float):
+            return "-"
+        return f"{value_float:.{precision}f}{suffix}"
+
+    def log_release_stop_timing(event, perf_s=None, unix_s=None, **values):
+        if not release_stop_timing_debug:
+            return
+        now_perf = time.perf_counter() if perf_s is None else float(perf_s)
+        now_unix = time.time() if unix_s is None else float(unix_s)
+        elapsed_s = now_perf - descent_start_perf
+        fields = [
+            f"event={event}",
+            f"t_rel_s={elapsed_s:.6f}",
+            f"unix_s={now_unix:.6f}",
+        ]
+        for key, value in values.items():
+            fields.append(f"{key}={value}")
+        print("[TactileTiming] " + " ".join(fields), flush=True)
+
+    def compute_tcp_speed_norms(state):
+        speed = getattr(state, "actual_tcp_speed", None)
+        if speed is None or len(speed) < 3:
+            return None, None
+        try:
+            linear_values = np.asarray(speed[:3], dtype=np.float64)
+            linear_norm = float(np.linalg.norm(linear_values))
+            angular_norm = None
+            if len(speed) >= 6:
+                angular_values = np.asarray(speed[3:6], dtype=np.float64)
+                angular_norm = float(np.linalg.norm(angular_values))
+            return linear_norm, angular_norm
+        except Exception:
+            return None, None
+
+    def read_rtde_is_steady():
+        rtde_control = getattr(controller, "_rtde_control", None)
+        is_steady = getattr(rtde_control, "isSteady", None)
+        if not callable(is_steady):
+            return None
+        try:
+            return bool(is_steady())
+        except Exception as exc:
+            if release_stop_timing_debug:
+                log_release_stop_timing("isSteady_error", error=repr(exc))
+            return None
+
+    def monitor_release_stop(trigger_info, stop_issue_perf, stop_return_perf):
+        if not release_stop_timing_debug:
+            return
+
+        trigger_perf = trigger_info.get("trigger_perf_s")
+        tcp_stop_perf = None
+        steady_perf = None
+        last_linear_speed = None
+        last_angular_speed = None
+        last_is_steady = None
+        read_error = None
+        deadline_perf = time.perf_counter() + release_stop_monitor_timeout_s
+
+        while time.perf_counter() <= deadline_perf:
+            state_read_unix = time.time()
+            try:
+                state = controller.read_robot_state(now_timestamp=state_read_unix)
+                linear_speed, angular_speed = compute_tcp_speed_norms(state)
+                last_linear_speed = linear_speed
+                last_angular_speed = angular_speed
+            except Exception as exc:
+                read_error = repr(exc)
+                linear_speed = None
+                angular_speed = None
+
+            is_steady = read_rtde_is_steady()
+            observed_perf = time.perf_counter()
+            observed_unix = time.time()
+            if is_steady is not None:
+                last_is_steady = is_steady
+
+            if tcp_stop_perf is None and linear_speed is not None and linear_speed <= release_stop_speed_threshold_mps:
+                tcp_stop_perf = observed_perf
+                log_release_stop_timing(
+                    "tcp_speed_stopped",
+                    perf_s=observed_perf,
+                    unix_s=observed_unix,
+                    linear_speed_mps=fmt_debug_value(linear_speed),
+                    angular_speed=fmt_debug_value(angular_speed),
+                    threshold_mps=fmt_debug_value(release_stop_speed_threshold_mps),
+                    command_to_tcp_stop_s=fmt_debug_value(tcp_stop_perf - stop_issue_perf),
+                    trigger_to_tcp_stop_s=fmt_debug_value(tcp_stop_perf - trigger_perf),
+                )
+
+            if steady_perf is None and is_steady is True:
+                steady_perf = observed_perf
+                log_release_stop_timing(
+                    "isSteady_true",
+                    perf_s=observed_perf,
+                    unix_s=observed_unix,
+                    linear_speed_mps=fmt_debug_value(linear_speed),
+                    command_to_isSteady_s=fmt_debug_value(steady_perf - stop_issue_perf),
+                    trigger_to_isSteady_s=fmt_debug_value(steady_perf - trigger_perf),
+                )
+
+            if tcp_stop_perf is not None and steady_perf is not None:
+                break
+
+            if release_stop_monitor_poll_dt_s <= 0.0:
+                time.sleep(0.0)
+            else:
+                time.sleep(release_stop_monitor_poll_dt_s)
+
+        if tcp_stop_perf is None:
+            log_release_stop_timing(
+                "tcp_speed_stop_timeout",
+                linear_speed_mps=fmt_debug_value(last_linear_speed),
+                angular_speed=fmt_debug_value(last_angular_speed),
+                threshold_mps=fmt_debug_value(release_stop_speed_threshold_mps),
+                timeout_s=fmt_debug_value(release_stop_monitor_timeout_s),
+                read_error=read_error if read_error is not None else "-",
+            )
+        if steady_perf is None:
+            log_release_stop_timing(
+                "isSteady_timeout",
+                isSteady=last_is_steady if last_is_steady is not None else "-",
+                timeout_s=fmt_debug_value(release_stop_monitor_timeout_s),
+            )
+
+        log_release_stop_timing(
+            "actual_stop_summary",
+            trigger_to_command_s=fmt_debug_value(stop_issue_perf - trigger_perf),
+            command_call_s=fmt_debug_value(stop_return_perf - stop_issue_perf),
+            command_to_tcp_stop_s=fmt_debug_value(None if tcp_stop_perf is None else tcp_stop_perf - stop_issue_perf),
+            command_to_isSteady_s=fmt_debug_value(None if steady_perf is None else steady_perf - stop_issue_perf),
+            trigger_to_tcp_stop_s=fmt_debug_value(None if tcp_stop_perf is None else tcp_stop_perf - trigger_perf),
+            trigger_to_isSteady_s=fmt_debug_value(None if steady_perf is None else steady_perf - trigger_perf),
+        )
+
+    def stop_for_release_trigger(trigger_info):
+        stop_issue_perf = time.perf_counter()
+        stop_issue_unix = time.time()
+        log_release_stop_timing(
+            "stop_command_issue",
+            perf_s=stop_issue_perf,
+            unix_s=stop_issue_unix,
+            trigger_to_command_s=fmt_debug_value(stop_issue_perf - trigger_info.get("trigger_perf_s")),
+        )
+        safe_stop_rtde(controller)
+        stop_return_perf = time.perf_counter()
+        stop_return_unix = time.time()
+        log_release_stop_timing(
+            "stop_command_return",
+            perf_s=stop_return_perf,
+            unix_s=stop_return_unix,
+            command_call_s=fmt_debug_value(stop_return_perf - stop_issue_perf),
+            trigger_to_return_s=fmt_debug_value(stop_return_perf - trigger_info.get("trigger_perf_s")),
+        )
+        monitor_release_stop(trigger_info, stop_issue_perf, stop_return_perf)
+
     def read_current_pose_mm():
+        # RTDE에서 현재 TCP pose를 읽는다.
         state = controller.read_robot_state(now_timestamp=time.time())
         pose = state.actual_tcp_pose_base
+        # pose를 못 읽으면 None을 반환해 바깥 loop에서 안전 정지한다.
         if pose is None:
             return None
+        # controller pose는 meter 단위이므로 mm 단위 tuple로 변환한다.
         pose_mm = meters_to_mm(pose[:3])
         return tuple(float(v) for v in pose_mm[:3])
 
     def check_trigger(pose_mm):
+        # tactile sensor 전체 norm을 읽는다.
         current_norm = tactile_manager.total_norm()
+        # release reference 대비 현재 norm 변화량을 갱신하고 가져온다.
         delta_norm = tactile_manager.update_release_delta(current_norm)
+        # 현재 하강 단계의 tactile frame log를 남긴다.
         print_tactile_frame_log(
             tactile_manager,
             stage="release_descent",
-            stage_time_s=time.time() - descent_start,
+            stage_time_s=time.perf_counter() - descent_start_perf,
             z_mm=f"{pose_mm[2]:.1f}",
         )
+        # 변화량이 threshold를 넘으면 물체가 놓일 조건이 되었다고 판단한다.
         if delta_norm is not None and delta_norm > delta_threshold:
+            trigger_perf = time.perf_counter()
+            trigger_unix = time.time()
+            sample_perf = getattr(tactile_manager, "last_sample_perf_s", np.nan)
+            sample_unix = getattr(tactile_manager, "last_sample_unix_s", np.nan)
+            sample_age_s = None
+            if sample_perf is not None:
+                try:
+                    sample_perf_float = float(sample_perf)
+                    if np.isfinite(sample_perf_float):
+                        sample_age_s = trigger_perf - sample_perf_float
+                except (TypeError, ValueError):
+                    sample_age_s = None
             tactile_manager.release_status = "release_triggered"
             print(
                 "[Tactile] Release trigger detected during descent: "
                 f"norm={current_norm:.3f}, ref={tactile_manager.release_reference_norm:.3f}, "
                 f"delta={delta_norm:.3f} > {delta_threshold:.3f}."
             )
-            return True
-        return False
+            log_release_stop_timing(
+                "trigger_detected",
+                perf_s=trigger_perf,
+                unix_s=trigger_unix,
+                descent_s=fmt_debug_value(trigger_perf - descent_start_perf),
+                norm=fmt_debug_value(current_norm, precision=3),
+                ref=fmt_debug_value(tactile_manager.release_reference_norm, precision=3),
+                delta=fmt_debug_value(delta_norm, precision=3),
+                threshold=fmt_debug_value(delta_threshold, precision=3),
+                z_mm=fmt_debug_value(pose_mm[2], precision=1),
+                tactile_sample_unix_s=fmt_debug_value(sample_unix),
+                tactile_sample_age_s=fmt_debug_value(sample_age_s),
+            )
+            return {
+                "trigger_perf_s": trigger_perf,
+                "trigger_unix_s": trigger_unix,
+                "current_norm": float(current_norm),
+                "reference_norm": tactile_manager.release_reference_norm,
+                "delta_norm": float(delta_norm),
+                "delta_threshold": float(delta_threshold),
+                "pose_mm": tuple(float(v) for v in pose_mm[:3]),
+                "sample_perf_s": sample_perf,
+                "sample_unix_s": sample_unix,
+                "sample_age_s": sample_age_s,
+            }
+        # 아직 release trigger 조건을 만족하지 못했다.
+        return None
 
+    # move_to_position이 진행되는 동안 cancel, pose read, tactile trigger, min_z, timeout을 반복 확인한다.
     while True:
+        # 외부 reset/shutdown 등이 들어오면 즉시 하강을 멈추고 실패 결과를 반환한다.
         if cancel_event is not None and cancel_event.is_set():
             safe_stop_rtde(controller)
             tactile_manager.release_status = "release_cancelled"
@@ -3051,7 +3512,9 @@ def execute_tactile_release_descent(
                 "reached_min_z": False,
                 "release_pose_mm": current_pose_mm,
             }
+        # 현재 로봇 TCP 위치[mm]를 읽는다.
         pose_mm = read_current_pose_mm()
+        # pose를 읽지 못하면 더 내려가는 것이 위험하므로 멈추고 현재 후보 pose에서 open하도록 반환한다.
         if pose_mm is None:
             tactile_manager.release_status = "release_descent_pose_missing"
             safe_stop_rtde(controller)
@@ -3065,10 +3528,14 @@ def execute_tactile_release_descent(
                 "reached_min_z": False,
                 "release_pose_mm": current_pose_mm,
             }
+        # 마지막으로 읽은 실제 TCP pose를 release 후보 pose로 갱신한다.
         current_pose_mm = pose_mm
 
-        if check_trigger(current_pose_mm):
-            safe_stop_rtde(controller)
+        # tactile 변화량이 threshold를 넘었는지 확인한다.
+        trigger_info = check_trigger(current_pose_mm)
+        if trigger_info is not None:
+            # trigger가 잡히면 하강 이동을 멈추고 현재 위치를 gripper open 위치로 반환한다.
+            stop_for_release_trigger(trigger_info)
             return {
                 "triggered": True,
                 "timed_out": False,
@@ -3076,6 +3543,7 @@ def execute_tactile_release_descent(
                 "release_pose_mm": current_pose_mm,
             }
 
+        # tactile trigger가 없어도 최저 z에 도달하면 더 내려가지 않고 현재 위치에서 open한다.
         if current_pose_mm[2] <= min_z_mm + tolerance_mm:
             tactile_manager.release_status = "release_min_z_open"
             safe_stop_rtde(controller)
@@ -3090,6 +3558,7 @@ def execute_tactile_release_descent(
                 "release_pose_mm": current_pose_mm,
             }
 
+        # 지정 timeout을 넘기면 이동을 멈추고 현재 위치에서 open하도록 반환한다.
         if time.time() >= deadline:
             tactile_manager.release_status = "release_descent_move_timeout"
             safe_stop_rtde(controller)
@@ -3103,6 +3572,7 @@ def execute_tactile_release_descent(
                 "reached_min_z": False,
                 "release_pose_mm": current_pose_mm,
             }
+        # 설정된 polling 주기만큼 쉬었다가 다시 tactile/pose 상태를 확인한다.
         if poll_dt > 0.0:
             time.sleep(poll_dt)
 
@@ -3243,31 +3713,42 @@ def compute_pre_release_descend_target_mm(place_x, place_y, place_z, args):
 
 def execute_return_and_place(controller, shared_state, args, metadata_recorder=None, tactile_manager=None, cancel_event=None):
     """Run the post-grasp return, release, backoff, and HOME sequence."""
+    # 함수 시작 시 이미 cancel 요청이 들어온 상태라면 로봇을 멈추고 실패로 종료한다.
     if cancel_event is not None and cancel_event.is_set():
         safe_stop_rtde(controller)
         return False
+    # shared_state에 저장된 grasp offset/place z 샘플을 이용해 최종 place 목표 EEF 위치[mm]를 계산한다.
     target_eef_xyz, place_target_debug = compute_place_target(shared_state)
+    # place 목표를 계산할 수 없으면 이후 이동 경로를 만들 수 없으므로 중단한다.
     if target_eef_xyz is None:
         print("[WARN] Cannot compute place target.")
         return False
 
+    # 현재 공유 상태 snapshot에서 로봇 자세 고정값과 초기 pose를 가져온다.
     snap = shared_state.get_snapshot()
+    # place/return 동안 TCP orientation을 고정하기 위한 base 좌표계 orientation이다.
     fixed_orientation_base = snap["fixed_orientation_base"]
+    # HOME joint 복귀가 실패했을 때 fallback으로 돌아갈 초기 TCP pose다.
     initial_pose_base = snap["initial_pose_base"]
+    # 고정 orientation이 없으면 위치 이동 명령을 만들 수 없으므로 중단한다.
     if fixed_orientation_base is None:
         print("[WARN] No fixed orientation.")
         return False
 
+    # tactile manager가 있고 enabled이면 놓기 직전 tactile 기반 하강 로직을 사용한다.
     tactile_enabled = tactile_manager is not None and bool(getattr(tactile_manager, "enabled", False))
 
     def move_with_optional_cancel(target_position_base, fixed_orientation_base, *, timeout_s, tolerance_m, source_mode):
+        # move_robot_and_wait에 넘길 공통 이동 옵션을 모은다.
         kwargs = {
             "timeout_s": timeout_s,
             "tolerance_m": tolerance_m,
             "source_mode": source_mode,
         }
+        # cancel_event가 있으면 blocking move 중간에도 취소할 수 있도록 전달한다.
         if cancel_event is not None:
             kwargs["cancel_event"] = cancel_event
+        # 지정한 target position/orientation으로 이동 명령을 보내고 도달 여부를 기다린다.
         return move_robot_and_wait(
             controller,
             target_position_base,
@@ -3275,35 +3756,48 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
             **kwargs,
         )
 
+    # compute_place_target이 만든 기본 place 목표 좌표[mm]를 분리한다.
     target_x, target_y, target_z = target_eef_xyz
+    # 목표 좌표가 workspace 범위를 넘지 않도록 clamp한다.
     target_x, target_y, target_z = clamp_pose_mm(target_x, target_y, target_z, args)
 
+    # 물체를 든 상태로 바로 place 지점에 가지 않고, 먼저 위쪽 hover 지점으로 이동한다.
     hover_z = target_z + HOVER_Z_OFFSET_MM
+    # hover 지점도 workspace 범위 안에 들어오도록 보정한다.
     hover_x, hover_y, hover_z = clamp_pose_mm(target_x, target_y, hover_z, args)
 
+    # 실제 release 직전까지 내려갈 place z를 계산한다.
     place_z = target_z + DESCEND_EXTRA_MM
+    # place 위치 역시 workspace/safety boundary 안으로 제한한다.
     place_x, place_y, place_z = clamp_pose_mm(target_x, target_y, place_z, args)
+    # gripper open 직전 추가 하강이 켜져 있으면 release pose를 따로 계산한다.
     release_pose_mm, pre_release_debug = compute_pre_release_descend_target_mm(place_x, place_y, place_z, args)
+    # release pose를 x/y/z 변수로 분리해 이후 tactile 또는 gripper open 위치로 사용한다.
     release_x, release_y, release_z = release_pose_mm
 
+    # place z 계산에 사용된 grasp z median을 로그 문자열로 만든다.
     grasp_z_med_text = (
         "-"
         if place_target_debug["grasp_z_median_mm"] is None
         else f"{float(place_target_debug['grasp_z_median_mm']):.1f}"
     )
+    # template bottom z median을 로그 문자열로 만든다.
     template_bottom_z_med_text = (
         "-"
         if place_target_debug["template_bottom_z_median_mm"] is None
         else f"{float(place_target_debug['template_bottom_z_median_mm']):.1f}"
     )
+    # 보정 전 raw place z를 로그 문자열로 만든다.
     raw_place_z_text = (
         "-"
         if place_target_debug["raw_place_z_mm"] is None
         else f"{float(place_target_debug['raw_place_z_mm']):.1f}"
     )
 
+    # return/place 시퀀스에서 사용할 주요 target을 콘솔에 출력한다.
     print(f"[INFO] RETURN hover target: ({hover_x:.1f}, {hover_y:.1f}, {hover_z:.1f})")
     print(f"[INFO] PLACE target: ({place_x:.1f}, {place_y:.1f}, {place_z:.1f})")
+    # place z가 어떤 기준으로 계산됐는지 디버그 정보를 출력한다.
     print(
         "[INFO] PLACE z debug: "
         f"grasp_z_med={grasp_z_med_text} "
@@ -3311,6 +3805,7 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
         f"raw_place_z={raw_place_z_text} "
         f"fallback={place_target_debug['used_fallback']}"
     )
+    # tactile release가 없고 pre-release descend 옵션이 켜졌다면 고정 거리 하강 정보를 출력한다.
     if pre_release_debug["enabled"] and not tactile_enabled:
         print(
             "[INFO] PRE-release descend target: "
@@ -3319,6 +3814,7 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
             f"unclamped_z={pre_release_debug['unclamped_z_mm']:.1f} mm, "
             f"home_guard_applied={pre_release_debug['home_guard_applied']}"
         )
+    # tactile release가 켜져 있으면 고정 하강 거리 대신 tactile 조건 기반 하강을 사용한다고 출력한다.
     elif tactile_enabled:
         print(
             "[INFO] Tactile release descent enabled. "
@@ -3326,14 +3822,18 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
             f"min_z={float(getattr(args, 'tactile_release_descent_min_z_mm', HOME_PLACE_MIN_Z_MM)):.1f} mm."
         )
 
+    # gripper를 열기 전 기본 이동 경로: hover 위치로 복귀한 뒤 place 위치로 내려간다.
     move_sequence = [
         ("return_hover", [hover_x, hover_y, hover_z]),
         ("return_place", [place_x, place_y, place_z]),
     ]
+    # 각 이동 단계는 timeout/tolerance/cancel을 적용해 순서대로 실행한다.
     for source_mode, pose_mm in move_sequence:
+        # 이동 시작 전 cancel 요청이 있으면 즉시 정지하고 실패 처리한다.
         if cancel_event is not None and cancel_event.is_set():
             safe_stop_rtde(controller)
             return False
+        # mm 단위 target을 m 단위로 바꿔 로봇 이동을 실행하고 도달 여부를 기다린다.
         ok = move_with_optional_cancel(
             mm_to_m_tuple(pose_mm),
             fixed_orientation_base,
@@ -3341,22 +3841,27 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
             tolerance_m=args.position_tolerance_m,
             source_mode=source_mode,
         )
+        # 특정 이동 단계가 timeout되면 전체 return/place 시퀀스를 실패로 끝낸다.
         if not ok:
             print(f"[WARN] Move timed out during {source_mode}.")
             return False
 
+    # tactile release 모드에서는 놓기 전 현재 tactile 값을 기준값으로 캡처한다.
     if tactile_enabled:
         capture_tactile_release_reference(
             tactile_manager,
             delay_s=getattr(args, "tactile_release_ref_delay_s", DEFAULT_TACTILE_RELEASE_REF_DELAY_S),
             cancel_event=cancel_event,
         )
+        # tactile reference 캡처 중 cancel되었으면 로봇을 멈추고 종료한다.
         if cancel_event is not None and cancel_event.is_set():
             safe_stop_rtde(controller)
             return False
+        # tactile 기반 하강 함수에 cancel_event를 선택적으로 넘기기 위한 kwargs다.
         descent_kwargs = {}
         if cancel_event is not None:
             descent_kwargs["cancel_event"] = cancel_event
+        # tactile 변화량을 보면서 release에 적절한 위치까지 추가 하강한다.
         descent_result = execute_tactile_release_descent(
             controller,
             tactile_manager,
@@ -3365,7 +3870,9 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
             args,
             **descent_kwargs,
         )
+        # tactile 하강 결과로 결정된 실제 release pose를 이후 open/backoff 기준으로 사용한다.
         release_x, release_y, release_z = descent_result["release_pose_mm"]
+    # tactile이 없고 pre-release descend가 켜져 있으면 고정 거리만큼 release pose로 이동한다.
     elif pre_release_debug["enabled"]:
         ok = move_with_optional_cancel(
             mm_to_m_tuple([release_x, release_y, release_z]),
@@ -3374,18 +3881,22 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
             tolerance_m=args.position_tolerance_m,
             source_mode="pre_release_descend_before_open",
         )
+        # pre-release 하강 이동이 실패하면 gripper를 열지 않고 종료한다.
         if not ok:
             print("[WARN] Pre-release descend move timed out.")
             return False
 
+    # release pose에서 gripper를 열어 물체를 놓는다.
     execute_gripper_open(
         controller,
         dwell_s=args.gripper_release_dwell_s,
         metadata_recorder=metadata_recorder,
         cancel_event=cancel_event,
     )
+    # gripper open 중 cancel이 들어왔으면 이후 후퇴/HOME 동작 없이 실패 처리한다.
     if cancel_event is not None and cancel_event.is_set():
         return False
+    # tactile 모드에서는 물체를 놓은 뒤 baseline을 다시 잡아 다음 task에 영향을 줄인다.
     if tactile_enabled:
         reset_tactile_baseline_after_open(
             tactile_manager,
@@ -3397,14 +3908,18 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
             cancel_event=cancel_event,
         )
 
+    # release 이후 위쪽으로 살짝 올라갈 z 목표를 계산한다.
     post_release_z = max(release_z + float(args.post_release_z_offset_mm), HOME_PLACE_MIN_Z_MM)
+    # post-release 위치도 workspace 범위 안으로 제한한다.
     post_release_x, post_release_y, post_release_z = clamp_pose_mm(release_x, release_y, post_release_z, args)
+    # 설정된 post-release z offset이 있으면 실제 상승 이동을 수행한다.
     if abs(float(args.post_release_z_offset_mm)) > 1e-6:
         print(
             "[INFO] POST-release Z target: "
             f"({post_release_x:.1f}, {post_release_y:.1f}, {post_release_z:.1f}), "
             f"offset={float(args.post_release_z_offset_mm):.1f} mm"
         )
+        # gripper open 후 물체와의 간섭을 줄이기 위해 z 방향으로 이동한다.
         ok = move_with_optional_cancel(
             mm_to_m_tuple([post_release_x, post_release_y, post_release_z]),
             fixed_orientation_base,
@@ -3412,12 +3927,16 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
             tolerance_m=args.position_tolerance_m,
             source_mode="post_release_z_move",
         )
+        # post-release 이동 실패 시 전체 시퀀스를 실패로 끝낸다.
         if not ok:
             print("[WARN] Post-release Z move timed out.")
             return False
 
+    # place 위치에서 x 방향으로 물러나 HOME 복귀 전 물체와 거리를 둔다.
     backoff_x = place_x - BACKOFF_X_MM
+    # backoff target도 workspace/safety boundary 안으로 제한한다.
     backoff_x, backoff_y, backoff_z = clamp_pose_mm(backoff_x, place_y, post_release_z, args)
+    # 물체를 놓은 뒤 후퇴 이동을 실행한다.
     ok = move_with_optional_cancel(
         mm_to_m_tuple([backoff_x, backoff_y, backoff_z]),
         fixed_orientation_base,
@@ -3425,20 +3944,27 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
         tolerance_m=args.position_tolerance_m,
         source_mode="return_backoff",
     )
+    # 후퇴 이동이 실패하면 HOME 복귀를 시도하지 않고 실패 처리한다.
     if not ok:
         print("[WARN] Back off move timed out.")
         return False
 
+    # 정상 경로에서는 joint HOME pose로 복귀한다.
     try:
         home_ok = move_robot_to_home_pose(controller, args, cancel_event=cancel_event)
+        # HOME 이동이 cancel로 False를 반환하면 실패 처리한다.
         if home_ok is False:
             return False
+    # HOME joint 복귀가 예외로 실패하면 초기 TCP pose로 fallback 복귀를 시도한다.
     except Exception as exc:
         print(f"[WARN] Return to HOME joints failed: {exc}")
+        # 초기 pose 기록이 없으면 fallback 이동도 불가능하다.
         if initial_pose_base is None:
             return False
+        # 초기 pose에서 position과 orientation을 분리한다.
         initial_target = tuple(float(v) for v in initial_pose_base[:3])
         initial_orientation = tuple(float(v) for v in initial_pose_base[3:6])
+        # HOME 대신 초기 TCP pose로 복귀한다.
         ok = move_with_optional_cancel(
             initial_target,
             initial_orientation,
@@ -3446,16 +3972,20 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
             tolerance_m=args.position_tolerance_m,
             source_mode="return_initial_pose",
         )
+        # 초기 pose 복귀도 실패하면 전체 시퀀스를 실패로 끝낸다.
         if not ok:
             print("[WARN] Return to initial pose timed out.")
             return False
 
+    # metadata recorder가 있으면 최종 delivery location을 기록한다.
     if metadata_recorder is not None:
         home_xyz = None if shared_state.home_object_xyz_mm is None else shared_state.home_object_xyz_mm.copy()
         metadata_recorder.note_delivery_location(home_xyz)
 
+    # task state를 DONE으로 바꾸고 prediction/arm 상태를 다음 task를 위해 초기화한다.
     shared_state.set_task_state("DONE", reset_prediction=True, reset_arm=True)
 
+    # return/place 전체 시퀀스가 성공했음을 알린다.
     print("[INFO] RETURN + PLACE done")
     return True
 
@@ -3933,163 +4463,273 @@ def render_cam0_perception_debug(
 
 def main():
     """Run the full dual-camera handover loop and handle keyboard controls."""
+    # 커맨드라인 인자를 읽어 기본 실행 옵션을 만든다.
     args = parse_args()
+    # 인자로 지정된 YAML 설정 파일을 로드한다.
     config = load_yaml_config(args.config)
+    # YAML에 들어 있는 기본값을 커맨드라인 인자에 반영한다.
     args = apply_config_defaults(args, config)
 
+    # 듀얼 카메라 모드에서는 개별 시리얼 인자를 사용하지 않으므로 경고만 출력한다.
     if args.serial is not None:
         print("[WARN] --serial is ignored in the dual-camera grasp-target mode. Camera selection comes from configs/handover.yaml")
 
+    # 카메라, 검출기, 융합기, 로봇 좌표 변환 등 전체 perception 파이프라인을 구성한다.
     pipeline = build_dual_perception_pipeline(args)
+    # 두 카메라 프레임을 동기화해서 공급하는 센서 허브를 가져온다.
     sensor_hub = pipeline["sensor_hub"]
+    # 촉각 센서 옵션이 켜져 있으면 AnySkin tactile manager를 생성한다.
     tactile_manager = AnySkinTactileManager(args) if bool(getattr(args, "tactile_enabled", False)) else None
+    # tactile manager가 생성된 경우 별도 수집 루프를 시작한다.
     if tactile_manager is not None:
         tactile_manager.start()
+    # 듀얼 카메라 스트리밍을 시작한다.
     sensor_hub.start()
 
+    # 런타임 로그에 남길 YOLO 모델 이름을 prompt class 정보까지 포함해 만든다.
     yolo_model = args.model if not pipeline["prompt_classes"] else f"{args.model} ({','.join(pipeline['prompt_classes'])})"
     # gpu, cpu 리소스 속도 파악
+    # 프레임별 처리 시간과 시스템 리소스 사용량을 기록할 profiler를 준비한다.
     runtime_profiler = RuntimeProfiler(
+        # --profile-runtime 옵션이 켜진 경우에만 profiler가 실제로 동작한다.
         enabled=bool(args.profile_runtime),
+        # 저장될 runtime profile 파일의 출력 디렉터리다.
         output_dir=args.profile_dir,
+        # CPU/GPU 샘플링 주기다.
         sample_interval_s=args.profile_sample_interval_s,
+        # 콘솔에 profiler 요약을 출력할 주기다.
         print_every_s=args.profile_print_every_s,
+        # 실행 조건, 모델, 카메라 설정 등 profile 메타데이터를 함께 저장한다.
         run_context=build_runtime_profile_context(args, yolo_model, pipeline),
     )
+    # profiler가 켜져 있으면 저장 단축키를 사용자에게 알려준다.
     if runtime_profiler.enabled:
         print(f"[INFO] Runtime profiler enabled. Press 's' to save logs to {args.profile_dir}.")
     
+    # cam0 디버그 화면의 OpenCV 창 이름이다.
     cam0_window_name = "cam0_grasp_target_follow"
+    # cam1 미리보기 화면의 OpenCV 창 이름이다.
     cam1_window_name = "cam1_view"
     
     # depth_window_name = "cam0_depth"
 
+    # 지수 이동 평균으로 부드럽게 표시할 FPS 값이다.
     smoothed_fps = 0.0
+    # 이전 루프가 끝난 perf_counter 시각을 저장해 순간 FPS를 계산한다.
     last_loop_time = time.perf_counter()
     # previous_hand_approach = False
 
+    # 메인 스레드와 로봇 스레드가 공유하는 target/follow 상태 객체다.
     shared_state = FollowSharedState(args)
+    # task ready, geometry, completion 같은 handover 메타데이터를 저장하는 recorder다.
     metadata_recorder = HandoverMetadataRecorder()
+    # 영상 녹화 서비스는 옵션이 켜졌을 때만 생성하므로 우선 None으로 둔다.
     video_recorder = None
+    # 로봇 제어 worker 역시 follow 옵션이 켜졌을 때만 생성하므로 우선 None으로 둔다.
     robot_worker = None
+    # 로봇 worker가 없거나 아직 상태를 못 받은 경우를 위한 기본 상태 객체다.
     robot_status = RobotStatus()
+    # task_ready 이벤트를 중복 처리하지 않기 위해 마지막으로 처리한 epoch를 보관한다.
     last_task_ready_epoch = 0
+    # reset 완료 이벤트를 중복 처리하지 않기 위해 마지막으로 처리한 epoch를 보관한다.
     last_reset_done_epoch = 0
+    # task_done 이벤트를 중복 처리하지 않기 위해 마지막으로 처리한 epoch를 보관한다.
     last_task_done_epoch = 0
+    # reset이 끝났을 때 runtime profile을 폐기할 사유를 임시로 저장한다.
     pending_reset_reason = None
+    # grasp/place 요청이 이미 들어갔는지 추적해 중복 명령을 막는다.
     grasp_request_pending = False
+    # 현재 perception fallback 상태가 어느 task epoch에 해당하는지 추적한다.
     active_task_epoch = None
+    # 현재 task의 녹화 시작 perf_counter 시각이다.
     task_record_start_perf = None
+    # 3D 디버그가 요청됐고 비활성화 옵션이 없을 때만 recorder를 켠다.
     debug_3d_enabled = bool(args.debug_3d) and not bool(args.disable_debug_3d_recording)
+    # raw image 저장은 3D debug recorder가 있어야 가능하므로 잘못된 조합을 경고한다.
     if args.save_image and not debug_3d_enabled:
         print("[WARN] --save-image requires --3d-debug; raw image/depth capture is disabled.")
+    # 3D debug recorder는 옵션이 켜졌을 때만 생성한다.
     debug_3d_recorder = None
+    # 3D debug recording이 활성화된 경우 recorder를 구성한다.
     if debug_3d_enabled:
         debug_3d_recorder = Debug3DRecorder(
+            # 3D debug 로그가 저장될 디렉터리다.
             output_dir=args.debug_3d_dir,
+            # 이 블록에 들어왔으므로 recorder를 활성 상태로 만든다.
             enabled=True,
+            # raw color/depth 프레임까지 저장할지 결정한다.
             save_images=bool(args.save_image),
+            # object point cloud 저장량을 제한한다.
             max_object_points=args.debug_3d_max_object_points,
+            # template point cloud 저장량을 제한한다.
             max_template_points=args.debug_3d_max_template_points,
+            # template axis 정보까지 저장할지 결정한다.
             record_template_axes=bool(args.debug_3d_template_axes),
         )
+        # d 키로 저장 및 reset할 수 있음을 콘솔에 안내한다.
         print(f"[INFO] 3D debug recorder armed. Press 'd' to save to {args.debug_3d_dir} and reset.")
+        # raw image 저장이 켜진 경우 추가 저장 정보를 안내한다.
         if debug_3d_recorder.save_images:
             print("[INFO] 3D debug recorder will include raw color/depth frames.")
 
+    # 영상 recorder의 web UI 사용 여부를 YAML 설정에서 가져온다.
     video_recorder_web_ui_enabled = get_video_recorder_web_ui_enabled(config)
+    # 영상 recorder와 함께 촉각 로그를 남길지 YAML 설정에서 가져온다.
     video_recorder_tactile_logging = get_video_recorder_tactile_logging_config(config)
+    # --record-video 옵션이 켜진 경우 녹화 서비스를 시작한다.
     if args.record_video:
+        # 녹화 장치나 서버 초기화 실패가 전체 perception loop를 죽이지 않도록 보호한다.
         try:
+            # handover 영상, 메타데이터, 촉각 로그를 관리하는 recorder service를 만든다.
             video_recorder = HandoverVideoRecorderService(
+                # 녹화용 카메라 또는 장치의 고정 시리얼이다.
                 serial=VIDEO_RECORDER_SERIAL,
+                # web UI 또는 recorder server가 사용할 포트다.
                 port=VIDEO_RECORDER_PORT,
+                # 녹화와 task metadata를 연결하기 위한 recorder다.
                 metadata_recorder=metadata_recorder,
+                # web UI를 띄울지 여부다.
                 web_ui_enabled=video_recorder_web_ui_enabled,
+                # tactile 로그를 함께 저장하기 위한 manager다.
                 tactile_manager=tactile_manager,
+                # tactile logging 전체 enable flag다.
                 tactile_logging_enabled=video_recorder_tactile_logging["enabled"],
+                # tactile CSV 저장 여부다.
                 tactile_csv_enabled=video_recorder_tactile_logging["csv_enabled"],
+                # tactile rerun 로그 저장 여부다.
                 tactile_rerun_enabled=video_recorder_tactile_logging["rerun_enabled"],
+                # tactile rerun live streaming 여부다.
                 tactile_rerun_live=video_recorder_tactile_logging["rerun_live"],
             )
+            # recorder 서버를 실제로 시작하고 상태 문자열을 받는다.
             recorder_status = video_recorder.start_server()
+            # web UI가 켜져 있으면 UI 접속 준비 상태를 출력한다.
             if video_recorder.is_web_ui_enabled:
                 print(f"[INFO] Video recorder UI ready: {recorder_status}")
+            # web UI가 꺼져 있으면 s 키로 바로 저장하는 모드임을 출력한다.
             else:
                 print(f"[INFO] Video recorder ready; web UI disabled; press s to save directly. {recorder_status}")
+        # recorder 초기화 실패 시 경고만 출력하고 나머지 시스템은 계속 실행한다.
         except Exception as exc:
             video_recorder = None
             print(f"[WARN] Failed to start video recorder service: {exc}")
 
+    # 로봇 follow 제어가 켜진 경우 별도 worker thread를 생성한다.
     if args.enable_follow:
         robot_worker = RobotWorker(
+            # 로봇 제어에 필요한 실행 옵션이다.
             args,
+            # 메인 perception loop와 공유할 target/follow 상태다.
             shared_state,
+            # 로봇 task 진행 상태를 metadata로 남기기 위한 recorder다.
             metadata_recorder=metadata_recorder,
+            # grasp/place 중 tactile 정보를 참조할 수 있게 전달한다.
             tactile_manager=tactile_manager,
         )
+        # 로봇 worker thread를 시작한다.
         robot_worker.start()
+        # 로봇 연결과 초기 상태 설정을 요청한다.
         robot_worker.submit(RobotRequest(ROBOT_REQ_INIT_ROBOT))
+        # 초기화 이후 target following을 시작하도록 요청한다.
         robot_worker.submit(RobotRequest(ROBOT_REQ_START_FOLLOW))
 
+    # 예외나 q 종료가 발생해도 아래 finally에서 장치와 thread를 정리한다.
     try:
+        # q/ESC 입력이 들어올 때까지 실시간 handover loop를 계속 돈다.
         while True:
+            # wall-clock timestamp는 로그와 외부 기록용으로 사용한다.
             current_time = time.time()
+            # perf_counter timestamp는 프레임 내부 경과 시간 계산에 사용한다.
             loop_perf = time.perf_counter()
+            # 전체 loop 처리 시간을 profiler에 넣기 위한 시작 시각이다.
             loop_total_start = time.perf_counter()
+            # 공유 상태를 읽을 때는 robot worker와의 경쟁을 피하기 위해 lock을 잡는다.
             with shared_state.lock:
+                # 현재 task epoch를 읽어 frame과 metadata를 같은 task 단위로 묶는다.
                 current_task_epoch = int(shared_state.task_epoch)
+                # 로봇 motion이 이미 trigger됐는지 읽어 fallback 판단에 사용한다.
                 motion_triggered = bool(shared_state.motion_triggered)
+            # 로봇 worker가 있을 때는 상태 epoch와 에러 상태를 매 프레임 확인한다.
             if robot_worker is not None:
+                # worker가 유지하는 최신 로봇 상태 snapshot을 가져온다.
                 robot_status = robot_worker.get_status()
+                # 로봇 reset 완료 epoch가 바뀌면 메인 thread 쪽 perception state도 reset한다.
                 if robot_status.reset_done_epoch != last_reset_done_epoch:
+                    # 같은 reset 이벤트를 다시 처리하지 않도록 epoch를 갱신한다.
                     last_reset_done_epoch = int(robot_status.reset_done_epoch)
+                    # object/hand/fusion/fallback 등 perception pipeline 내부 상태를 초기화한다.
                     reset_perception_pipeline_for_system_reset(pipeline)
+                    # reset 후 이전 3D debug buffer가 섞이지 않게 비운다.
                     if debug_3d_recorder is not None:
                         debug_3d_recorder.clear()
+                    # reset 요청 때문에 profile을 버려야 한다면 여기서 폐기한다.
                     if pending_reset_reason is not None:
                         discard_runtime_profile(runtime_profiler, reason=pending_reset_reason)
                         pending_reset_reason = None
+                    # reset 이후에는 이전 grasp 요청 상태를 무효화한다.
                     grasp_request_pending = False
+                    # 메인 thread perception reset이 끝났음을 알린다.
                     print("[INFO] Main-thread perception reset complete after robot reset.")
+                # task ready epoch가 바뀌면 새 handover trial 기록을 시작한다.
                 if robot_status.task_ready_epoch != last_task_ready_epoch:
+                    # 같은 task_ready 이벤트를 중복 처리하지 않도록 epoch를 갱신한다.
                     last_task_ready_epoch = int(robot_status.task_ready_epoch)
+                    # metadata recorder에 task 시작 시각과 shared state snapshot을 기록한다.
                     task_ready_timestamp = metadata_recorder.mark_task_ready(shared_state)
+                    # 영상과 debug 로그의 task-relative elapsed time 기준점을 잡는다.
                     task_record_start_perf = time.perf_counter()
+                    # metadata 시작 timestamp를 콘솔에 남긴다.
                     print(f"[INFO] Metadata task start timestamp={task_ready_timestamp}")
+                    # 영상 녹화가 켜져 있으면 task 시작 timestamp에 맞춰 녹화를 시작한다.
                     start_task_video_recording(video_recorder, task_ready_timestamp)
+                # task done epoch가 바뀌면 grasp 요청 pending 상태를 해제한다.
                 if robot_status.task_done_epoch != last_task_done_epoch:
                     last_task_done_epoch = int(robot_status.task_done_epoch)
                     grasp_request_pending = False
+                # 로봇 에러 상태에서는 새 grasp 요청을 막는다.
                 if robot_status.state == ROBOT_STATE_ERROR:
                     grasp_request_pending = False
+            # profiler에 새 frame 기록을 시작한다.
             runtime_profiler.start_frame(timestamp_unix_s=current_time, task_epoch=current_task_epoch)
+            # task epoch가 바뀌면 이전 task의 hand-relative fallback state를 초기화한다.
             if current_task_epoch != active_task_epoch:
                 pipeline["hand_relative_fallback"].reset()
                 active_task_epoch = current_task_epoch
 
+            # 두 카메라에서 시간 동기화된 frame pair를 읽는 구간을 측정한다.
             with runtime_profiler.stage("read_pair"):
                 snapshot = sensor_hub.read_next_pair()
 
+            # cam0에서 object detection/segmentation을 수행한다.
             with runtime_profiler.stage("object_cam0"):
                 object_cam0 = pipeline["object_worker_cam0"].process_frame(snapshot.cam0, frame_id=snapshot.pair_index)
+            # cam1에서 object detection/segmentation을 수행한다.
             with runtime_profiler.stage("object_cam1"):
                 object_cam1 = pipeline["object_worker_cam1"].process_frame(snapshot.cam1, frame_id=snapshot.pair_index)
+            # cam0에서 hand detector/tracker를 수행한다.
             with runtime_profiler.stage("hand_cam0"):
                 hand_cam0 = pipeline["hand_worker_cam0"].process_frame(snapshot.cam0, frame_id=snapshot.pair_index)
+            # cam1에서 hand detector/tracker를 수행한다.
             with runtime_profiler.stage("hand_cam1"):
                 hand_cam1 = pipeline["hand_worker_cam1"].process_frame(snapshot.cam1, frame_id=snapshot.pair_index)
+            # 두 카메라의 hand/object 상태를 하나의 상태로 합치는 구간이다.
             with runtime_profiler.stage("merge"):
+                # 두 카메라 중 현재 가장 신뢰할 수 있는 hand state를 선택한다.
                 selected_hand = pipeline["hand_selector"].process_states(hand_cam0, hand_cam1)
+                # 두 카메라 object state를 base 좌표계 기준 object state로 병합한다.
                 merged_object = pipeline["object_merger"].process_states(
                     object_cam0,
                     object_cam1,
                     # hand_approach_detected=previous_hand_approach,
                 )
+            # 병합된 object point cloud에 형상 fitting/tracking을 수행한다.
             with runtime_profiler.stage("shape_fit"):
                 shape_fitting_state = pipeline["shape_fitting_tracker"].process(merged_object)
+                # fitting 결과를 metadata recorder에 업데이트한다.
                 metadata_recorder.update_geometry(shape_fitting_state, now_perf=loop_perf)
+            # cam0 object worker가 남긴 debug 정보를 가져온다.
             object_debug_cam0 = getattr(pipeline["object_worker_cam0"], "last_debug", None)
+            # fill-level 추정 등에 사용할 수 있는 cam0 object mask를 꺼낸다.
             cam0_mask = None if object_debug_cam0 is None else getattr(object_debug_cam0, "combined_mask", None)
             # with runtime_profiler.stage("fill_level"):
             #     fill_estimate = pipeline["fill_level_estimator"].estimate_fill_level_from_cam0(
@@ -4105,13 +4745,17 @@ def main():
             #         shape_fitting_state=shape_fitting_state,
             #         now_perf=loop_perf,
             #     )
+            # object-hand fusion과 grasp target 계산을 같은 profiler stage로 묶는다.
             with runtime_profiler.stage("fusion_grasp"):
+                # shape fitting 결과가 있으면 merged object에 fitted geometry를 반영한다.
                 fitted_merged_object = build_fitted_merged_object(merged_object, shape_fitting_state)
+                # object와 hand 상태를 융합해 hand 접근, latch, filtering 상태를 계산한다.
                 fusion_state = pipeline["fusion"].process_states(
                     fitted_merged_object,
                     selected_hand,
                     now_timestamp=current_time,
                 )
+                # 융합된 상태를 바탕으로 로봇이 잡을 목표 grasp point를 계산한다.
                 grasp_target = pipeline["grasp_planner"].process_states(
                     fitted_merged_object,
                     selected_hand,
@@ -4121,40 +4765,58 @@ def main():
                 #     fusion_state.hand_approach_detected or fusion_state.hand_approach_latched
                 # )
 
+                # filtering된 centroid가 있으면 우선 사용하고, 없으면 fitted object centroid를 사용한다.
                 measured_object_point_base = choose_point(
                     fusion_state.filtered_object_centroid_base,
                     fitted_merged_object.centroid_base,
                 )
+                # planner가 유효한 grasp target을 냈을 때만 grasp point를 사용한다.
                 measured_grasp_point_base = grasp_target.target_position_base if grasp_target.valid else None
+                # 실제 로봇 grasp 위치 보정을 위해 base 좌표계 y축 offset을 적용한다.
                 measured_grasp_point_base = offset_point_base_mm(
                     measured_grasp_point_base,
                     y_mm=GRASP_POINT_Y_OFFSET_MM,
                 )
+            # task recording이 시작된 뒤 현재 frame이 몇 초 지났는지 계산한다.
             frame_record_elapsed_s = (
                 None
                 if task_record_start_perf is None
                 else max(float(loop_perf) - float(task_record_start_perf), 0.0)
             )
+            # object/grasp 측정이 끊겼을 때 hand-relative fallback을 계산한다.
             with runtime_profiler.stage("fallback"):
                 hand_relative_fallback_state = pipeline["hand_relative_fallback"].process(
+                    # 실제 측정된 object 위치다.
                     measured_object_position_base=measured_object_point_base,
+                    # 실제 측정된 grasp 위치다.
                     measured_grasp_position_base=measured_grasp_point_base,
+                    # 현재 선택된 hand state다.
                     selected_hand=selected_hand,
+                    # object-hand fusion 결과다.
                     fusion_state=fusion_state,
+                    # 로봇 motion trigger 여부다.
                     motion_triggered=motion_triggered,
+                    # 현재 wall-clock timestamp다.
                     now_timestamp=current_time,
+                    # 현재 동기화 frame id다.
                     frame_id=snapshot.pair_index,
+                    # task recording 기준 elapsed time이다.
                     record_elapsed_s=frame_record_elapsed_s,
                 )
 
+            # 기본적으로는 measured object point를 최종 object point로 사용한다.
             object_point_base = measured_object_point_base
+            # 기본적으로는 measured grasp point를 최종 grasp point로 사용한다.
             grasp_point_base = measured_grasp_point_base
+            # 최종 target이 실제 측정값에서 왔음을 표시한다.
             measurement_source = "measured"
+            # object 측정이 끊겼고 fallback이 유효하면 hand-relative 예측값으로 대체한다.
             if measured_object_point_base is None and hand_relative_fallback_state.valid:
                 object_point_base = hand_relative_fallback_state.object_position_base
                 grasp_point_base = hand_relative_fallback_state.grasp_position_base
                 measurement_source = "hand_fallback"
 
+            # 최종 object base 좌표를 cam0 이미지 픽셀로 재투영해 overlay와 shared state에 사용한다.
             object_pixel = project_base_point_to_cam0(
                 object_point_base,
                 snapshot.cam0.intrinsics,
@@ -4163,44 +4825,72 @@ def main():
                 snapshot.cam0.color_image.shape[0],
             )
 
+            # 현재 end-effector pose는 필요할 때만 robot status에서 읽는다.
             eef_pose_base = None
+            # shared state에는 end-effector xyz를 mm 단위로 넣기 위해 별도 변수로 둔다.
             eef_xyz_mm = None
+            # object target이 있거나 3D debug 기록이 켜져 있으면 로봇 pose가 필요하다.
             need_robot_pose = object_point_base is not None or debug_3d_recorder is not None
+            # 로봇 worker가 있고 pose가 필요한 frame에서만 status를 다시 읽는다.
             if robot_worker is not None and need_robot_pose:
+                # robot status read 시간도 profiler stage로 기록한다.
                 with runtime_profiler.stage("robot_read"):
                     robot_status = robot_worker.get_status()
+                # status에 최신 robot pose가 있으면 tuple(float) 형태로 정규화한다.
                 if robot_status.last_robot_pose is not None:
                     eef_pose_base = tuple(float(v) for v in robot_status.last_robot_pose)
+                    # robot pose의 xyz[m]를 xyz[mm]로 변환한다.
                     eef_xyz_mm = meters_to_mm(eef_pose_base[:3])
 
+            # 3D debug recorder가 켜져 있으면 현재 frame의 모든 중간 결과를 buffer에 쌓는다.
             if debug_3d_recorder is not None:
+                # debug frame append 시간도 profiler에 기록한다.
                 with runtime_profiler.stage("debug_3d"):
                     append_debug_3d_frame(
+                        # 누적 저장할 recorder 객체다.
                         debug_3d_recorder,
+                        # 현재 듀얼 카메라 frame pair다.
                         snapshot=snapshot,
+                        # frame의 wall-clock timestamp다.
                         current_time=current_time,
+                        # frame의 perf_counter timestamp다.
                         loop_perf=loop_perf,
+                        # task recording 기준 elapsed time이다.
                         record_elapsed_s=frame_record_elapsed_s,
+                        # 현재 task epoch다.
                         current_task_epoch=current_task_epoch,
+                        # perception pipeline과 calibration 정보를 포함한다.
                         pipeline=pipeline,
+                        # 선택된 hand state다.
                         selected_hand=selected_hand,
+                        # 병합된 object state다.
                         merged_object=merged_object,
+                        # shape fitting 결과다.
                         shape_fitting_state=shape_fitting_state,
+                        # 최종 object target base 좌표다.
                         object_point_base=object_point_base,
+                        # 최종 grasp target base 좌표다.
                         grasp_point_base=grasp_point_base,
+                        # 현재 end-effector pose다.
                         eef_pose_base=eef_pose_base,
+                        # measured인지 fallback인지 저장한다.
                         measurement_source=measurement_source,
+                        # 촉각 상태도 함께 저장할 수 있게 전달한다.
                         tactile_manager=tactile_manager,
                     )
 
+            # 최종 object target이 있으면 shared state를 갱신하고 필요 시 grasp/place를 시작한다.
             if object_point_base is not None:
+                # target update 구간 시간을 profiler에 기록한다.
                 with runtime_profiler.stage("target_update"):
+                    # place z 보정을 위해 grasp/object/fitted point 샘플을 shared state에 누적한다.
                     shared_state.update_place_z_samples(
                         grasp_point_base=grasp_point_base,
                         object_point_base=object_point_base,
                         fitted_points_base=shape_fitting_state.fitted_points_base,
                     )
 
+                    # 로봇 worker가 따라갈 최신 target을 shared state에 기록한다.
                     shared_state.update_target(
                         grasp_point_base,
                         object_point_base,
@@ -4209,44 +4899,63 @@ def main():
                         measurement_source=measurement_source,
                         object_label=merged_object.label,
                     )
+                # 로봇이 pregrasp pose에 도달했고 아직 grasp 요청이 없으면 바로 grasp/place를 요청한다.
                 if (
                     robot_worker is not None
                     and not grasp_request_pending
                     and robot_status.state == ROBOT_STATE_FOLLOWING
                     and shared_state.is_pregrasp_pose_reached(robot_status.last_robot_pose)
                 ):
+                    # direct grasp trigger를 콘솔에 남긴다.
                     print("[INFO] DIRECT GRASP trigger")
+                    # robot worker에 넘길 fitted point cloud copy를 준비한다.
                     fitted_points_copy = None
+                    # fitted point가 있으면 thread 간 공유 부작용을 피하기 위해 numpy copy를 만든다.
                     if shape_fitting_state.fitted_points_base is not None:
                         fitted_points_copy = np.asarray(shape_fitting_state.fitted_points_base, dtype=np.float32).copy()
+                    # grasp point도 tuple copy로 정규화한다.
                     grasp_point_copy = None if grasp_point_base is None else tuple(float(v) for v in grasp_point_base)
+                    # template axis 정보가 있으면 함께 넘긴다.
                     template_axes = getattr(shape_fitting_state, "template_axes_base", None)
+                    # axis 정보 역시 numpy copy로 만들어 worker에 안전하게 전달한다.
                     template_axes_copy = None if template_axes is None else np.asarray(template_axes, dtype=np.float32).copy()
+                    # grasp/place 동작에 필요한 geometry context를 하나로 묶는다.
                     action_context = RobotActionContext(
                         fitted_points_base=fitted_points_copy,
                         grasp_point_base=grasp_point_copy,
                         object_label=shape_fitting_state.label,
                         template_axes_base=template_axes_copy,
                     )
+                    # robot worker에 grasp/place 시작 요청을 보낸다.
                     robot_worker.submit(
                         RobotRequest(
                             ROBOT_REQ_START_GRASP_PLACE,
                             payload={"context": action_context},
                         )
                     )
+                    # 같은 pregrasp 상태에서 중복 요청하지 않도록 pending flag를 세운다.
                     grasp_request_pending = True
+            # object target이 없으면 prediction/arm reset 없이 target만 비운다.
             else:
                 shared_state.clear_target(reset_prediction=False, reset_arm=False)
 
+            # FPS 계산 기준이 되는 현재 perf_counter 시각이다.
             now = time.perf_counter()
+            # 직전 loop와의 시간 차로 순간 FPS를 계산한다.
             instant_fps = 1.0 / max(now - last_loop_time, 1e-6)
+            # 화면 표시와 로그 안정성을 위해 순간 FPS를 지수 이동 평균으로 smoothing한다.
             smoothed_fps = instant_fps if smoothed_fps == 0.0 else 0.9 * smoothed_fps + 0.1 * instant_fps
+            # 다음 frame FPS 계산을 위해 현재 시각을 저장한다.
             last_loop_time = now
+            # task 시작 후 render 시점까지의 elapsed time을 계산한다.
             record_elapsed_s = None if task_record_start_perf is None else max(now - task_record_start_perf, 0.0)
 
+            # OpenCV 화면 렌더링 구간을 profiler에 기록한다.
             with runtime_profiler.stage("render"):
+                # 촉각 manager가 있으면 total norm을 계산해 최신 overlay 값으로 갱신한다.
                 if tactile_manager is not None:
                     tactile_manager.total_norm()
+                # cam0 화면에 object/hand/grasp/follow 상태를 overlay한 debug 이미지를 만든다.
                 annotated = render_cam0_perception_debug(
                     snapshot,
                     pipeline,
@@ -4259,6 +4968,7 @@ def main():
                     record_elapsed_s=record_elapsed_s,
                     tactile_manager=tactile_manager,
                 )
+                # cam1 화면에는 mask와 grasp preview 중심의 보조 debug 이미지를 만든다.
                 cam1_preview = render_camera_mask_preview(
                     snapshot,
                     pipeline,
@@ -4268,19 +4978,30 @@ def main():
                     grasp_point_base,
                     camera_label="cam1",
                 )
+                # cam0 debug 화면을 표시한다.
                 cv.imshow(cam0_window_name, annotated)
+                # cam1 preview 화면을 표시한다.
                 cv.imshow(cam1_window_name, cam1_preview)
                 # if args.show_depth:
                 #     cv.imshow(depth_window_name, render_depth(snapshot.cam0.depth_image_m, args.depth_max_m))
 
+            # OpenCV 키 입력 대기 시간도 profiler stage로 기록한다.
             with runtime_profiler.stage("wait_key"):
+                # 1ms 동안 키 입력을 받고 하위 8bit만 사용한다.
                 key = cv.waitKey(1) & 0xFF
+            # frame 전체 loop 처리 시간을 profiler stage로 추가한다.
             runtime_profiler.add_stage_ms("loop_total", (time.perf_counter() - loop_total_start) * 1000.0)
+            # 이번 frame의 timing과 perception metric을 runtime profile에 기록한다.
             runtime_profiler.record_frame(
+                # 동기화 frame pair index다.
                 frame_index=int(snapshot.pair_index),
+                # frame의 wall-clock timestamp다.
                 timestamp_unix_s=current_time,
+                # 현재 task epoch다.
                 task_epoch=current_task_epoch,
+                # smoothing된 FPS다.
                 fps=smoothed_fps,
+                # object/hand/fusion/grasp 관련 상세 metric을 모은다.
                 metrics=collect_runtime_profile_metrics(
                     snapshot=snapshot,
                     pipeline=pipeline,
@@ -4296,96 +5017,154 @@ def main():
                     smoothed_fps=smoothed_fps,
                 ),
             )
+            # ESC 또는 q를 누르면 main loop를 빠져나간다.
             if key in (27, ord("q")):
                 break
+            # f 키는 follow pause/resume을 토글한다.
             if key == ord("f"):
+                # 로봇 worker가 있으면 worker에게 follow 시작/정지를 요청한다.
                 if robot_worker is not None:
+                    # 현재 follow enabled 상태를 shared state snapshot에서 읽는다.
                     follow_enabled = bool(shared_state.get_snapshot()["follow_enabled"])
+                    # 현재 상태에 따라 stop 또는 start request를 선택한다.
                     request_type = ROBOT_REQ_STOP_FOLLOW if follow_enabled else ROBOT_REQ_START_FOLLOW
+                    # 선택한 follow request를 robot worker에 보낸다.
                     robot_worker.submit(RobotRequest(request_type))
+                # 로봇 없이 perception만 돌리는 경우 shared state만 직접 토글한다.
                 else:
                     shared_state.clear_follow_pause()
                     shared_state.toggle_follow()
+            # r 키는 저장하지 않고 startup state로 reset한다.
             elif key == ord("r"):
+                # reset 요청을 콘솔에 남긴다.
                 print("[INFO] Reset requested: returning to startup state")
+                # 진행 중인 영상 녹화가 있으면 저장하지 않고 버린다.
                 discard_video_recording_for_reset(video_recorder)
+                # task recording elapsed time 기준점을 제거한다.
                 task_record_start_perf = None
+                # 로봇 worker가 있으면 로봇을 home/reset sequence로 보낸다.
                 if robot_worker is not None:
+                    # reset 완료 후 profiler를 폐기할 사유를 저장한다.
                     pending_reset_reason = "r_key_reset"
+                    # robot worker에 reset home request를 보낸다.
                     robot_worker.submit(RobotRequest(ROBOT_REQ_RESET_HOME))
+                # 로봇 worker가 없으면 메인 thread에서 모든 상태를 즉시 reset한다.
                 else:
                     reset_tactile_state_for_system_reset(tactile_manager)
                     shared_state.reset_for_restart(follow_enabled=False)
                     reset_perception_pipeline_for_system_reset(pipeline)
+                    # debug recorder가 있으면 누적 buffer를 비운다.
                     if debug_3d_recorder is not None:
                         debug_3d_recorder.clear()
+                    # 저장하지 않을 reset이므로 runtime profile도 폐기한다.
                     discard_runtime_profile(runtime_profiler, reason="r_key_reset")
+            # d 키는 3D debug buffer를 저장한 뒤 reset한다.
             elif key == ord("d"):
+                # 3D debug recorder가 꺼져 있으면 저장할 것이 없으므로 경고 후 다음 frame으로 간다.
                 if debug_3d_recorder is None:
                     print("[WARN] 3D debug recording is disabled; launch with --3d-debug.")
                     continue
+                # 저장 성공 시 경로를 담을 변수다.
                 debug_save_path = None
+                # debug 저장 실패가 reset까지 이어지지 않도록 보호한다.
                 try:
+                    # 누적된 3D debug frame을 디스크에 저장한다.
                     debug_save_path = debug_3d_recorder.save()
+                    # 저장된 경로를 콘솔에 출력한다.
                     print(f"[INFO] 3D debug recording saved: {debug_save_path}")
+                # 저장 실패 시 buffer를 유지하고 reset을 건너뛴다.
                 except Exception as exc:
                     print(f"[WARN] 3D debug save failed; keeping buffered frames and skipping reset: {exc}")
                     continue
+                # 저장이 끝난 buffer는 다음 trial과 섞이지 않게 비운다.
                 debug_3d_recorder.clear()
+                # debug 저장 reset에서는 일반 영상 녹화는 폐기한다.
                 discard_video_recording_for_reset(video_recorder)
+                # task recording elapsed time 기준점을 제거한다.
                 task_record_start_perf = None
+                # 로봇 worker가 있으면 reset은 worker를 통해 수행한다.
                 if robot_worker is not None:
+                    # reset 완료 후 profiler를 폐기할 사유를 저장한다.
                     pending_reset_reason = "d_key_debug_reset"
+                    # robot worker에 reset home request를 보낸다.
                     robot_worker.submit(RobotRequest(ROBOT_REQ_RESET_HOME))
+                # 로봇 worker가 없으면 메인 thread에서 즉시 reset한다.
                 else:
                     reset_tactile_state_for_system_reset(tactile_manager)
                     shared_state.reset_for_restart(follow_enabled=False)
                     reset_perception_pipeline_for_system_reset(pipeline)
+                    # debug reset으로 끝난 profile은 저장하지 않고 폐기한다.
                     discard_runtime_profile(runtime_profiler, reason="d_key_debug_reset")
+            # s 키는 현재 task를 저장하고 follow를 멈춘다.
             elif key == ord("s"):
+                # 로봇 worker가 있으면 저장 후 정지 sequence를 worker에 맡긴다.
                 if robot_worker is not None:
                     robot_worker.submit(RobotRequest(ROBOT_REQ_SAVE_AND_STOP))
+                # 로봇 worker가 없으면 shared state에서 follow를 직접 멈춘다.
                 else:
                     shared_state.request_follow_pause()
                     shared_state.stop_follow()
+                # metadata recorder가 있으면 completion row를 CSV에 append한다.
                 if metadata_recorder is not None:
                     csv_path = metadata_recorder.record_completion()
+                    # 새 metadata가 저장된 경우 경로를 출력한다.
                     if csv_path is not None:
                         print(f"[INFO] Handover metadata appended: {csv_path}")
+                    # 이미 저장됐거나 저장할 task가 없으면 안내만 한다.
                     else:
                         print("[INFO] Handover metadata was already saved or no task metadata is available.")
+                # 영상 recorder가 있으면 녹화를 마무리한다.
                 if video_recorder is not None:
+                    # web UI 모드에서는 pending 상태로 넘겨 사용자가 UI에서 확인/저장하게 한다.
                     if video_recorder.is_web_ui_enabled:
                         ok, message = video_recorder.finish_recording_to_pending()
+                    # web UI가 없으면 현재 녹화를 바로 저장한다.
                     else:
                         ok, message = video_recorder.finish_and_save_plain_recording()
+                    # recorder 결과에 따라 로그 레벨을 나눈다.
                     level = "[INFO]" if ok else "[WARN]"
+                    # recorder 처리 결과 메시지를 출력한다.
                     print(f"{level} Video recorder: {message}")
+                    # web UI 모드에서는 저장 후보를 확인할 UI를 연다.
                     if video_recorder.is_web_ui_enabled:
                         open_video_recorder_ui(video_recorder)
+                # s 키 저장 시 runtime profile을 디스크에 저장한다.
                 save_runtime_profile(runtime_profiler, reason="s_key")
 
+    # loop 종료, 예외, KeyboardInterrupt 등 어떤 경우에도 리소스를 정리한다.
     finally:
+        # runtime profiler 내부 sampling thread/file handle을 닫는다.
         runtime_profiler.close()
+        # 3D debug recorder가 있으면 열려 있는 writer나 buffer를 정리한다.
         if debug_3d_recorder is not None:
             debug_3d_recorder.close()
+        # 공유 stop event를 세워 background 루프들이 종료 조건을 볼 수 있게 한다.
         shared_state.stop_event.set()
+        # 로봇 worker가 있으면 shutdown request를 보내고 thread 종료를 기다린다.
         if robot_worker is not None:
             robot_worker.submit(RobotRequest(ROBOT_REQ_SHUTDOWN))
             robot_worker.join(timeout=2.0)
+        # tactile manager가 있으면 센서 수집 thread와 연결을 닫는다.
         if tactile_manager is not None:
             tactile_manager.close()
+        # hand worker와 sensor hub는 중첩 finally로 최대한 모두 닫히게 한다.
         try:
+            # cam0 hand worker를 닫는다.
             pipeline["hand_worker_cam0"].close()
         finally:
             try:
+                # cam1 hand worker를 닫는다.
                 pipeline["hand_worker_cam1"].close()
             finally:
+                # hand worker close 중 예외가 나도 카메라 스트리밍은 반드시 멈춘다.
                 sensor_hub.stop()
+        # 영상 recorder service가 떠 있으면 서버와 장치를 정리한다.
         if video_recorder is not None:
             video_recorder.stop()
+        # 열려 있는 모든 OpenCV 창을 닫는다.
         cv.destroyAllWindows()
 
 
+# 이 파일을 직접 실행했을 때만 main loop를 시작한다.
 if __name__ == "__main__":
     main()

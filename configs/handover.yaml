@@ -9,11 +9,11 @@ video_recording:
     enabled: false
   tactile_logging:
     # true이면 video recorder capture thread에서 frame과 같은 타임라인으로 tactile sidecar를 기록합니다.
-    enabled: true
+    enabled: false
     # true이면 분석용 baseline-subtracted tactile 값을 CSV로 저장합니다.
-    csv_enabled: true
+    csv_enabled: false
     # true이면 Rerun .rrd 시각화 파일도 함께 저장합니다. rerun 패키지가 없으면 CSV만 저장합니다.
-    rerun_enabled: true
+    rerun_enabled: false
     # true이면 Rerun viewer를 live로 띄웁니다. 기본은 파일 저장만 합니다.
     rerun_live: false
 
@@ -154,7 +154,7 @@ perception:
       # YOLOE segmentation weights/model 이름입니다. 실행 인자 --model이 있으면 override됩니다.
       model_name: yoloe-26l-seg.pt
       # YOLOE text prompt class 목록입니다. 실행 인자 --prompt가 있으면 override됩니다.
-      prompt_classes: ["cup", "wine glass", "box-shaped snack"]
+      prompt_classes: ["cup", "wine glass", "box-shaped snack", "bottle"]
       # segmentation inference image size입니다. 실행 인자 --imgsz가 있으면 override됩니다.
       imgsz: 640
       # YOLOE inference confidence threshold입니다. 실행 인자 --conf가 있으면 override됩니다.
@@ -174,7 +174,7 @@ perception:
       # cup과 wine glass가 동시에 잡히면 confidence와 무관하게 wine glass mask를 선택합니다.
       prefer_wine_glass_over_cup: true
       # 특정 class를 우선 선택해야 할 때 사용할 class 이름 목록입니다.
-      selection_class_names: ["wine glass", "box-shaped snack","cup"]
+      selection_class_names: ["wine glass", "box-shaped snack", "cup", "bottle"]
       preprocess:
         # segmentation 입력 영상 전처리 사용 여부입니다.
         enabled: false
@@ -257,7 +257,7 @@ perception:
       # hand pose를 valid로 볼 최소 3D keypoint 개수입니다.
       min_valid_keypoints: 4
     # palm center/normal 이동평균 window frame 수입니다.
-    smoothing_window_frames: 5
+    smoothing_window_frames: 2
     # 손 velocity EMA alpha입니다.
     velocity_alpha: 0.5
     # palm pose quality가 이 값 미만이면 hand를 invalid 처리합니다.
@@ -280,9 +280,9 @@ perception:
 
   fusion:
     # object centroid EMA alpha입니다. 수정 0.35  -> 0.6
-    object_centroid_alpha: 0.6
+    object_centroid_alpha: 1
     # hand center EMA alpha입니다. 수정 0.35 -> 0.6
-    hand_center_alpha: 0.6
+    hand_center_alpha: 1
     # hand normal EMA alpha입니다.
     hand_normal_alpha: 0.50
     # position jump가 이보다 크면 smoothing state를 재초기화합니다.
@@ -311,6 +311,15 @@ perception:
         # template point 단위를 meter로 바꾸는 scale입니다.
         unit_scale_m: 0.001
         # wine glass도 template local x/y/z 축별 scale을 따로 적용합니다.
+        scale_mode: axis_xyz
+      bottle:
+        # bottle template 식별자입니다.
+        template_id: bottle_shape_fit
+        # bottle canonical point cloud 파일입니다.
+        asset_path: shape_fitting/beer_bottle.npy
+        # template point 단위를 meter로 바꾸는 scale입니다.
+        unit_scale_m: 0.001
+        # bottle도 template local x/y/z 축별 scale을 따로 적용합니다.
         scale_mode: axis_xyz
       box-shaped snack:
         # box-shaped snack template 식별자입니다.
@@ -397,7 +406,7 @@ grasp:
   # object centroid 주변 grasp 후보 search radius입니다.
   candidate_search_radius_from_centroid_m: 0.11
   # 손 높이와 grasp 후보 사이 최소 clearance입니다.
-  min_hand_height_clearance_m: 0.05
+  min_hand_height_clearance_m: 0.04
   # 후보가 없을 때 이전 target을 hold할지 invalid로 둘지 정합니다.
   no_candidate_action: hold
   hand_relative_fallback:
@@ -427,7 +436,7 @@ grasp:
     # 후보 dropout 시 이전 grasp target을 유지할 frame 수입니다.
     dropout_hold_frames: 8
     # 이전 후보와의 거리 penalty 가중치입니다.
-    score_previous_distance_weight: 0.10
+    score_previous_distance_weight: 0.90
 
 robot:
   return_sequence:
@@ -450,23 +459,31 @@ robot:
     # stream 시작 후 baseline reset 전 대기 시간입니다.
     startup_delay_s: 1.0
     # baseline-subtracted tactile total norm이 이 값 이상이면 contact로 봅니다.
-    contact_norm_threshold: 30.0
+    contact_norm_threshold: 35.0
     # tactile contact position에서 gripper를 추가로 닫을 Robotiq position count입니다.
-    extra_grasp_pos: 10
+    extra_grasp_pos: 20
     # place/release 위치에서 held reference 대비 이 delta 이상이면 release timing으로 봅니다.
     release_delta_threshold: 30
     # grasp 성공 후 held tactile reference를 잡기 전 대기 시간입니다.
     release_ref_delay_s: 0.3
     # 고정 위치 release trigger 대기용 timeout입니다. tactile continuous descent에서는 min_z가 fallback 한계입니다.
-    release_timeout_s: 1.0
+    # release_timeout_s: 1.0
     # tactile release descent에서 허용할 최소 robot base Z입니다.
-    release_descent_min_z_mm: 45.0
+    release_descent_min_z_mm: 30.0
     # legacy step mode용 값입니다. 현재 single-target tactile release descent에서는 사용하지 않습니다.
     release_descent_step_mm: 2.0
     # tactile release descent 중 step 사이 tactile 확인 주기입니다.
     release_descent_poll_dt_s: 0.03
     # gripper open 후 tactile baseline을 다시 잡기 전 대기 시간입니다. 0이면 비활성입니다.
-    auto_baseline_reset_after_open_s: 1.5
+    auto_baseline_reset_after_open_s: 0
+    # true이면 tactile release trigger 이후 stop command/actual stop timing을 자세히 출력합니다.
+    release_stop_timing_debug: false
+    # actual_tcp_speed linear norm이 이 값 이하이면 실제 정지로 기록합니다.
+    release_stop_speed_threshold_mps: 0.002
+    # stop command 이후 실제 정지를 관찰할 최대 시간입니다.
+    release_stop_monitor_timeout_s: 1.0
+    # 실제 정지 관찰 중 RTDE state/isSteady polling 주기입니다.
+    release_stop_monitor_poll_dt_s: 0.005
     # tactile debug log 출력 여부입니다.
     debug: true
 
@@ -493,16 +510,12 @@ robot:
     move_asynchronous: true
     # moveL acceleration입니다.
     move_acceleration: 0.30
-    # servoL velocity parameter입니다.
-    servo_velocity: 0.05
-    # servoL acceleration parameter입니다.
-    servo_acceleration: 0.20
     # servoL lookahead_time입니다.
     servo_lookahead_time: 0.10
     # servoL gain입니다.
     servo_gain: 300
-    # stopL/stop motion acceleration입니다.
-    stop_acceleration: 1.0
+    # stopL/stop motion acceleration입니다. 기본은 0.1입니다만, tactile release descent에서 빠르게 멈추기 위해 5.0으로 높였습니다.
+    stop_acceleration: 5.0
   motion:
     # RtdeController blocking move 기본 속도입니다.
     approach_speed_mps: 0.35
@@ -524,7 +537,7 @@ robot:
     # gripper socket 연결 시 activate 명령을 보낼지 정합니다.
     activate_on_connect: true
     # gripper open speed입니다.
-    open_speed: 100 # 기존 255에서 100으로 낮춤
+    open_speed: 250 # 기존 255에서 100으로 낮춤
     # gripper open force입니다.
     open_force: 255
     # gripper close speed입니다.
@@ -597,6 +610,6 @@ safety:
     # robot base X clamp 범위입니다. 실행 인자 --workspace-x가 있으면 override됩니다.
     x: [-0.60, 0.80]
     # robot base Y clamp 범위입니다. 실행 인자 --workspace-y가 있으면 override됩니다.
-    y: [-0.30, 0.80]
+    y: [-0.80, 0.80]
     # robot base Z clamp 범위입니다. 실행 인자 --workspace-z가 있으면 override됩니다.
     z: [0.00, 0.80]
