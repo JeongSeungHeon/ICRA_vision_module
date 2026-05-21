@@ -29,6 +29,7 @@ from perception.hand_selector import HandSelector
 from perception.hand_worker import HandWorkerCam0, HandWorkerCam1
 from perception.object_merger import ObjectMerger
 from perception.object_worker import ObjectWorkerCam0, ObjectWorkerCam1
+from perception.silhouette_constraint import SilhouetteObservation
 from perception.shape_fitting_tracker_v2 import ShapeFittingTracker
 from perception.target_predictor import TargetPredictor
 from robot.rtde_controller import RtdeController
@@ -4328,6 +4329,59 @@ def project_base_points_to_cam0(points_base, intrinsics, t_cam0_base, width: int
     return np.stack([us[in_bounds], vs[in_bounds]], axis=1)
 
 
+def _build_silhouette_observation(camera_id, frame_bundle, object_worker, t_base_cam):
+    """Package the latest per-camera segmentation mask for shape fitting rerank."""
+    object_debug = getattr(object_worker, "last_debug", None)
+    mask = None if object_debug is None else getattr(object_debug, "combined_mask", None)
+    if mask is None:
+        return None
+    mask_array = np.asarray(mask)
+    if mask_array.size == 0 or not np.any(mask_array):
+        return None
+
+    intrinsics = getattr(frame_bundle, "intrinsics", None) or {}
+    required_keys = ("fx", "fy", "cx", "cy")
+    if any(key not in intrinsics for key in required_keys):
+        return None
+
+    image_shape = tuple(int(value) for value in frame_bundle.color_image.shape[:2])
+    return SilhouetteObservation(
+        camera_id=int(camera_id),
+        mask=mask_array,
+        intrinsics=dict(intrinsics),
+        t_base_cam=np.asarray(t_base_cam, dtype=np.float32),
+        image_shape=(image_shape[0], image_shape[1]),
+        weight=1.0,
+    )
+
+
+def build_silhouette_observations(snapshot, pipeline):
+    """Build cam0/cam1 silhouette observations when masks and calibration are available."""
+    transform_chain = pipeline.get("transform_chain")
+    if transform_chain is None:
+        return []
+
+    observations = []
+    cam0_observation = _build_silhouette_observation(
+        0,
+        snapshot.cam0,
+        pipeline.get("object_worker_cam0"),
+        transform_chain.t_base_cam0,
+    )
+    if cam0_observation is not None:
+        observations.append(cam0_observation)
+
+    cam1_observation = _build_silhouette_observation(
+        1,
+        snapshot.cam1,
+        pipeline.get("object_worker_cam1"),
+        transform_chain.t_base_cam1,
+    )
+    if cam1_observation is not None:
+        observations.append(cam1_observation)
+    return observations
+
+
 def choose_point(primary, fallback=None):
     return primary if primary is not None else fallback
 
@@ -4472,6 +4526,13 @@ def collect_runtime_profile_metrics(
         "shape_fit_icp_fitness": getattr(shape_fit_debug, "icp_fitness", None),
         "shape_fit_icp_rmse": getattr(shape_fit_debug, "icp_rmse", None),
         "shape_fit_z_rotation_deg": getattr(shape_fit_debug, "z_rotation_deg", None),
+        "shape_fit_silhouette_enabled": getattr(shape_fit_debug, "silhouette_enabled", False),
+        "shape_fit_silhouette_candidate_count": getattr(shape_fit_debug, "silhouette_candidate_count", 0),
+        "shape_fit_silhouette_valid_camera_count": getattr(shape_fit_debug, "silhouette_valid_camera_count", 0),
+        "shape_fit_silhouette_loss": getattr(shape_fit_debug, "silhouette_loss", None),
+        "shape_fit_silhouette_outside_loss": getattr(shape_fit_debug, "silhouette_outside_loss", None),
+        "shape_fit_silhouette_robust_3d_loss": getattr(shape_fit_debug, "robust_3d_loss", None),
+        "shape_fit_rerank_changed_candidate": getattr(shape_fit_debug, "rerank_changed_candidate", False),
         "selected_hand_valid": bool(getattr(selected_hand, "valid", False)),
         "selected_hand_camera": getattr(selected_hand, "selected_camera", None),
         "fusion_object_fresh": bool(getattr(fusion_state, "object_fresh", False)),
@@ -4918,7 +4979,11 @@ def main():
                 )
             # 병합된 object point cloud에 형상 fitting/tracking을 수행한다.
             with runtime_profiler.stage("shape_fit"):
-                shape_fitting_state = pipeline["shape_fitting_tracker"].process(merged_object)
+                silhouette_observations = build_silhouette_observations(snapshot, pipeline)
+                shape_fitting_state = pipeline["shape_fitting_tracker"].process(
+                    merged_object,
+                    silhouette_observations=silhouette_observations,
+                )
                 # fitting 결과를 metadata recorder에 업데이트한다.
                 metadata_recorder.update_geometry(shape_fitting_state, now_perf=loop_perf)
             # cam0 object worker가 남긴 debug 정보를 가져온다.

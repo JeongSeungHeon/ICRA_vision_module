@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 IMAGE_ARRAY_KEYS = (
     "cam0_color_image",
     "cam0_depth_image_m",
@@ -346,6 +346,52 @@ class Debug3DRecorder:
             "shape_fitting_scale_y": _vec(getattr(shape_fitting_state, "scale_xyz", None), 3)[1],
             "shape_fitting_scale_z": _vec(getattr(shape_fitting_state, "scale_xyz", None), 3)[2],
             "shape_fitting_scale_mode": str(getattr(shape_fitting_state, "scale_mode", "uniform")),
+            "shape_fitting_silhouette_enabled": bool(getattr(shape_fitting_state, "silhouette_enabled", False)),
+            "shape_fitting_silhouette_reason": str(getattr(shape_fitting_state, "silhouette_reason", "disabled")),
+            "shape_fitting_silhouette_candidate_count": int(
+                getattr(shape_fitting_state, "silhouette_candidate_count", 0)
+            ),
+            "shape_fitting_silhouette_valid_camera_count": int(
+                getattr(shape_fitting_state, "silhouette_valid_camera_count", 0)
+            ),
+            "shape_fitting_silhouette_best_iou_cam0": np.nan
+            if getattr(shape_fitting_state, "silhouette_best_iou_cam0", None) is None
+            else float(getattr(shape_fitting_state, "silhouette_best_iou_cam0")),
+            "shape_fitting_silhouette_best_iou_cam1": np.nan
+            if getattr(shape_fitting_state, "silhouette_best_iou_cam1", None) is None
+            else float(getattr(shape_fitting_state, "silhouette_best_iou_cam1")),
+            "shape_fitting_silhouette_loss": np.nan
+            if getattr(shape_fitting_state, "silhouette_loss", None) is None
+            else float(getattr(shape_fitting_state, "silhouette_loss")),
+            "shape_fitting_silhouette_outside_loss": np.nan
+            if getattr(shape_fitting_state, "silhouette_outside_loss", None) is None
+            else float(getattr(shape_fitting_state, "silhouette_outside_loss")),
+            "shape_fitting_silhouette_robust_3d_loss": np.nan
+            if getattr(shape_fitting_state, "robust_3d_loss", None) is None
+            else float(getattr(shape_fitting_state, "robust_3d_loss")),
+            "shape_fitting_silhouette_scale_prior_loss": np.nan
+            if getattr(shape_fitting_state, "scale_prior_loss", None) is None
+            else float(getattr(shape_fitting_state, "scale_prior_loss")),
+            "shape_fitting_silhouette_temporal_scale_loss": np.nan
+            if getattr(shape_fitting_state, "temporal_scale_loss", None) is None
+            else float(getattr(shape_fitting_state, "temporal_scale_loss")),
+            "shape_fitting_pre_rerank_scale": np.nan
+            if getattr(shape_fitting_state, "pre_rerank_scale", None) is None
+            else float(getattr(shape_fitting_state, "pre_rerank_scale")),
+            "shape_fitting_post_rerank_scale": np.nan
+            if getattr(shape_fitting_state, "post_rerank_scale", None) is None
+            else float(getattr(shape_fitting_state, "post_rerank_scale")),
+            "shape_fitting_pre_rerank_scale_xyz": _vec(getattr(shape_fitting_state, "pre_rerank_scale_xyz", None), 3),
+            "shape_fitting_post_rerank_scale_xyz": _vec(getattr(shape_fitting_state, "post_rerank_scale_xyz", None), 3),
+            "shape_fitting_pre_rerank_template_extent": _vec(
+                getattr(shape_fitting_state, "pre_rerank_template_extent", None), 3
+            ),
+            "shape_fitting_post_rerank_template_extent": _vec(
+                getattr(shape_fitting_state, "post_rerank_template_extent", None), 3
+            ),
+            "shape_fitting_rerank_changed_candidate": bool(
+                getattr(shape_fitting_state, "rerank_changed_candidate", False)
+            ),
             "template_points_base": fitted_points,
             "template_centroid_base": _vec(getattr(shape_fitting_state, "centroid_base", None), 3),
             "cam0_hand_points_base": _hand_debug_points(hand_debug_cam0),
@@ -434,6 +480,7 @@ class Debug3DRecorder:
             "template_id",
             "shape_fitting_reason",
             "shape_fitting_scale_mode",
+            "shape_fitting_silhouette_reason",
             "hand_selection_reason",
             "hand_selector_cam0_reject_reason",
             "hand_selector_cam1_reject_reason",

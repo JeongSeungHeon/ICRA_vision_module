@@ -25,6 +25,11 @@ except Exception:  # pragma: no cover - optional dependency
     cKDTree = None
 
 from object_pt_extraction.pointcloud_utils import voxel_downsample_point_cloud
+from perception.silhouette_constraint import (
+    SilhouetteObservation,
+    SilhouetteScore,
+    compute_silhouette_score,
+)
 from system.shared_state import HEIGHT_AXIS_X, HEIGHT_AXIS_Y, HEIGHT_AXIS_Z, MergedObjectState
 
 DEFAULT_CONFIG_PATH = Path("configs/handover.yaml")
@@ -415,6 +420,24 @@ class ShapeFittingState:
     bowl_height_fraction: float | None
     initialized: bool
     reason: str
+    silhouette_enabled: bool = False
+    silhouette_reason: str = "disabled"
+    silhouette_candidate_count: int = 0
+    silhouette_valid_camera_count: int = 0
+    silhouette_best_iou_cam0: float | None = None
+    silhouette_best_iou_cam1: float | None = None
+    silhouette_loss: float | None = None
+    silhouette_outside_loss: float | None = None
+    robust_3d_loss: float | None = None
+    scale_prior_loss: float | None = None
+    temporal_scale_loss: float | None = None
+    pre_rerank_scale: float | None = None
+    post_rerank_scale: float | None = None
+    pre_rerank_scale_xyz: tuple[float, float, float] | None = None
+    post_rerank_scale_xyz: tuple[float, float, float] | None = None
+    pre_rerank_template_extent: tuple[float, float, float] | None = None
+    post_rerank_template_extent: tuple[float, float, float] | None = None
+    rerank_changed_candidate: bool = False
 
 
 @dataclass
@@ -440,6 +463,37 @@ class ShapeFittingDebug:
     icp_target_points: int
     icp_iterations_used: int
     z_rotation_deg: float | None
+    silhouette_enabled: bool = False
+    silhouette_reason: str = "disabled"
+    silhouette_candidate_count: int = 0
+    silhouette_valid_camera_count: int = 0
+    silhouette_best_iou_cam0: float | None = None
+    silhouette_best_iou_cam1: float | None = None
+    silhouette_loss: float | None = None
+    silhouette_outside_loss: float | None = None
+    robust_3d_loss: float | None = None
+    scale_prior_loss: float | None = None
+    temporal_scale_loss: float | None = None
+    pre_rerank_scale: float | None = None
+    post_rerank_scale: float | None = None
+    pre_rerank_scale_xyz: tuple[float, float, float] | None = None
+    post_rerank_scale_xyz: tuple[float, float, float] | None = None
+    pre_rerank_template_extent: tuple[float, float, float] | None = None
+    post_rerank_template_extent: tuple[float, float, float] | None = None
+    rerank_changed_candidate: bool = False
+
+
+@dataclass(frozen=True)
+class _SilhouetteCandidateScore:
+    index: int
+    scale_xyz: np.ndarray
+    points_base: np.ndarray
+    total_loss: float
+    robust_3d_loss: float
+    silhouette_score: SilhouetteScore
+    scale_prior_loss: float
+    temporal_scale_loss: float
+    is_growth_candidate: bool
 
 
 class ShapeFittingTracker:
@@ -468,6 +522,7 @@ class ShapeFittingTracker:
         downsample_cfg = fitting_cfg.get("downsample", {})
         icp_cfg = fitting_cfg.get("icp", {})
         crop_cfg = icp_cfg.get("crop", {})
+        silhouette_cfg = fitting_cfg.get("silhouette_constraint", {}) or {}
 
         self.dbscan_eps_m = float(cluster_cfg.get("dbscan_eps_m", 0.02))
         self.dbscan_min_points = int(cluster_cfg.get("dbscan_min_points", 10))
@@ -498,6 +553,40 @@ class ShapeFittingTracker:
         self.icp_crop_min_points_after_crop = int(crop_cfg.get("min_points_after_crop", 80))
         self.icp_crop_min_height_extent_m = float(crop_cfg.get("min_height_extent_m", 0.01))
 
+        self.silhouette_enabled = bool(silhouette_cfg.get("enabled", False))
+        default_silhouette_labels = ["cup", "wine glass", "glass", "bottle"]
+        self.silhouette_apply_to_all = bool(silhouette_cfg.get("apply_to_all", False))
+        self.silhouette_apply_to_labels = {
+            str(label).strip().lower()
+            for label in silhouette_cfg.get("apply_to_labels", default_silhouette_labels)
+            if str(label).strip()
+        }
+        self.silhouette_lambda_3d = float(silhouette_cfg.get("lambda_3d", 1.0))
+        self.silhouette_lambda_iou = float(silhouette_cfg.get("lambda_iou", 0.75))
+        self.silhouette_lambda_outside = float(silhouette_cfg.get("lambda_outside", 1.25))
+        self.silhouette_lambda_scale_prior = float(silhouette_cfg.get("lambda_scale_prior", 0.25))
+        self.silhouette_lambda_temporal = float(silhouette_cfg.get("lambda_temporal", 0.4))
+        self.silhouette_point_radius_px = int(silhouette_cfg.get("point_radius_px", 2))
+        self.silhouette_close_kernel_px = int(silhouette_cfg.get("close_kernel_px", 5))
+        self.silhouette_dilate_px = int(silhouette_cfg.get("dilate_px", 1))
+        self.silhouette_mask_erode_px = int(silhouette_cfg.get("mask_erode_px", 0))
+        self.silhouette_min_rendered_pixels = int(silhouette_cfg.get("min_rendered_pixels", 30))
+        self.silhouette_min_segmentation_pixels = int(silhouette_cfg.get("min_segmentation_pixels", 50))
+        self.silhouette_distance_trunc_px = float(silhouette_cfg.get("distance_trunc_px", 25.0))
+        self.silhouette_robust_3d_trunc_m = float(silhouette_cfg.get("robust_3d_trunc_m", 0.03))
+        self.silhouette_observed_to_template_weight = float(silhouette_cfg.get("observed_to_template_weight", 0.25))
+        self.silhouette_growth_penalty = float(silhouette_cfg.get("growth_penalty", 2.0))
+        self.silhouette_max_growth_factor = float(silhouette_cfg.get("max_growth_factor", 1.05))
+        self.silhouette_shrink_factors = [
+            float(value) for value in silhouette_cfg.get("shrink_factors", [0.75, 0.85, 0.95])
+        ]
+        self.silhouette_uniform_growth_factors = [
+            float(value) for value in silhouette_cfg.get("uniform_growth_factors", [1.0, 1.05])
+        ]
+        self.silhouette_max_projection_points = int(silhouette_cfg.get("max_projection_points", 1500))
+        self.silhouette_robust_3d_max_points = int(silhouette_cfg.get("robust_3d_max_points", 2000))
+        self.silhouette_debug = bool(silhouette_cfg.get("debug", False))
+
         self._templates = self._load_template_library(template_cfg)
         self._active_template: ShapeTemplateModel | None = None
         self._tracked_cluster_centroid: np.ndarray | None = None
@@ -510,6 +599,11 @@ class ShapeFittingTracker:
         self._frozen_rotation = np.eye(3, dtype=np.float64)
         self._frozen_z_rotation_deg: float | None = None
         self._current_template_points = np.empty((0, 3), dtype=np.float32)
+        self._last_silhouette_scale_xyz: np.ndarray | None = None
+        self._last_silhouette_debug = self._make_empty_silhouette_debug(
+            enabled=self.silhouette_enabled,
+            reason="disabled" if not self.silhouette_enabled else "not_evaluated",
+        )
         self._initialized = False
 
         self.last_state = ShapeFittingState(
@@ -569,9 +663,23 @@ class ShapeFittingTracker:
         self._frozen_rotation = np.eye(3, dtype=np.float64)
         self._frozen_z_rotation_deg = None
         self._current_template_points = np.empty((0, 3), dtype=np.float32)
+        self._last_silhouette_scale_xyz = None
+        self._last_silhouette_debug = self._make_empty_silhouette_debug(
+            enabled=self.silhouette_enabled,
+            reason="disabled" if not self.silhouette_enabled else "reset",
+        )
         self._initialized = False
 
-    def process(self, merged_object: MergedObjectState) -> ShapeFittingState:
+    def process(
+        self,
+        merged_object: MergedObjectState,
+        *,
+        silhouette_observations: list[SilhouetteObservation] | tuple[SilhouetteObservation, ...] | None = None,
+    ) -> ShapeFittingState:
+        self._last_silhouette_debug = self._make_empty_silhouette_debug(
+            enabled=self.silhouette_enabled,
+            reason="disabled" if not self.silhouette_enabled else "not_evaluated",
+        )
         if not self.enabled:
             return self._make_state(valid=False, template=None, fitted_points=None, centroid=None, reason="disabled")
 
@@ -668,7 +776,12 @@ class ShapeFittingTracker:
                 reason=state.reason,
                 tracking_mode="init",
             )
-            return state
+            return self._maybe_rerank_with_silhouette(
+                state,
+                template=template,
+                observed_points=filtered_points,
+                silhouette_observations=silhouette_observations,
+            )
 
         assert self._frozen_scale is not None
         assert self._frozen_scale_xyz is not None
@@ -738,7 +851,372 @@ class ShapeFittingTracker:
             icp_target_points=icp_target_points,
             icp_iterations_used=icp_iterations_used,
         )
+        return self._maybe_rerank_with_silhouette(
+            state,
+            template=template,
+            observed_points=filtered_points,
+            silhouette_observations=silhouette_observations,
+        )
+
+    def _maybe_rerank_with_silhouette(
+        self,
+        state: ShapeFittingState,
+        *,
+        template: ShapeTemplateModel,
+        observed_points: np.ndarray,
+        silhouette_observations: list[SilhouetteObservation] | tuple[SilhouetteObservation, ...] | None,
+    ) -> ShapeFittingState:
+        if not self.silhouette_enabled:
+            self._last_silhouette_debug = self._make_empty_silhouette_debug(enabled=False, reason="disabled")
+            self._apply_silhouette_fields_to_state(state)
+            self._apply_silhouette_fields_to_debug()
+            return state
+
+        if not self._silhouette_applies_to_template(template):
+            self._last_silhouette_debug = self._make_empty_silhouette_debug(enabled=True, reason="label_not_enabled")
+            self._apply_silhouette_fields_to_state(state)
+            self._apply_silhouette_fields_to_debug()
+            return state
+
+        if not state.valid or not self._initialized:
+            self._last_silhouette_debug = self._make_empty_silhouette_debug(enabled=True, reason="invalid_fit")
+            self._apply_silhouette_fields_to_state(state)
+            self._apply_silhouette_fields_to_debug()
+            return state
+
+        if not silhouette_observations:
+            self._last_silhouette_debug = self._make_empty_silhouette_debug(enabled=True, reason="no_masks")
+            self._apply_silhouette_fields_to_state(state)
+            self._apply_silhouette_fields_to_debug()
+            return state
+
+        if self._frozen_scale_xyz is None or len(self._current_template_points) == 0:
+            self._last_silhouette_debug = self._make_empty_silhouette_debug(enabled=True, reason="missing_template_state")
+            self._apply_silhouette_fields_to_state(state)
+            self._apply_silhouette_fields_to_debug()
+            return state
+
+        observed_points = np.asarray(observed_points, dtype=np.float64).reshape((-1, 3))
+        if len(observed_points) == 0:
+            self._last_silhouette_debug = self._make_empty_silhouette_debug(enabled=True, reason="no_3d_points")
+            self._apply_silhouette_fields_to_state(state)
+            self._apply_silhouette_fields_to_debug()
+            return state
+
+        pre_scale_xyz = np.asarray(self._frozen_scale_xyz, dtype=np.float64).reshape(3)
+        current_template_points = np.asarray(self._current_template_points, dtype=np.float64).reshape((-1, 3))
+        current_centroid = np.mean(current_template_points, axis=0)
+        pre_extent = _compute_robust_extent(current_template_points, 0.0, 100.0)
+        scale_mode = self._scale_mode_for_template(template)
+        candidate_scales = self._build_silhouette_scale_candidates(pre_scale_xyz, scale_mode=scale_mode)
+        if not candidate_scales:
+            self._last_silhouette_debug = self._make_empty_silhouette_debug(enabled=True, reason="no_candidates")
+            self._apply_silhouette_fields_to_state(state)
+            self._apply_silhouette_fields_to_debug()
+            return state
+
+        candidate_scores: list[_SilhouetteCandidateScore] = []
+        for candidate_index, candidate_scale_xyz in enumerate(candidate_scales):
+            candidate_points = _apply_similarity_pose(
+                template.canonical_points,
+                rotation=self._frozen_rotation,
+                target_center=current_centroid,
+                scale_xyz=candidate_scale_xyz,
+                scale_basis=self._frozen_scale_basis,
+                scale_center=self._frozen_scale_center,
+            )
+            robust_3d_loss = self._compute_robust_3d_loss(candidate_points, observed_points)
+            silhouette_score = compute_silhouette_score(
+                candidate_points,
+                silhouette_observations,
+                point_radius_px=self.silhouette_point_radius_px,
+                close_kernel_px=self.silhouette_close_kernel_px,
+                dilate_px=self.silhouette_dilate_px,
+                mask_erode_px=self.silhouette_mask_erode_px,
+                min_rendered_pixels=self.silhouette_min_rendered_pixels,
+                min_segmentation_pixels=self.silhouette_min_segmentation_pixels,
+                distance_trunc_px=self.silhouette_distance_trunc_px,
+                max_projection_points=self.silhouette_max_projection_points,
+            )
+            if not silhouette_score.valid:
+                continue
+            scale_prior_loss = self._compute_scale_prior_loss(candidate_scale_xyz, pre_scale_xyz)
+            temporal_scale_loss = self._compute_temporal_scale_loss(candidate_scale_xyz)
+            total_loss = (
+                self.silhouette_lambda_3d * robust_3d_loss
+                + self.silhouette_lambda_iou * silhouette_score.loss_iou
+                + self.silhouette_lambda_outside * silhouette_score.outside_loss
+                + self.silhouette_lambda_scale_prior * scale_prior_loss
+                + self.silhouette_lambda_temporal * temporal_scale_loss
+            )
+            ratios = candidate_scale_xyz / np.maximum(pre_scale_xyz, 1e-9)
+            candidate_scores.append(
+                _SilhouetteCandidateScore(
+                    index=candidate_index,
+                    scale_xyz=np.asarray(candidate_scale_xyz, dtype=np.float64).reshape(3),
+                    points_base=np.asarray(candidate_points, dtype=np.float64).reshape((-1, 3)),
+                    total_loss=float(total_loss),
+                    robust_3d_loss=float(robust_3d_loss),
+                    silhouette_score=silhouette_score,
+                    scale_prior_loss=float(scale_prior_loss),
+                    temporal_scale_loss=float(temporal_scale_loss),
+                    is_growth_candidate=bool(np.any(ratios > 1.000001)),
+                )
+            )
+
+        if not candidate_scores:
+            self._last_silhouette_debug = self._make_empty_silhouette_debug(
+                enabled=True,
+                reason="no_valid_silhouette",
+                candidate_count=len(candidate_scales),
+            )
+            self._apply_silhouette_fields_to_state(state)
+            self._apply_silhouette_fields_to_debug()
+            return state
+
+        baseline_score = candidate_scores[0]
+        eligible_scores = [
+            score
+            for score in candidate_scores
+            if self._silhouette_growth_candidate_allowed(score, baseline_score)
+        ]
+        if not eligible_scores:
+            eligible_scores = [baseline_score]
+        best_score = min(eligible_scores, key=lambda score: score.total_loss)
+
+        changed = bool(not np.allclose(best_score.scale_xyz, pre_scale_xyz, rtol=1e-4, atol=1e-6))
+        post_scale_xyz = best_score.scale_xyz
+        post_points = best_score.points_base
+        post_extent = _compute_robust_extent(post_points, 0.0, 100.0)
+        self._last_silhouette_scale_xyz = np.asarray(post_scale_xyz, dtype=np.float64).reshape(3).copy()
+        self._last_silhouette_debug = self._make_silhouette_debug_from_score(
+            best_score,
+            enabled=True,
+            reason="changed" if changed else "kept",
+            candidate_count=len(candidate_scales),
+            pre_scale_xyz=pre_scale_xyz,
+            post_scale_xyz=post_scale_xyz,
+            pre_extent=pre_extent,
+            post_extent=post_extent,
+            changed=changed,
+        )
+
+        if changed:
+            self._frozen_scale_xyz = np.asarray(post_scale_xyz, dtype=np.float64).reshape(3)
+            self._frozen_scale = float(np.median(self._frozen_scale_xyz))
+            self._current_template_points = np.asarray(post_points, dtype=np.float32).reshape((-1, 3))
+            output_points = self._downsample_output(self._current_template_points)
+            output_centroid = None if len(output_points) == 0 else np.mean(output_points, axis=0)
+            state = self._make_state(
+                valid=len(output_points) > 0,
+                template=template,
+                fitted_points=output_points,
+                centroid=output_centroid,
+                reason=state.reason,
+            )
+        else:
+            self._apply_silhouette_fields_to_state(state)
+            self.last_state = state
+
+        self._apply_silhouette_fields_to_debug()
         return state
+
+    def _silhouette_applies_to_template(self, template: ShapeTemplateModel | None) -> bool:
+        if template is None:
+            return False
+        if self.silhouette_apply_to_all:
+            return True
+        return str(template.label).strip().lower() in self.silhouette_apply_to_labels
+
+    def _build_silhouette_scale_candidates(self, scale_xyz: np.ndarray, *, scale_mode: str) -> list[np.ndarray]:
+        base_scale = np.asarray(scale_xyz, dtype=np.float64).reshape(3)
+        max_growth = max(float(self.silhouette_max_growth_factor), 1.0)
+        min_scale_xyz = np.full((3,), self.min_scale, dtype=np.float64)
+        max_scale_xyz = np.minimum(
+            np.full((3,), self.max_scale, dtype=np.float64),
+            base_scale * max_growth,
+        )
+
+        def clipped(candidate: np.ndarray) -> np.ndarray:
+            return np.clip(np.asarray(candidate, dtype=np.float64).reshape(3), min_scale_xyz, max_scale_xyz)
+
+        candidates: list[np.ndarray] = [clipped(base_scale)]
+        shrink_factors = [factor for factor in self.silhouette_shrink_factors if np.isfinite(factor) and factor > 0.0]
+        growth_factors = [
+            min(max(float(factor), 1.0), max_growth)
+            for factor in self.silhouette_uniform_growth_factors
+            if np.isfinite(float(factor)) and float(factor) > 0.0
+        ]
+
+        if scale_mode == SCALE_MODE_UNIFORM:
+            for factor in [*shrink_factors, 1.0, *growth_factors]:
+                candidates.append(clipped(base_scale * float(factor)))
+        else:
+            for factor in shrink_factors:
+                candidates.append(clipped(base_scale * float(factor)))
+            for axis_index in range(3):
+                for factor in shrink_factors:
+                    candidate = base_scale.copy()
+                    candidate[axis_index] *= float(factor)
+                    candidates.append(clipped(candidate))
+            for factor in growth_factors:
+                if factor > 1.0:
+                    candidates.append(clipped(base_scale * float(factor)))
+
+        return self._deduplicate_scale_candidates(candidates)
+
+    @staticmethod
+    def _deduplicate_scale_candidates(candidates: list[np.ndarray]) -> list[np.ndarray]:
+        unique_candidates: list[np.ndarray] = []
+        seen: set[tuple[float, float, float]] = set()
+        for candidate in candidates:
+            candidate = np.asarray(candidate, dtype=np.float64).reshape(3)
+            key = tuple(float(round(value, 6)) for value in candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_candidates.append(candidate)
+        return unique_candidates
+
+    def _compute_robust_3d_loss(self, candidate_points: np.ndarray, observed_points: np.ndarray) -> float:
+        candidate = np.asarray(candidate_points, dtype=np.float64).reshape((-1, 3))
+        observed = np.asarray(observed_points, dtype=np.float64).reshape((-1, 3))
+        if len(candidate) == 0 or len(observed) == 0:
+            return 1.0
+
+        candidate = _subsample_points_for_icp(candidate, self.silhouette_robust_3d_max_points)
+        observed = _subsample_points_for_icp(observed, self.silhouette_robust_3d_max_points)
+        trunc = max(float(self.silhouette_robust_3d_trunc_m), 1e-6)
+        template_to_cloud_distances, _ = _query_nearest_neighbors_batched(candidate, observed)
+        cloud_to_template_distances, _ = _query_nearest_neighbors_batched(observed, candidate)
+
+        if len(template_to_cloud_distances) == 0 or len(cloud_to_template_distances) == 0:
+            return 1.0
+
+        template_loss = float(np.mean(np.minimum(template_to_cloud_distances, trunc)) / trunc)
+        observed_loss = float(np.mean(np.minimum(cloud_to_template_distances, trunc)) / trunc)
+        return float(template_loss + self.silhouette_observed_to_template_weight * observed_loss)
+
+    def _compute_scale_prior_loss(self, candidate_scale_xyz: np.ndarray, baseline_scale_xyz: np.ndarray) -> float:
+        candidate = np.asarray(candidate_scale_xyz, dtype=np.float64).reshape(3)
+        baseline = np.asarray(baseline_scale_xyz, dtype=np.float64).reshape(3)
+        ratios = candidate / np.maximum(baseline, 1e-9)
+        growth = np.maximum(ratios - 1.0, 0.0)
+        shrink = np.maximum(1.0 - ratios, 0.0)
+        boundary_low = np.maximum(float(self.min_scale) - candidate, 0.0)
+        boundary_high = np.maximum(candidate - float(self.max_scale), 0.0)
+        return float(
+            self.silhouette_growth_penalty * np.mean(np.square(growth))
+            + 0.10 * np.mean(np.square(shrink))
+            + np.mean(np.square(boundary_low + boundary_high))
+        )
+
+    def _compute_temporal_scale_loss(self, candidate_scale_xyz: np.ndarray) -> float:
+        if self._last_silhouette_scale_xyz is None:
+            return 0.0
+        candidate = np.asarray(candidate_scale_xyz, dtype=np.float64).reshape(3)
+        previous = np.asarray(self._last_silhouette_scale_xyz, dtype=np.float64).reshape(3)
+        ratios = candidate / np.maximum(previous, 1e-9)
+        growth = np.maximum(ratios - 1.0, 0.0)
+        shrink = np.maximum(1.0 - ratios, 0.0)
+        return float(self.silhouette_growth_penalty * np.mean(np.square(growth)) + 0.05 * np.mean(np.square(shrink)))
+
+    @staticmethod
+    def _silhouette_growth_candidate_allowed(
+        score: _SilhouetteCandidateScore,
+        baseline_score: _SilhouetteCandidateScore,
+    ) -> bool:
+        if not score.is_growth_candidate:
+            return True
+        iou_improved = score.silhouette_score.mean_iou > baseline_score.silhouette_score.mean_iou + 1e-4
+        robust_not_worse = score.robust_3d_loss <= baseline_score.robust_3d_loss + 0.05
+        return bool(iou_improved and robust_not_worse)
+
+    @staticmethod
+    def _float_or_none(value: float | None) -> float | None:
+        if value is None:
+            return None
+        value = float(value)
+        return value if np.isfinite(value) else None
+
+    def _make_empty_silhouette_debug(
+        self,
+        *,
+        enabled: bool,
+        reason: str,
+        candidate_count: int = 0,
+    ) -> dict[str, Any]:
+        return {
+            "silhouette_enabled": bool(enabled),
+            "silhouette_reason": str(reason),
+            "silhouette_candidate_count": int(candidate_count),
+            "silhouette_valid_camera_count": 0,
+            "silhouette_best_iou_cam0": None,
+            "silhouette_best_iou_cam1": None,
+            "silhouette_loss": None,
+            "silhouette_outside_loss": None,
+            "robust_3d_loss": None,
+            "scale_prior_loss": None,
+            "temporal_scale_loss": None,
+            "pre_rerank_scale": None,
+            "post_rerank_scale": None,
+            "pre_rerank_scale_xyz": None,
+            "post_rerank_scale_xyz": None,
+            "pre_rerank_template_extent": None,
+            "post_rerank_template_extent": None,
+            "rerank_changed_candidate": False,
+        }
+
+    def _make_silhouette_debug_from_score(
+        self,
+        score: _SilhouetteCandidateScore,
+        *,
+        enabled: bool,
+        reason: str,
+        candidate_count: int,
+        pre_scale_xyz: np.ndarray,
+        post_scale_xyz: np.ndarray,
+        pre_extent: np.ndarray,
+        post_extent: np.ndarray,
+        changed: bool,
+    ) -> dict[str, Any]:
+        pre_scale_xyz = np.asarray(pre_scale_xyz, dtype=np.float64).reshape(3)
+        post_scale_xyz = np.asarray(post_scale_xyz, dtype=np.float64).reshape(3)
+        pre_extent = np.asarray(pre_extent, dtype=np.float64).reshape(3)
+        post_extent = np.asarray(post_extent, dtype=np.float64).reshape(3)
+        return {
+            "silhouette_enabled": bool(enabled),
+            "silhouette_reason": str(reason),
+            "silhouette_candidate_count": int(candidate_count),
+            "silhouette_valid_camera_count": int(score.silhouette_score.valid_camera_count),
+            "silhouette_best_iou_cam0": self._float_or_none(score.silhouette_score.per_camera_iou.get(0)),
+            "silhouette_best_iou_cam1": self._float_or_none(score.silhouette_score.per_camera_iou.get(1)),
+            "silhouette_loss": float(score.silhouette_score.loss_iou),
+            "silhouette_outside_loss": float(score.silhouette_score.outside_loss),
+            "robust_3d_loss": float(score.robust_3d_loss),
+            "scale_prior_loss": float(score.scale_prior_loss),
+            "temporal_scale_loss": float(score.temporal_scale_loss),
+            "pre_rerank_scale": float(np.median(pre_scale_xyz)),
+            "post_rerank_scale": float(np.median(post_scale_xyz)),
+            "pre_rerank_scale_xyz": tuple(float(value) for value in pre_scale_xyz),
+            "post_rerank_scale_xyz": tuple(float(value) for value in post_scale_xyz),
+            "pre_rerank_template_extent": tuple(float(value) for value in pre_extent),
+            "post_rerank_template_extent": tuple(float(value) for value in post_extent),
+            "rerank_changed_candidate": bool(changed),
+        }
+
+    def _apply_silhouette_fields_to_state(self, state: ShapeFittingState) -> None:
+        for key, value in self._last_silhouette_debug.items():
+            if hasattr(state, key):
+                setattr(state, key, value)
+
+    def _apply_silhouette_fields_to_debug(self) -> None:
+        debug = getattr(self, "last_debug", None)
+        if debug is None:
+            return
+        for key, value in self._last_silhouette_debug.items():
+            if hasattr(debug, key):
+                setattr(debug, key, value)
 
     def _initialize_template(self, template: ShapeTemplateModel, target_points: np.ndarray) -> np.ndarray:
         median_target_extent = np.median(np.asarray(self._extent_buffer, dtype=np.float64), axis=0)
@@ -1150,6 +1628,7 @@ class ShapeFittingTracker:
             icp_iterations_used=int(icp_iterations_used),
             z_rotation_deg=None if z_rotation_deg is None else float(z_rotation_deg),
         )
+        self._apply_silhouette_fields_to_debug()
 
     def _make_state(
         self,
@@ -1183,6 +1662,7 @@ class ShapeFittingTracker:
             initialized=bool(self._initialized),
             reason=str(reason),
         )
+        self._apply_silhouette_fields_to_state(state)
         self.last_state = state
         return state
 
@@ -1192,4 +1672,5 @@ __all__ = [
     "ShapeFittingDebug",
     "ShapeFittingState",
     "ShapeFittingTracker",
+    "SilhouetteObservation",
 ]

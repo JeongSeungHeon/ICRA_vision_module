@@ -413,6 +413,39 @@ perception:
       voxel_size_m: 0.004
       # fitted output cloud 최대 point 수입니다.
       max_points: 6000
+    silhouette_constraint:
+      # 투명 물체의 depth bleeding 때문에 template이 커지는 것을 막기 위한 2D mask rerank입니다.
+      enabled: true
+      # 아래 label에만 silhouette rerank를 적용합니다. apply_to_all을 true로 두면 전체 label에 적용됩니다.
+      apply_to_labels: ["cup", "wine glass", "glass", "bottle"]
+      apply_to_all: false
+      # 3D robust loss, IoU loss, mask 밖 projection penalty, scale prior, temporal scale penalty 가중치입니다.
+      lambda_3d: 1.0
+      lambda_iou: 0.75
+      lambda_outside: 1.25
+      lambda_scale_prior: 0.25
+      lambda_temporal: 0.4
+      # projected template point를 간단히 splat/rasterize할 때 쓰는 pixel 설정입니다.
+      point_radius_px: 2
+      close_kernel_px: 5
+      dilate_px: 1
+      mask_erode_px: 0
+      # 너무 작은 segmentation/rendering은 rerank evidence로 쓰지 않습니다.
+      min_rendered_pixels: 30
+      min_segmentation_pixels: 50
+      # mask 밖으로 벗어난 projection의 distance-transform penalty truncation입니다.
+      distance_trunc_px: 25.0
+      # bleeding outlier가 3D loss를 지배하지 않도록 nearest-neighbor loss를 clipping합니다.
+      robust_3d_trunc_m: 0.03
+      observed_to_template_weight: 0.25
+      robust_3d_max_points: 2000
+      max_projection_points: 1500
+      # scale rerank는 shrink 후보 위주로 만들고, 성장이 필요할 때도 작게만 허용합니다.
+      growth_penalty: 2.0
+      max_growth_factor: 1.05
+      shrink_factors: [0.75, 0.85, 0.95]
+      uniform_growth_factors: [1.0, 1.05]
+      debug: true
 
   activation:
     # hand와 object 거리로 접근 상태를 판단하는 threshold입니다.

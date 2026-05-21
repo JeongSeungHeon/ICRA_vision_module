@@ -346,17 +346,23 @@ def run_replay(input_path: str | Path, args: argparse.Namespace) -> OfflineRepla
                 object_cam1,
                 hand_approach_detected=previous_hand_approach,
             )
-            shape_fitting_state = pipeline["shape_fitting_tracker"].process(merged_object)
+            silhouette_observations = live.build_silhouette_observations(snapshot, pipeline)
+            shape_fitting_state = pipeline["shape_fitting_tracker"].process(
+                merged_object,
+                silhouette_observations=silhouette_observations,
+            )
             object_debug_cam0 = getattr(pipeline["object_worker_cam0"], "last_debug", None)
             cam0_mask = None if object_debug_cam0 is None else getattr(object_debug_cam0, "combined_mask", None)
-            pipeline["fill_level_estimator"].estimate_fill_level_from_cam0(
-                color_image_bgr=snapshot.cam0.color_image,
-                depth_image_m=snapshot.cam0.depth_image_m,
-                intrinsics=snapshot.cam0.intrinsics,
-                container_mask=cam0_mask,
-                camera_to_base=pipeline["transform_chain"].t_base_cam0,
-                label=object_cam0.label,
-            )
+            fill_level_estimator = pipeline.get("fill_level_estimator")
+            if fill_level_estimator is not None:
+                fill_level_estimator.estimate_fill_level_from_cam0(
+                    color_image_bgr=snapshot.cam0.color_image,
+                    depth_image_m=snapshot.cam0.depth_image_m,
+                    intrinsics=snapshot.cam0.intrinsics,
+                    container_mask=cam0_mask,
+                    camera_to_base=pipeline["transform_chain"].t_base_cam0,
+                    label=object_cam0.label,
+                )
             fitted_merged_object = live.build_fitted_merged_object(merged_object, shape_fitting_state)
             fusion_state = pipeline["fusion"].process_states(
                 fitted_merged_object,
