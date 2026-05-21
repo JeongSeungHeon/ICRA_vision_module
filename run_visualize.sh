@@ -1,1 +1,1 @@
-python tools/visualize_handover_3d_debug_rerun.py output/debug_3d/0520-DDK/7_hand_unstable-seg_gosomi.npz
+python tools/visualize_handover_3d_debug_rerun.py output/debug_3d/19_hand-center_wine.npz

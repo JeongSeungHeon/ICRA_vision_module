@@ -37,7 +37,7 @@ cameras:
     depth_filters:
       spatial:
         # RealSense spatial depth filter 사용 여부입니다.
-        enabled: false
+        enabled: true
         # spatial filter 강도입니다.
         magnitude: 2
         # spatial filter smoothing alpha입니다.
@@ -46,7 +46,7 @@ cameras:
         smooth_delta: 20
       temporal:
         # RealSense temporal depth filter 사용 여부입니다.
-        enabled: false
+        enabled: true
         # temporal filter smoothing alpha입니다.
         smooth_alpha: 0.4
         # temporal filter delta입니다.
@@ -56,6 +56,17 @@ cameras:
         enabled: false
         # hole filling mode 값입니다.
         mode: 1
+      bilateral:
+        # RealSense filter 이후 meter 단위 depth image에 OpenCV bilateral filter를 적용할지 정합니다.
+        enabled: true
+        # bilateral filter radius입니다. 실제 kernel 크기는 2 * radius + 1입니다.
+        radius: 2
+        # depth 값 차이에 대한 sigma입니다. meter 단위 depth에 적용됩니다.
+        sigma_color: 0.02
+        # bilateral filter 공간 sigma입니다.
+        sigma_space: 2.0
+        # 이 값 이상의 depth는 invalid로 보고 filter 후에도 0으로 유지합니다.
+        zfar: 100.0
   cam1:
     # DualSensorHub가 cam1 RealSense 장치를 열 때 사용할 serial입니다.
     serial: "327122075999"
@@ -87,6 +98,17 @@ cameras:
         enabled: false
         # hole filling mode 값입니다.
         mode: 1
+      bilateral:
+        # cam1 RealSense filter 이후 meter 단위 depth image에 OpenCV bilateral filter를 적용할지 정합니다.
+        enabled: true
+        # bilateral filter radius입니다. 실제 kernel 크기는 2 * radius + 1입니다.
+        radius: 2
+        # depth 값 차이에 대한 sigma입니다. meter 단위 depth에 적용됩니다.
+        sigma_color: 0.02
+        # bilateral filter 공간 sigma입니다.
+        sigma_space: 2.0
+        # 이 값 이상의 depth는 invalid로 보고 filter 후에도 0으로 유지합니다.
+        zfar: 100.0
 
 calibration:
   chain:
@@ -446,6 +468,16 @@ robot:
     pre_release_descend_m: 0.02
     # gripper release 후 x backoff 전에 robot base +Z 방향으로 올릴 거리입니다.
     post_release_z_offset_m: -0.03
+    # return_backoff moveL 이후 HOME moveJ로 넘어가기 전에 실제 정지를 확인합니다.
+    post_backoff_stop_check_enabled: true
+    # actual_tcp_speed linear norm이 이 값 이하이면 backoff 후 정지로 봅니다.
+    post_backoff_stop_speed_threshold_mps: 0.002
+    # backoff 후 정지 확인을 기다릴 최대 시간입니다.
+    post_backoff_stop_timeout_s: 1.0
+    # backoff 후 정지 확인 중 RTDE state/isSteady polling 주기입니다.
+    post_backoff_stop_poll_dt_s: 0.01
+    # true이면 backoff 후 정지 확인 실패 시 HOME moveJ로 진행하지 않고 sequence를 실패 처리합니다.
+    post_backoff_stop_require_confirmed: false
 
   tactile:
     # true이면 AnySkin tactile reader를 시작하고 grasp/release 판단에 사용합니다.
@@ -509,13 +541,13 @@ robot:
     # moveL을 async로 실행할지 정합니다.
     move_asynchronous: true
     # moveL acceleration입니다.
-    move_acceleration: 0.30
+    move_acceleration: 0.75
     # servoL lookahead_time입니다.
     servo_lookahead_time: 0.10
     # servoL gain입니다.
     servo_gain: 300
     # stopL/stop motion acceleration입니다. 기본은 0.1입니다만, tactile release descent에서 빠르게 멈추기 위해 5.0으로 높였습니다.
-    stop_acceleration: 5.0
+    stop_acceleration: 10.0
   motion:
     # RtdeController blocking move 기본 속도입니다.
     approach_speed_mps: 0.35

@@ -76,7 +76,7 @@ EEF_Y_OFFSET_MM = 0.0
 # grasp / place behavior
 HOVER_Z_OFFSET_MM = 0
 DESCEND_EXTRA_MM = 0.0
-BACKOFF_X_MM = 100.0
+BACKOFF_X_MM = 75.0
 DEFAULT_POST_RELEASE_Z_OFFSET_MM = 0.0
 HOME_PLACE_X_OFFSET_MM = 0.0
 HOME_PLACE_Y_OFFSET_MM = -3.0
@@ -109,6 +109,11 @@ DEFAULT_TACTILE_RELEASE_STOP_TIMING_DEBUG = False
 DEFAULT_TACTILE_RELEASE_STOP_SPEED_THRESHOLD_MPS = 0.002
 DEFAULT_TACTILE_RELEASE_STOP_MONITOR_TIMEOUT_S = 1.0
 DEFAULT_TACTILE_RELEASE_STOP_MONITOR_POLL_DT_S = 0.005
+DEFAULT_POST_BACKOFF_STOP_CHECK_ENABLED = True
+DEFAULT_POST_BACKOFF_STOP_SPEED_THRESHOLD_MPS = 0.002
+DEFAULT_POST_BACKOFF_STOP_TIMEOUT_S = 1.0
+DEFAULT_POST_BACKOFF_STOP_POLL_DT_S = 0.01
+DEFAULT_POST_BACKOFF_STOP_REQUIRE_CONFIRMED = False
 HOME_JOINTS_DEG = [0.0, -135.0, 135.0, 0.0, 90.0, 0.0]
 HOME_JOINT_TOLERANCE_DEG = 1.0
 HOME_JOINT_SPEED_RAD_S = 0.5
@@ -419,6 +424,32 @@ def apply_config_defaults(args, config):
         else return_sequence_cfg.get("pre_release_descend_m", RELEASE_PARAMETER_MM / 1000.0)
     )
     args.pre_release_descend_mm = max(0.0, float(pre_release_descend_m) * 1000.0)
+    args.post_backoff_stop_check_enabled = bool(
+        return_sequence_cfg.get("post_backoff_stop_check_enabled", DEFAULT_POST_BACKOFF_STOP_CHECK_ENABLED)
+    )
+    args.post_backoff_stop_speed_threshold_mps = max(
+        0.0,
+        float(
+            return_sequence_cfg.get(
+                "post_backoff_stop_speed_threshold_mps",
+                DEFAULT_POST_BACKOFF_STOP_SPEED_THRESHOLD_MPS,
+            )
+        ),
+    )
+    args.post_backoff_stop_timeout_s = max(
+        0.0,
+        float(return_sequence_cfg.get("post_backoff_stop_timeout_s", DEFAULT_POST_BACKOFF_STOP_TIMEOUT_S)),
+    )
+    args.post_backoff_stop_poll_dt_s = max(
+        0.0,
+        float(return_sequence_cfg.get("post_backoff_stop_poll_dt_s", DEFAULT_POST_BACKOFF_STOP_POLL_DT_S)),
+    )
+    args.post_backoff_stop_require_confirmed = bool(
+        return_sequence_cfg.get(
+            "post_backoff_stop_require_confirmed",
+            DEFAULT_POST_BACKOFF_STOP_REQUIRE_CONFIRMED,
+        )
+    )
 
     for axis_name in ("x", "y", "z"):
         arg_name = f"workspace_{axis_name}"
@@ -1665,6 +1696,25 @@ class RobotWorker:
         # robot worker가 servo 명령을 쥐고 있지 않음을 shared state에 알린다.
         self.shared_state.set_follow_thread_idle(True)
 
+    def _publish_robot_state(self, state):
+        # blocking move/gripper helper 안에서 읽은 RTDE state를 main loop가 볼 수 있게 publish한다.
+        if state is None:
+            return
+        updates = {}
+        if hasattr(state, "actual_tcp_pose_base"):
+            pose = getattr(state, "actual_tcp_pose_base", None)
+            updates["last_robot_pose"] = None if pose is None else tuple(float(v) for v in pose)
+        if hasattr(state, "is_connected"):
+            updates["is_connected"] = bool(getattr(state, "is_connected", False))
+        using_mock = getattr(state, "using_mock", getattr(self.controller, "using_mock", None))
+        if using_mock is not None:
+            updates["using_mock"] = bool(using_mock)
+        if hasattr(state, "last_error"):
+            updates["last_error"] = getattr(state, "last_error", None)
+        if updates:
+            self._set_status(**updates)
+        self._last_status_read_t = time.time()
+
     def _read_robot_state(self):
         # controller가 없으면 연결되지 않은 상태로 status를 갱신한다.
         if self.controller is None:
@@ -1678,20 +1728,8 @@ class RobotWorker:
             self._set_status(last_error=str(exc), is_connected=False)
             return None
 
-        # actual_tcp_pose_base를 tuple(float)로 정규화해 status에 저장한다.
-        pose = getattr(state, "actual_tcp_pose_base", None)
-        pose_tuple = None if pose is None else tuple(float(v) for v in pose)
-        # mock controller 사용 여부를 state 또는 controller 속성에서 확인한다.
-        using_mock = bool(getattr(state, "using_mock", getattr(self.controller, "using_mock", False)))
         # 외부 main loop가 볼 수 있도록 최신 robot status를 publish한다.
-        self._set_status(
-            is_connected=bool(getattr(state, "is_connected", False)),
-            using_mock=using_mock,
-            last_robot_pose=pose_tuple,
-            last_error=getattr(state, "last_error", None),
-        )
-        # non-follow 상태에서 status read 주기를 제한하기 위한 timestamp다.
-        self._last_status_read_t = time.time()
+        self._publish_robot_state(state)
         return state
 
     def _send_robot_command(self, command_type, **kwargs):
@@ -1810,7 +1848,12 @@ class RobotWorker:
             # 초기 연결 상태와 TCP pose를 읽어 status에 반영한다.
             self._read_robot_state()
             # task 시작 전 HOME joint pose로 이동한다.
-            home_ok = move_robot_to_home_pose(self.controller, self.args, cancel_event=self._cancel_event)
+            home_ok = move_robot_to_home_pose(
+                self.controller,
+                self.args,
+                cancel_event=self._cancel_event,
+                on_state_read=self._publish_robot_state,
+            )
             # HOME 이동이 취소된 경우 idle 상태로 돌아간다.
             if home_ok is False:
                 self._set_status(state=ROBOT_STATE_IDLE, last_error="robot initialization cancelled")
@@ -1921,6 +1964,7 @@ class RobotWorker:
             tactile_contact_threshold=self.args.tactile_contact_norm_threshold,
             tactile_extra_grasp_pos=self.args.tactile_extra_grasp_pos,
             cancel_event=self._cancel_event,
+            on_state_read=self._publish_robot_state,
         )
         # grasp 판정 결과를 status에 기록한다.
         self._set_status(grasp_ok=bool(grasp_ok))
@@ -1936,7 +1980,7 @@ class RobotWorker:
             return
 
         # grasp 성공 후 현재 TCP와 object target 간 offset을 저장해 place 계산에 사용한다.
-        save_grasp_offset(self.controller, self.shared_state)
+        save_grasp_offset(self.controller, self.shared_state, on_state_read=self._publish_robot_state)
         # offset 저장 직후 취소가 들어왔는지 다시 확인한다.
         if self._cancel_event.is_set():
             self._safe_stop(source_mode="post_grasp_cancelled")
@@ -1954,6 +1998,7 @@ class RobotWorker:
             metadata_recorder=self.metadata_recorder,
             tactile_manager=self.tactile_manager,
             cancel_event=self._cancel_event,
+            on_state_read=self._publish_robot_state,
         )
         # place 중 취소되면 stop 후 idle로 돌아간다.
         if self._cancel_event.is_set():
@@ -1989,7 +2034,12 @@ class RobotWorker:
                     cancel_event=self._cancel_event,
                 )
                 # HOME joint pose로 복귀한다.
-                home_ok = move_robot_to_home_pose(self.controller, self.args, cancel_event=self._cancel_event)
+                home_ok = move_robot_to_home_pose(
+                    self.controller,
+                    self.args,
+                    cancel_event=self._cancel_event,
+                    on_state_read=self._publish_robot_state,
+                )
                 # HOME 이동 취소 시 idle로만 돌아간다.
                 if home_ok is False:
                     self._set_status(state=ROBOT_STATE_IDLE, last_error="reset cancelled")
@@ -2189,7 +2239,92 @@ class RobotWorker:
             print(f"[WARN] servo command failed: {exc}")
 
 
-def wait_until_target_reached(controller, target_position_base, *, timeout_s, tolerance_m, poll_dt=0.05, cancel_event=None):
+def compute_tcp_speed_norms(state):
+    """Return linear/angular TCP speed norms from a RobotState-like object."""
+    speed = getattr(state, "actual_tcp_speed", None)
+    if speed is None or len(speed) < 3:
+        return None, None
+    try:
+        linear_values = np.asarray(speed[:3], dtype=np.float64)
+        linear_norm = float(np.linalg.norm(linear_values))
+        angular_norm = None
+        if len(speed) >= 6:
+            angular_values = np.asarray(speed[3:6], dtype=np.float64)
+            angular_norm = float(np.linalg.norm(angular_values))
+        return linear_norm, angular_norm
+    except Exception:
+        return None, None
+
+
+def read_rtde_is_steady(controller):
+    """Return RTDE isSteady() when available; otherwise None."""
+    rtde_control = getattr(controller, "_rtde_control", None)
+    is_steady = getattr(rtde_control, "isSteady", None)
+    if not callable(is_steady):
+        return None
+    try:
+        return bool(is_steady())
+    except Exception:
+        return None
+
+
+def wait_until_robot_stopped(
+    controller,
+    *,
+    timeout_s,
+    speed_threshold_mps=DEFAULT_POST_BACKOFF_STOP_SPEED_THRESHOLD_MPS,
+    poll_dt=DEFAULT_POST_BACKOFF_STOP_POLL_DT_S,
+    cancel_event=None,
+    on_state_read=None,
+    source_mode="robot_stop_wait",
+):
+    """Poll robot state until TCP speed or RTDE steady status indicates a stop."""
+    del source_mode
+    if cancel_event is not None and cancel_event.is_set():
+        safe_stop_rtde(controller)
+        return False
+    if not hasattr(controller, "read_robot_state"):
+        return False
+
+    deadline = time.time() + max(0.0, float(timeout_s))
+    threshold = max(0.0, float(speed_threshold_mps))
+    poll_dt = max(0.0, float(poll_dt))
+
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            safe_stop_rtde(controller)
+            return False
+        try:
+            state = controller.read_robot_state(now_timestamp=time.time())
+            if on_state_read is not None:
+                on_state_read(state)
+        except Exception:
+            state = None
+
+        if state is not None:
+            linear_speed, _angular_speed = compute_tcp_speed_norms(state)
+            if linear_speed is not None and linear_speed <= threshold:
+                return True
+
+        is_steady = read_rtde_is_steady(controller)
+        if is_steady is True:
+            return True
+
+        if time.time() >= deadline:
+            return False
+        time.sleep(poll_dt)
+
+
+def wait_until_target_reached(
+    controller,
+    target_position_base,
+    *,
+    timeout_s,
+    tolerance_m,
+    poll_dt=0.05,
+    cancel_event=None,
+    on_state_read=None,
+):
     """Poll the robot pose until a blocking move reaches its target or times out."""
     deadline = time.time() + timeout_s
     target = np.asarray(target_position_base, dtype=np.float32).reshape(3)
@@ -2199,6 +2334,8 @@ def wait_until_target_reached(controller, target_position_base, *, timeout_s, to
             safe_stop_rtde(controller)
             return False
         state = controller.read_robot_state(now_timestamp=time.time())
+        if on_state_read is not None:
+            on_state_read(state)
         pose = state.actual_tcp_pose_base
         if pose is not None:
             current = np.asarray(pose[:3], dtype=np.float32).reshape(3)
@@ -2209,7 +2346,16 @@ def wait_until_target_reached(controller, target_position_base, *, timeout_s, to
     return False
 
 
-def wait_until_joint_target_reached(controller, target_joints_rad, *, timeout_s, tolerance_rad, poll_dt=0.05, cancel_event=None):
+def wait_until_joint_target_reached(
+    controller,
+    target_joints_rad,
+    *,
+    timeout_s,
+    tolerance_rad,
+    poll_dt=0.05,
+    cancel_event=None,
+    on_state_read=None,
+):
     """Poll the robot joints until the target is reached or the move times out."""
     deadline = time.time() + timeout_s
     target = np.asarray(target_joints_rad, dtype=np.float64).reshape(6)
@@ -2222,6 +2368,8 @@ def wait_until_joint_target_reached(controller, target_joints_rad, *, timeout_s,
                 safe_stop_rtde(controller)
             return False
         state = controller.read_robot_state(now_timestamp=time.time())
+        if on_state_read is not None:
+            on_state_read(state)
         joints = getattr(state, "joint_positions", None)
         if joints is not None:
             current = np.asarray(joints, dtype=np.float64).reshape(6)
@@ -2233,7 +2381,17 @@ def wait_until_joint_target_reached(controller, target_joints_rad, *, timeout_s,
     return False
 
 
-def move_robot_and_wait(controller, target_position_base, fixed_orientation_base, *, timeout_s, tolerance_m, source_mode, cancel_event=None):
+def move_robot_and_wait(
+    controller,
+    target_position_base,
+    fixed_orientation_base,
+    *,
+    timeout_s,
+    tolerance_m,
+    source_mode,
+    cancel_event=None,
+    on_state_read=None,
+):
     """Issue one blocking position move and wait for completion."""
     if cancel_event is not None and cancel_event.is_set():
         safe_stop_rtde(controller)
@@ -2252,6 +2410,7 @@ def move_robot_and_wait(controller, target_position_base, fixed_orientation_base
         timeout_s=timeout_s,
         tolerance_m=tolerance_m,
         cancel_event=cancel_event,
+        on_state_read=on_state_read,
     )
 
 
@@ -2266,7 +2425,7 @@ def stop_follow_for_handoff(shared_state, timeout_s):
     return True
 
 
-def move_robot_to_home_pose(controller, args, cancel_event=None):
+def move_robot_to_home_pose(controller, args, cancel_event=None, on_state_read=None):
     """Move the robot to the configured HOME joint target before or between tasks."""
     if cancel_event is not None and cancel_event.is_set():
         safe_stop_rtde(controller)
@@ -2298,6 +2457,7 @@ def move_robot_to_home_pose(controller, args, cancel_event=None):
         timeout_s=args.move_timeout_s,
         tolerance_rad=float(np.deg2rad(HOME_JOINT_TOLERANCE_DEG)),
         cancel_event=cancel_event,
+        on_state_read=on_state_read,
     )
     if not ok:
         if hasattr(controller, "stop_joint_motion"):
@@ -2894,6 +3054,7 @@ def execute_gripper_close(
     tactile_contact_threshold=None,
     tactile_extra_grasp_pos=None,
     cancel_event=None,
+    on_state_read=None,
 ):
     """Close the gripper and stop when force or position indicates contact."""
     if verbose:
@@ -2904,6 +3065,8 @@ def execute_gripper_close(
         return False
 
     baseline_state = controller.read_robot_state(now_timestamp=time.time())
+    if on_state_read is not None:
+        on_state_read(baseline_state)
     baseline_force_norm = baseline_state.tcp_force_norm_n
     if verbose:
         print(f"[INFO] Pre-close baseline force_norm={baseline_force_norm}")
@@ -2954,6 +3117,8 @@ def execute_gripper_close(
                 tactile_manager.release_status = "close_cancelled"
             return False
         state = controller.read_robot_state(now_timestamp=time.time())
+        if on_state_read is not None:
+            on_state_read(state)
         force_norm = state.tcp_force_norm_n
         elapsed = time.time() - loop_start
         force_delta = None
@@ -3172,6 +3337,7 @@ def execute_tactile_release_descent(
     start_pose_mm,
     args,
     cancel_event=None,
+    on_state_read=None,
 ):
     """Descend in -Z until tactile release trigger or the configured lower bound."""
     # 시작 pose[mm]에서 x, y, z만 float으로 꺼낸다.
@@ -3292,33 +3458,6 @@ def execute_tactile_release_descent(
             fields.append(f"{key}={value}")
         print("[TactileTiming] " + " ".join(fields), flush=True)
 
-    def compute_tcp_speed_norms(state):
-        speed = getattr(state, "actual_tcp_speed", None)
-        if speed is None or len(speed) < 3:
-            return None, None
-        try:
-            linear_values = np.asarray(speed[:3], dtype=np.float64)
-            linear_norm = float(np.linalg.norm(linear_values))
-            angular_norm = None
-            if len(speed) >= 6:
-                angular_values = np.asarray(speed[3:6], dtype=np.float64)
-                angular_norm = float(np.linalg.norm(angular_values))
-            return linear_norm, angular_norm
-        except Exception:
-            return None, None
-
-    def read_rtde_is_steady():
-        rtde_control = getattr(controller, "_rtde_control", None)
-        is_steady = getattr(rtde_control, "isSteady", None)
-        if not callable(is_steady):
-            return None
-        try:
-            return bool(is_steady())
-        except Exception as exc:
-            if release_stop_timing_debug:
-                log_release_stop_timing("isSteady_error", error=repr(exc))
-            return None
-
     def monitor_release_stop(trigger_info, stop_issue_perf, stop_return_perf):
         if not release_stop_timing_debug:
             return
@@ -3336,6 +3475,8 @@ def execute_tactile_release_descent(
             state_read_unix = time.time()
             try:
                 state = controller.read_robot_state(now_timestamp=state_read_unix)
+                if on_state_read is not None:
+                    on_state_read(state)
                 linear_speed, angular_speed = compute_tcp_speed_norms(state)
                 last_linear_speed = linear_speed
                 last_angular_speed = angular_speed
@@ -3344,7 +3485,7 @@ def execute_tactile_release_descent(
                 linear_speed = None
                 angular_speed = None
 
-            is_steady = read_rtde_is_steady()
+            is_steady = read_rtde_is_steady(controller)
             observed_perf = time.perf_counter()
             observed_unix = time.time()
             if is_steady is not None:
@@ -3432,6 +3573,8 @@ def execute_tactile_release_descent(
     def read_current_pose_mm():
         # RTDE에서 현재 TCP pose를 읽는다.
         state = controller.read_robot_state(now_timestamp=time.time())
+        if on_state_read is not None:
+            on_state_read(state)
         pose = state.actual_tcp_pose_base
         # pose를 못 읽으면 None을 반환해 바깥 loop에서 안전 정지한다.
         if pose is None:
@@ -3595,7 +3738,7 @@ def reset_tactile_baseline_after_open(tactile_manager, delay_s, cancel_event=Non
         tactile_manager.release_status = "baseline_reset"
 
 
-def save_grasp_offset(controller, shared_state):
+def save_grasp_offset(controller, shared_state, on_state_read=None):
     """Store object-to-tool offset and freeze place-height data after grasp."""
     snap = shared_state.get_snapshot()
     obj_xyz = snap["latest_object_xyz_mm"]
@@ -3604,6 +3747,8 @@ def save_grasp_offset(controller, shared_state):
         return False
 
     state = controller.read_robot_state(now_timestamp=time.time())
+    if on_state_read is not None:
+        on_state_read(state)
     cur_pose = state.actual_tcp_pose_base
     if cur_pose is None:
         print("[WARN] Cannot read EEF pose for grasp offset.")
@@ -3711,7 +3856,15 @@ def compute_pre_release_descend_target_mm(place_x, place_y, place_z, args):
     }
 
 
-def execute_return_and_place(controller, shared_state, args, metadata_recorder=None, tactile_manager=None, cancel_event=None):
+def execute_return_and_place(
+    controller,
+    shared_state,
+    args,
+    metadata_recorder=None,
+    tactile_manager=None,
+    cancel_event=None,
+    on_state_read=None,
+):
     """Run the post-grasp return, release, backoff, and HOME sequence."""
     # 함수 시작 시 이미 cancel 요청이 들어온 상태라면 로봇을 멈추고 실패로 종료한다.
     if cancel_event is not None and cancel_event.is_set():
@@ -3748,6 +3901,8 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
         # cancel_event가 있으면 blocking move 중간에도 취소할 수 있도록 전달한다.
         if cancel_event is not None:
             kwargs["cancel_event"] = cancel_event
+        if on_state_read is not None:
+            kwargs["on_state_read"] = on_state_read
         # 지정한 target position/orientation으로 이동 명령을 보내고 도달 여부를 기다린다.
         return move_robot_and_wait(
             controller,
@@ -3861,6 +4016,8 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
         descent_kwargs = {}
         if cancel_event is not None:
             descent_kwargs["cancel_event"] = cancel_event
+        if on_state_read is not None:
+            descent_kwargs["on_state_read"] = on_state_read
         # tactile 변화량을 보면서 release에 적절한 위치까지 추가 하강한다.
         descent_result = execute_tactile_release_descent(
             controller,
@@ -3949,9 +4106,46 @@ def execute_return_and_place(controller, shared_state, args, metadata_recorder=N
         print("[WARN] Back off move timed out.")
         return False
 
+    # backoff moveL이 위치 tolerance만 만족한 상태에서 바로 moveJ로 전환되지 않도록 실제 정지를 확인한다.
+    if bool(getattr(args, "post_backoff_stop_check_enabled", DEFAULT_POST_BACKOFF_STOP_CHECK_ENABLED)):
+        stop_confirmed = wait_until_robot_stopped(
+            controller,
+            timeout_s=getattr(args, "post_backoff_stop_timeout_s", DEFAULT_POST_BACKOFF_STOP_TIMEOUT_S),
+            speed_threshold_mps=getattr(
+                args,
+                "post_backoff_stop_speed_threshold_mps",
+                DEFAULT_POST_BACKOFF_STOP_SPEED_THRESHOLD_MPS,
+            ),
+            poll_dt=getattr(args, "post_backoff_stop_poll_dt_s", DEFAULT_POST_BACKOFF_STOP_POLL_DT_S),
+            cancel_event=cancel_event,
+            on_state_read=on_state_read,
+            source_mode="post_backoff_stop_check",
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        if stop_confirmed:
+            print("[INFO] POST-backoff stop confirmed before HOME moveJ.")
+        else:
+            message = "[WARN] POST-backoff stop was not confirmed before HOME moveJ."
+            if bool(
+                getattr(
+                    args,
+                    "post_backoff_stop_require_confirmed",
+                    DEFAULT_POST_BACKOFF_STOP_REQUIRE_CONFIRMED,
+                )
+            ):
+                print(message + " Aborting return sequence because confirmation is required.")
+                return False
+            print(message + " Continuing with HOME moveJ.")
+
     # 정상 경로에서는 joint HOME pose로 복귀한다.
     try:
-        home_ok = move_robot_to_home_pose(controller, args, cancel_event=cancel_event)
+        home_kwargs = {}
+        if cancel_event is not None:
+            home_kwargs["cancel_event"] = cancel_event
+        if on_state_read is not None:
+            home_kwargs["on_state_read"] = on_state_read
+        home_ok = move_robot_to_home_pose(controller, args, **home_kwargs)
         # HOME 이동이 cancel로 False를 반환하면 실패 처리한다.
         if home_ok is False:
             return False

@@ -12,6 +12,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from utils.depth_filters import bilateral_filter_depth
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FDCT_ROOT = REPO_ROOT / "FDCT"
@@ -218,36 +220,6 @@ def infer_depth(
         interpolation=cv2.INTER_NEAREST,
     )
     return preprocessed_depth, completed_np, elapsed_ms
-
-
-def bilateral_filter_depth(
-    depth_m: np.ndarray,
-    radius: int = 2,
-    zfar: float = 100.0,
-    sigma_space: float = 2.0,
-) -> np.ndarray:
-    depth_np = np.asarray(depth_m, dtype=np.float32)
-    if depth_np.size == 0:
-        return depth_np.copy()
-
-    valid = np.isfinite(depth_np)
-    valid &= depth_np >= 0.001
-    valid &= depth_np < float(zfar)
-    if not np.any(valid):
-        return np.zeros_like(depth_np, dtype=np.float32)
-
-    filtered = depth_np.copy()
-    filtered[~valid] = 0.0
-    ksize = max(1, int(radius) * 2 + 1)
-    filtered = cv2.bilateralFilter(
-        filtered,
-        d=ksize,
-        sigmaColor=0.02,
-        sigmaSpace=max(float(sigma_space), 1.0),
-    )
-    filtered = np.asarray(filtered, dtype=np.float32)
-    filtered[~valid] = 0.0
-    return filtered
 
 
 class FDCTDepthCompleter:

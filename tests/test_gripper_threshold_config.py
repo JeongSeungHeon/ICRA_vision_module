@@ -248,6 +248,29 @@ class DummyPoseController:
         return SimpleNamespace(actual_tcp_pose_base=pose_base)
 
 
+class DummyStopController:
+    def __init__(self, speeds, *, steady_values=None):
+        self._speeds = list(speeds)
+        self._rtde_control = SimpleNamespace(isSteady=self._read_steady)
+        self._steady_values = list(steady_values or [])
+
+    def _read_steady(self):
+        if not self._steady_values:
+            return False
+        return bool(self._steady_values.pop(0))
+
+    def read_robot_state(self, *, now_timestamp=None):
+        del now_timestamp
+        if self._speeds:
+            speed = self._speeds.pop(0)
+        else:
+            speed = (1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        return SimpleNamespace(
+            actual_tcp_speed=tuple(float(v) for v in speed),
+            actual_tcp_pose_base=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        )
+
+
 class DummyTactile:
     enabled = True
 
@@ -549,6 +572,111 @@ class RobotWorkerThreadStructureTests(unittest.TestCase):
         self.assertTrue(status.grasp_ok)
         self.assertEqual(status.task_done_epoch, 1)
 
+    def test_worker_grasp_place_publishes_pose_from_blocking_callbacks(self):
+        worker, _shared_state, _controller = self.make_worker()
+        worker._set_status(state=_MODULE.ROBOT_STATE_FOLLOWING)
+
+        def make_state(x):
+            return SimpleNamespace(
+                is_connected=True,
+                using_mock=True,
+                actual_tcp_pose_base=(float(x), 0.0, 0.0, 0.0, 0.0, 0.0),
+                last_error=None,
+            )
+
+        def fake_gripper_close(*args, **kwargs):
+            del args
+            kwargs["on_state_read"](make_state(0.1))
+            return True
+
+        def fake_save_offset(*args, **kwargs):
+            del args
+            kwargs["on_state_read"](make_state(0.2))
+            return True
+
+        def fake_return_place(*args, **kwargs):
+            del args
+            kwargs["on_state_read"](make_state(0.3))
+            return True
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            with unittest.mock.patch.object(_MODULE, "execute_gripper_close", side_effect=fake_gripper_close):
+                with unittest.mock.patch.object(_MODULE, "save_grasp_offset", side_effect=fake_save_offset):
+                    with unittest.mock.patch.object(_MODULE, "execute_return_and_place", side_effect=fake_return_place):
+                        worker._handle_start_grasp_place({"context": _MODULE.RobotActionContext()})
+
+        status = worker.get_status()
+        self.assertEqual(status.state, _MODULE.ROBOT_STATE_DONE)
+        self.assertEqual(status.last_robot_pose, (0.3, 0.0, 0.0, 0.0, 0.0, 0.0))
+
+    def test_wait_until_target_reached_reports_each_robot_state(self):
+        controller = DummyPoseController([(100.0, 0.0, 0.0)])
+        states = []
+
+        ok = _MODULE.wait_until_target_reached(
+            controller,
+            (0.1, 0.0, 0.0),
+            timeout_s=0.1,
+            tolerance_m=0.0,
+            poll_dt=0.0,
+            on_state_read=states.append,
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(len(states), 1)
+        self.assertEqual(states[0].actual_tcp_pose_base, (0.1, 0.0, 0.0, 0.0, 0.0, 0.0))
+
+    def test_wait_until_robot_stopped_accepts_low_tcp_speed(self):
+        controller = DummyStopController([(0.001, 0.0, 0.0, 0.0, 0.0, 0.0)])
+
+        ok = _MODULE.wait_until_robot_stopped(
+            controller,
+            timeout_s=0.1,
+            speed_threshold_mps=0.002,
+            poll_dt=0.0,
+        )
+
+        self.assertTrue(ok)
+
+    def test_wait_until_robot_stopped_accepts_rtde_steady(self):
+        controller = DummyStopController(
+            [(0.05, 0.0, 0.0, 0.0, 0.0, 0.0)],
+            steady_values=[True],
+        )
+
+        ok = _MODULE.wait_until_robot_stopped(
+            controller,
+            timeout_s=0.1,
+            speed_threshold_mps=0.002,
+            poll_dt=0.0,
+        )
+
+        self.assertTrue(ok)
+
+    def test_wait_until_robot_stopped_times_out_when_motion_continues(self):
+        controller = DummyStopController([(0.05, 0.0, 0.0, 0.0, 0.0, 0.0)])
+
+        ok = _MODULE.wait_until_robot_stopped(
+            controller,
+            timeout_s=0.0,
+            speed_threshold_mps=0.002,
+            poll_dt=0.0,
+        )
+
+        self.assertFalse(ok)
+
+    def test_wait_until_robot_stopped_accepts_mock_zero_speed(self):
+        controller = DummyStopController([(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)])
+
+        ok = _MODULE.wait_until_robot_stopped(
+            controller,
+            timeout_s=0.1,
+            speed_threshold_mps=0.002,
+            poll_dt=0.0,
+        )
+
+        self.assertTrue(ok)
+
     def test_cancelled_wait_sends_stop_command(self):
         controller = DummyWorkerController()
         cancel_event = threading.Event()
@@ -826,6 +954,13 @@ class TactileConfigAndBehaviorTests(unittest.TestCase):
         args = config_args()
         config = {
             "robot": {
+                "return_sequence": {
+                    "post_backoff_stop_check_enabled": True,
+                    "post_backoff_stop_speed_threshold_mps": 0.003,
+                    "post_backoff_stop_timeout_s": 0.4,
+                    "post_backoff_stop_poll_dt_s": 0.02,
+                    "post_backoff_stop_require_confirmed": True,
+                },
                 "tactile": {
                     "enabled": True,
                     "port": "/dev/ttyUSB9",
@@ -859,6 +994,11 @@ class TactileConfigAndBehaviorTests(unittest.TestCase):
         self.assertAlmostEqual(resolved.tactile_release_descent_step_mm, 3.0)
         self.assertAlmostEqual(resolved.tactile_release_descent_poll_dt_s, 0.02)
         self.assertFalse(resolved.tactile_debug)
+        self.assertTrue(resolved.post_backoff_stop_check_enabled)
+        self.assertAlmostEqual(resolved.post_backoff_stop_speed_threshold_mps, 0.003)
+        self.assertAlmostEqual(resolved.post_backoff_stop_timeout_s, 0.4)
+        self.assertAlmostEqual(resolved.post_backoff_stop_poll_dt_s, 0.02)
+        self.assertTrue(resolved.post_backoff_stop_require_confirmed)
 
     def test_system_reset_clears_tactile_reference_delta_and_latest(self):
         tactile = DummyTactile([10.0])

@@ -2,6 +2,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from utils.depth_filters import bilateral_filter_depth
+
 try:
     import pyrealsense2 as rs
 except ImportError:
@@ -51,6 +53,7 @@ class RealSenseCamera:
         self._spatial_filter = self._build_spatial_filter()
         self._temporal_filter = self._build_temporal_filter()
         self._hole_filling_filter = self._build_hole_filling_filter()
+        self._bilateral_filter_config = self._build_bilateral_filter_config()
 
         device = self.profile.get_device()
         self.serial = device.get_info(rs.camera_info.serial_number)
@@ -100,6 +103,17 @@ class RealSenseCamera:
             filter_obj.set_option(rs.option.holes_fill, float(cfg["mode"]))
         return filter_obj
 
+    def _build_bilateral_filter_config(self):
+        cfg = dict(self.depth_filters_config.get("bilateral", {}) or {})
+        if not cfg.get("enabled", False):
+            return None
+        return {
+            "radius": int(cfg.get("radius", 2)),
+            "sigma_color": float(cfg.get("sigma_color", 0.02)),
+            "sigma_space": float(cfg.get("sigma_space", 2.0)),
+            "zfar": float(cfg.get("zfar", 100.0)),
+        }
+
     def _apply_depth_filters(self, depth_frame):
         filtered = depth_frame
         if self._spatial_filter is not None:
@@ -109,6 +123,11 @@ class RealSenseCamera:
         if self._hole_filling_filter is not None:
             filtered = self._hole_filling_filter.process(filtered)
         return filtered
+
+    def _apply_bilateral_filter(self, depth_image_m):
+        if self._bilateral_filter_config is None:
+            return depth_image_m
+        return bilateral_filter_depth(depth_image_m, **self._bilateral_filter_config)
 
     def read(self):
         frames = self.pipeline.wait_for_frames()
@@ -122,6 +141,7 @@ class RealSenseCamera:
         color_image = np.asanyarray(color_frame.get_data())
         depth_image = np.asanyarray(depth_frame.get_data()).astype(np.float32)
         depth_image_m = depth_image * self.depth_scale
+        depth_image_m = self._apply_bilateral_filter(depth_image_m)
 
         return FrameBundle(
             color_image=color_image,
