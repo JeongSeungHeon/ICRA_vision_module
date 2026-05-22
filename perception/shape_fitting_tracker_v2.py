@@ -675,6 +675,7 @@ class ShapeFittingTracker:
         merged_object: MergedObjectState,
         *,
         silhouette_observations: list[SilhouetteObservation] | tuple[SilhouetteObservation, ...] | None = None,
+        freeze_silhouette_scale: bool = False,
     ) -> ShapeFittingState:
         self._last_silhouette_debug = self._make_empty_silhouette_debug(
             enabled=self.silhouette_enabled,
@@ -781,6 +782,7 @@ class ShapeFittingTracker:
                 template=template,
                 observed_points=filtered_points,
                 silhouette_observations=silhouette_observations,
+                freeze_silhouette_scale=freeze_silhouette_scale,
             )
 
         assert self._frozen_scale is not None
@@ -856,6 +858,7 @@ class ShapeFittingTracker:
             template=template,
             observed_points=filtered_points,
             silhouette_observations=silhouette_observations,
+            freeze_silhouette_scale=freeze_silhouette_scale,
         )
 
     def _maybe_rerank_with_silhouette(
@@ -865,6 +868,7 @@ class ShapeFittingTracker:
         template: ShapeTemplateModel,
         observed_points: np.ndarray,
         silhouette_observations: list[SilhouetteObservation] | tuple[SilhouetteObservation, ...] | None,
+        freeze_silhouette_scale: bool = False,
     ) -> ShapeFittingState:
         if not self.silhouette_enabled:
             self._last_silhouette_debug = self._make_empty_silhouette_debug(enabled=False, reason="disabled")
@@ -874,6 +878,15 @@ class ShapeFittingTracker:
 
         if not self._silhouette_applies_to_template(template):
             self._last_silhouette_debug = self._make_empty_silhouette_debug(enabled=True, reason="label_not_enabled")
+            self._apply_silhouette_fields_to_state(state)
+            self._apply_silhouette_fields_to_debug()
+            return state
+
+        if freeze_silhouette_scale:
+            self._last_silhouette_debug = self._make_empty_silhouette_debug(
+                enabled=True,
+                reason="scale_frozen_home_locked",
+            )
             self._apply_silhouette_fields_to_state(state)
             self._apply_silhouette_fields_to_debug()
             return state

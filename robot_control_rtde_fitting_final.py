@@ -62,8 +62,8 @@ DEFAULT_WORKSPACE_MM = {
 
 # object motion trigger
 REFERENCE_LOCK_COUNT = 8
-MOTION_TRIGGER_MM = 40.0
-MOTION_TRIGGER_Z_MM = 40.0
+MOTION_TRIGGER_MM = 100.0
+MOTION_TRIGGER_Z_MM = 100.0
 
 # control loop
 DEFAULT_CONTROL_HZ = 30.0
@@ -939,7 +939,7 @@ class FollowSharedState:
 
         self.home_object_xyz_mm = None # 홈 위치에서의 object의 xyz 위치 (mm 단위)
         self.home_object_locked = False # 홈 위치에서 object 위치가 고정되어 있는지 여부. True이면 home_object_xyz_mm이 홈 위치에서의 object 위치로 간주되고, follow 모드에서 참조로 사용될 수 있음.
-        self.home_pose_buffer = deque(maxlen=8) # 홈 위치에서의 최근 로봇 pose 버퍼 (base 좌표계, x/y/z in mm + rotvec)
+        self.home_pose_buffer = deque(maxlen=4) # 홈 위치에서의 최근 로봇 pose 버퍼 (base 좌표계, x/y/z in mm + rotvec)
         self.home_object_pixel = None # 홈 위치에서 object의 pixel 위치 (u/v in pixels)
         self.home_pixel_buffer = deque(maxlen=15) #  홈 위치에서의 최근 object pixel 위치 버퍼 (u/v in pixels)
 
@@ -4277,13 +4277,13 @@ def build_fitted_merged_object(raw_merged_object, shape_fitting_state):
     )
 
 
-def project_base_point_to_cam0(point_base, intrinsics, t_cam0_base, width: int, height: int):
+def project_base_point_to_camera(point_base, intrinsics, t_cam_base, width: int, height: int):
     """Project one base-frame point into a camera image for overlay drawing."""
     if point_base is None or intrinsics is None:
         return None
     point = np.asarray(point_base, dtype=np.float32).reshape(3)
     point_h = np.concatenate([point, np.array([1.0], dtype=np.float32)], axis=0)
-    point_cam = (t_cam0_base @ point_h.reshape(4, 1)).reshape(-1)[:3]
+    point_cam = (t_cam_base @ point_h.reshape(4, 1)).reshape(-1)[:3]
     z = float(point_cam[2])
     if not np.isfinite(z) or z <= 1e-6:
         return None
@@ -4298,7 +4298,7 @@ def project_base_point_to_cam0(point_base, intrinsics, t_cam0_base, width: int, 
     return (u, v)
 
 
-def project_base_points_to_cam0(points_base, intrinsics, t_cam0_base, width: int, height: int, max_points: int = 1500):
+def project_base_points_to_camera(points_base, intrinsics, t_cam_base, width: int, height: int, max_points: int = 1500):
     """Project a sampled base-frame point cloud into camera pixels for preview."""
     if points_base is None or intrinsics is None:
         return np.empty((0, 2), dtype=np.int32)
@@ -4310,7 +4310,7 @@ def project_base_points_to_cam0(points_base, intrinsics, t_cam0_base, width: int
         points = points[::stride]
     ones = np.ones((len(points), 1), dtype=np.float32)
     points_h = np.concatenate([points, ones], axis=1)
-    points_cam = (t_cam0_base @ points_h.T).T[:, :3]
+    points_cam = (t_cam_base @ points_h.T).T[:, :3]
     zs = points_cam[:, 2]
     valid = np.isfinite(zs) & (zs > 1e-6)
     if not np.any(valid):
@@ -4327,6 +4327,34 @@ def project_base_points_to_cam0(points_base, intrinsics, t_cam0_base, width: int
     if not np.any(in_bounds):
         return np.empty((0, 2), dtype=np.int32)
     return np.stack([us[in_bounds], vs[in_bounds]], axis=1)
+
+
+def draw_projected_template_overlay(
+    image_bgr,
+    points_base,
+    intrinsics,
+    t_cam_base,
+    *,
+    max_points: int = 1800,
+    color_bgr=(0, 0, 255),
+):
+    """Draw a fitted base-frame template cloud into one camera preview."""
+    template_pixels = project_base_points_to_camera(
+        points_base,
+        intrinsics,
+        t_cam_base,
+        image_bgr.shape[1],
+        image_bgr.shape[0],
+        max_points=max_points,
+    )
+    if len(template_pixels) == 0:
+        return image_bgr
+
+    point_mask = np.zeros(image_bgr.shape[:2], dtype=np.uint8)
+    point_mask[template_pixels[:, 1], template_pixels[:, 0]] = 255
+    point_mask = cv.dilate(point_mask, np.ones((3, 3), dtype=np.uint8), iterations=1)
+    image_bgr[point_mask > 0] = np.array(color_bgr, dtype=np.uint8)
+    return image_bgr
 
 
 def _build_silhouette_observation(camera_id, frame_bundle, object_worker, t_base_cam):
@@ -4565,13 +4593,14 @@ def render_camera_mask_preview(
     snapshot,
     pipeline,
     object_worker,
+    merged_object,
     selected_hand,
     fusion_state,
     display_grasp_point,
     *,
     camera_label,
 ):
-    """Render the secondary camera preview with object mask and key projected points."""
+    """Render a camera preview with object mask, fitted template, and key projected points."""
     frame_bundle = snapshot.cam0 if camera_label == "cam0" else snapshot.cam1
     image_bgr = np.asarray(frame_bundle.color_image).copy()
 
@@ -4585,13 +4614,21 @@ def render_camera_mask_preview(
             image_bgr = cv.addWeighted(image_bgr, 1.0, overlay, 0.35, 0.0)
 
     camera_transform = pipeline["t_cam0_base"] if camera_label == "cam0" else pipeline["t_cam1_base"]
+    image_bgr = draw_projected_template_overlay(
+        image_bgr,
+        getattr(merged_object, "merged_points_base", None),
+        frame_bundle.intrinsics,
+        camera_transform,
+        max_points=1800,
+    )
+
     hand_point = choose_point(fusion_state.filtered_hand_center_base, selected_hand.palm_center_base)
     draw_specs = [
         (display_grasp_point, (0, 255, 0), "grasp"),
         (hand_point, (255, 120, 0), "hand"),
     ]
     for point_base, color_bgr, _label in draw_specs:
-        pixel = project_base_point_to_cam0(
+        pixel = project_base_point_to_camera(
             point_base,
             frame_bundle.intrinsics,
             camera_transform,
@@ -4670,19 +4707,13 @@ def render_cam0_perception_debug(
             overlay[mask_bool] = np.array([0, 180, 255], dtype=np.uint8)
             image_bgr = cv.addWeighted(image_bgr, 1.0, overlay, 0.35, 0.0)
 
-    merged_pixels = project_base_points_to_cam0(
+    image_bgr = draw_projected_template_overlay(
+        image_bgr,
         merged_object.merged_points_base,
         snapshot.cam0.intrinsics,
         pipeline["t_cam0_base"],
-        image_bgr.shape[1],
-        image_bgr.shape[0],
         max_points=1800,
     )
-    if len(merged_pixels) > 0:
-        point_mask = np.zeros(image_bgr.shape[:2], dtype=np.uint8)
-        point_mask[merged_pixels[:, 1], merged_pixels[:, 0]] = 255
-        point_mask = cv.dilate(point_mask, np.ones((3, 3), dtype=np.uint8), iterations=1)
-        image_bgr[point_mask > 0] = np.array([0, 0, 255], dtype=np.uint8)
 
     object_point = display_object_point
     hand_point = choose_point(fusion_state.filtered_hand_center_base, selected_hand.palm_center_base)
@@ -4692,7 +4723,7 @@ def render_cam0_perception_debug(
         (hand_point, (255, 120, 0), "hand"),
     ]
     for point_base, color_bgr, label in draw_specs:
-        pixel = project_base_point_to_cam0(
+        pixel = project_base_point_to_camera(
             point_base,
             snapshot.cam0.intrinsics,
             pipeline["t_cam0_base"],
@@ -4904,6 +4935,8 @@ def main():
                 current_task_epoch = int(shared_state.task_epoch)
                 # 로봇 motion이 이미 trigger됐는지 읽어 fallback 판단에 사용한다.
                 motion_triggered = bool(shared_state.motion_triggered)
+                # HOME object 위치가 고정된 뒤에는 silhouette 기반 template scale 변경을 멈춘다.
+                home_object_locked = bool(shared_state.home_object_locked)
             # 로봇 worker가 있을 때는 상태 epoch와 에러 상태를 매 프레임 확인한다.
             if robot_worker is not None:
                 # worker가 유지하는 최신 로봇 상태 snapshot을 가져온다.
@@ -4983,6 +5016,7 @@ def main():
                 shape_fitting_state = pipeline["shape_fitting_tracker"].process(
                     merged_object,
                     silhouette_observations=silhouette_observations,
+                    freeze_silhouette_scale=home_object_locked,
                 )
                 # fitting 결과를 metadata recorder에 업데이트한다.
                 metadata_recorder.update_geometry(shape_fitting_state, now_perf=loop_perf)
@@ -5076,7 +5110,7 @@ def main():
                 measurement_source = "hand_fallback"
 
             # 최종 object base 좌표를 cam0 이미지 픽셀로 재투영해 overlay와 shared state에 사용한다.
-            object_pixel = project_base_point_to_cam0(
+            object_pixel = project_base_point_to_camera(
                 object_point_base,
                 snapshot.cam0.intrinsics,
                 pipeline["t_cam0_base"],
@@ -5227,11 +5261,12 @@ def main():
                     record_elapsed_s=record_elapsed_s,
                     tactile_manager=tactile_manager,
                 )
-                # cam1 화면에는 mask와 grasp preview 중심의 보조 debug 이미지를 만든다.
+                # cam1 화면에는 mask, template, grasp preview 중심의 보조 debug 이미지를 만든다.
                 cam1_preview = render_camera_mask_preview(
                     snapshot,
                     pipeline,
                     pipeline["object_worker_cam1"],
+                    fitted_merged_object,
                     selected_hand,
                     fusion_state,
                     grasp_point_base,

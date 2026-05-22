@@ -1,1 +1,1 @@
-python tools/visualize_handover_3d_debug_rerun.py output/debug_3d/19_hand-center_wine.npz
+python tools/visualize_handover_3d_debug_rerun.py output/debug_3d/handover_3d_debug_20260522_101638_378681_session008.npz
