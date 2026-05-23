@@ -74,6 +74,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end-frame", type=int, default=None, help="Exclusive source frame index stop.")
     parser.add_argument("--stride", type=int, default=1, help="Process every Nth source frame.")
     parser.add_argument("--max-frames", type=int, default=None, help="Maximum number of selected frames to process.")
+    parser.add_argument(
+        "--offline-motion-triggered",
+        action="store_true",
+        help=(
+            "Fallback value for live shared_state.motion_triggered when the input recording "
+            "does not contain per-frame motion_triggered values."
+        ),
+    )
+    parser.add_argument(
+        "--offline-home-object-locked",
+        action="store_true",
+        help=(
+            "Fallback value for live shared_state.home_object_locked when the input recording "
+            "does not contain per-frame home_object_locked values."
+        ),
+    )
     parser.add_argument("--save-image", action="store_true", help="Copy raw color/depth frames into the output .npz.")
     parser.add_argument("--debug-3d-max-object-points", type=int, default=8000)
     parser.add_argument("--debug-3d-max-template-points", type=int, default=8000)
@@ -173,6 +189,31 @@ def optional_float_array_value(data: dict[str, Any], key: str, index: int, defau
         return float(default)
 
 
+def optional_bool_array_value(data: dict[str, Any], key: str, index: int, default: bool = False) -> bool:
+    values = data.get(key)
+    if values is None or len(values) <= index:
+        return bool(default)
+    value = values[index]
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "f", "no", "n", "off"}:
+            return False
+        return bool(default)
+    try:
+        numeric = float(np.asarray(value).reshape(()))
+    except Exception:
+        return bool(default)
+    if not np.isfinite(numeric):
+        return bool(default)
+    return bool(numeric)
+
+
 def optional_vec(data: dict[str, Any], key: str, index: int, length: int) -> tuple[float, ...] | None:
     values = data.get(key)
     if values is None or len(values) <= index:
@@ -239,6 +280,7 @@ def prepare_runtime_args(args: argparse.Namespace, data: dict[str, Any]) -> argp
 
     # Robot/control fields are not used for offline inference, but the live
     # config-default helper expects them to exist.
+    runtime_args.serial = None
     runtime_args.robot_ip = None
     runtime_args.control_hz = None
     runtime_args.follow_z = None
@@ -255,6 +297,8 @@ def prepare_runtime_args(args: argparse.Namespace, data: dict[str, Any]) -> argp
     runtime_args.move_timeout_s = 10.0
     runtime_args.gripper_close_timeout_s = 2.0
     runtime_args.gripper_release_dwell_s = 0.5
+    runtime_args.pre_release_descend_before_open = None
+    runtime_args.pre_release_descend_m = None
     runtime_args.follow_handoff_timeout_s = 5.0
     runtime_args.enable_target_prediction = True
     runtime_args.prediction_max_horizon_s = 0.25
@@ -267,6 +311,7 @@ def prepare_runtime_args(args: argparse.Namespace, data: dict[str, Any]) -> argp
     runtime_args.debug_3d = True
     runtime_args.debug_3d_dir = str(args.output_dir)
     runtime_args.disable_debug_3d_recording = False
+    runtime_args.record_video = False
     runtime_args.profile_runtime = False
     runtime_args.profile_dir = "output/runtime_profile"
     runtime_args.profile_sample_interval_s = 1.0
@@ -318,7 +363,7 @@ def run_replay(input_path: str | Path, args: argparse.Namespace) -> OfflineRepla
         record_template_axes=bool(args.debug_3d_template_axes),
     )
 
-    previous_hand_approach = False
+    active_task_epoch = None
     replay_start_perf = time.perf_counter()
     try:
         for replay_index, source_index in enumerate(frame_indices):
@@ -333,6 +378,23 @@ def run_replay(input_path: str | Path, args: argparse.Namespace) -> OfflineRepla
             if not np.isfinite(record_elapsed_s):
                 record_elapsed_s = time.perf_counter() - replay_start_perf
             task_epoch = int(optional_float_array_value(data, "task_epoch", source_index, 0.0))
+            motion_triggered = optional_bool_array_value(
+                data,
+                "motion_triggered",
+                source_index,
+                bool(getattr(args, "offline_motion_triggered", False)),
+            )
+            home_object_locked = optional_bool_array_value(
+                data,
+                "home_object_locked",
+                source_index,
+                bool(getattr(args, "offline_home_object_locked", False)),
+            )
+            if task_epoch != active_task_epoch:
+                fallback_tracker = pipeline.get("hand_relative_fallback")
+                if fallback_tracker is not None and hasattr(fallback_tracker, "reset"):
+                    fallback_tracker.reset()
+                active_task_epoch = task_epoch
             snapshot = build_offline_snapshot(data, source_index, replay_index, runtime_args.fps)
 
             object_cam0 = pipeline["object_worker_cam0"].process_frame(snapshot.cam0, frame_id=snapshot.pair_index)
@@ -341,28 +403,13 @@ def run_replay(input_path: str | Path, args: argparse.Namespace) -> OfflineRepla
             hand_cam1 = pipeline["hand_worker_cam1"].process_frame(snapshot.cam1, frame_id=snapshot.pair_index)
 
             selected_hand = pipeline["hand_selector"].process_states(hand_cam0, hand_cam1)
-            merged_object = pipeline["object_merger"].process_states(
-                object_cam0,
-                object_cam1,
-                hand_approach_detected=previous_hand_approach,
-            )
+            merged_object = pipeline["object_merger"].process_states(object_cam0, object_cam1)
             silhouette_observations = live.build_silhouette_observations(snapshot, pipeline)
             shape_fitting_state = pipeline["shape_fitting_tracker"].process(
                 merged_object,
                 silhouette_observations=silhouette_observations,
+                freeze_silhouette_scale=home_object_locked,
             )
-            object_debug_cam0 = getattr(pipeline["object_worker_cam0"], "last_debug", None)
-            cam0_mask = None if object_debug_cam0 is None else getattr(object_debug_cam0, "combined_mask", None)
-            fill_level_estimator = pipeline.get("fill_level_estimator")
-            if fill_level_estimator is not None:
-                fill_level_estimator.estimate_fill_level_from_cam0(
-                    color_image_bgr=snapshot.cam0.color_image,
-                    depth_image_m=snapshot.cam0.depth_image_m,
-                    intrinsics=snapshot.cam0.intrinsics,
-                    container_mask=cam0_mask,
-                    camera_to_base=pipeline["transform_chain"].t_base_cam0,
-                    label=object_cam0.label,
-                )
             fitted_merged_object = live.build_fitted_merged_object(merged_object, shape_fitting_state)
             fusion_state = pipeline["fusion"].process_states(
                 fitted_merged_object,
@@ -373,9 +420,6 @@ def run_replay(input_path: str | Path, args: argparse.Namespace) -> OfflineRepla
                 fitted_merged_object,
                 selected_hand,
                 fusion_state,
-            )
-            previous_hand_approach = bool(
-                fusion_state.hand_approach_detected or fusion_state.hand_approach_latched
             )
 
             measured_object_point_base = live.choose_point(
@@ -393,7 +437,7 @@ def run_replay(input_path: str | Path, args: argparse.Namespace) -> OfflineRepla
                 measured_grasp_position_base=measured_grasp_point_base,
                 selected_hand=selected_hand,
                 fusion_state=fusion_state,
-                motion_triggered=False,
+                motion_triggered=motion_triggered,
                 now_timestamp=current_time,
                 frame_id=snapshot.pair_index,
                 record_elapsed_s=record_elapsed_s,

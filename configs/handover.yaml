@@ -377,10 +377,10 @@ perception:
       percentile_low: 5.0
       # object extent 계산 upper percentile입니다.
       percentile_high: 95.0
-      # template scale 최소값입니다.
-      min_scale: 0.5
-      # template scale 최대값입니다.
-      max_scale: 1.8
+      # template scale 최소값입니다.default 0.5
+      min_scale: 0.2  
+      # template scale 최대값입니다. default 1.8
+      max_scale: 2.0
     tracking:
       # cluster extent가 이보다 작으면 tracking invalid 처리합니다.
       min_cluster_extent_m: 1.0e-5
@@ -542,7 +542,7 @@ robot:
     # gripper open 후 tactile baseline을 다시 잡기 전 대기 시간입니다. 0이면 비활성입니다.
     auto_baseline_reset_after_open_s: 0
     # true이면 tactile release trigger 이후 stop command/actual stop timing을 자세히 출력합니다.
-    release_stop_timing_debug: false
+    release_stop_timing_debug: true
     # actual_tcp_speed linear norm이 이 값 이하이면 실제 정지로 기록합니다.
     release_stop_speed_threshold_mps: 0.002
     # stop command 이후 실제 정지를 관찰할 최대 시간입니다.
@@ -574,7 +574,7 @@ robot:
     # moveL을 async로 실행할지 정합니다.
     move_asynchronous: true
     # moveL acceleration입니다.
-    move_acceleration: 0.75
+    move_acceleration: 0.35
     # servoL lookahead_time입니다.
     servo_lookahead_time: 0.10
     # servoL gain입니다.

@@ -32,8 +32,11 @@ from perception.silhouette_constraint import (
 )
 from system.shared_state import HEIGHT_AXIS_X, HEIGHT_AXIS_Y, HEIGHT_AXIS_Z, MergedObjectState
 
+# 설정 파일과 템플릿 자산 경로를 안정적으로 찾기 위한 기준 경로입니다.
 DEFAULT_CONFIG_PATH = Path("configs/handover.yaml")
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# shared_state에서 전달되는 높이 축 이름을 numpy 좌표 인덱스로 변환합니다.
 _HEIGHT_AXIS_TO_INDEX = {
     HEIGHT_AXIS_X: 0,
     HEIGHT_AXIS_Y: 1,
@@ -42,9 +45,12 @@ _HEIGHT_AXIS_TO_INDEX = {
     "y": 1,
     "z": 2,
 }
+# 템플릿 스케일링 모드: 전체 균일 배율 또는 템플릿 로컬 축별 배율입니다.
 SCALE_MODE_UNIFORM = "uniform"
 SCALE_MODE_AXIS_XYZ = "axis_xyz"
 VALID_SCALE_MODES = {SCALE_MODE_UNIFORM, SCALE_MODE_AXIS_XYZ}
+
+# 와인잔처럼 bowl 영역이 중요한 템플릿의 높이 비율을 추정할 때 쓰는 프로파일 파라미터입니다.
 TEMPLATE_PROFILE_BINS = 40
 TEMPLATE_PROFILE_SMOOTHING_BINS = 5
 TOP_WIDTH_FRACTION_FOR_REFERENCE = 0.15
@@ -391,14 +397,21 @@ def _estimate_template_bowl_height_fraction(
 
 @dataclass(frozen=True)
 class ShapeTemplateModel:
+    """설정 파일에서 로드한 하나의 canonical point-cloud 템플릿 정보."""
+
+    # 템플릿 식별 및 원본 자산 정보입니다.
     label: str
     template_id: str
     asset_path: Path
     unit_scale_m: float
     scale_mode: str
+
+    # canonical_points는 템플릿의 기준 좌표계 점군이며, source_extent_xyz는 초기 스케일 추정 기준입니다.
     canonical_points: np.ndarray
     source_extent_xyz: np.ndarray
     bowl_height_fraction: float | None
+
+    # 초기 정렬 시 z축 회전 후보를 탐색할지와 탐색 범위를 정의합니다.
     z_rotation_enabled: bool
     z_rotation_min_deg: float
     z_rotation_max_deg: float
@@ -407,19 +420,30 @@ class ShapeTemplateModel:
 
 @dataclass
 class ShapeFittingState:
+    """외부 모듈에 전달되는 shape fitting 결과 상태."""
+
+    # 현재 프레임에서 유효한 템플릿 fitting 결과가 있는지와 어떤 템플릿인지 나타냅니다.
     valid: bool
     label: str | None
     template_id: str | None
+
+    # fitted_points_base는 로봇 base 좌표계에 정렬된 템플릿 점군입니다.
     fitted_points_base: np.ndarray
     centroid_base: tuple[float, float, float] | None
+
+    # scale은 대표 배율, scale_xyz는 축별 배율이며 scale_mode가 해석 방식을 결정합니다.
     scale: float | None
     scale_xyz: tuple[float, float, float] | None
     scale_mode: str
+
+    # template_axes_base는 canonical 템플릿 축이 base 좌표계에서 향하는 단위 벡터입니다.
     template_axes_base: tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]] | None
     z_rotation_deg: float | None
     bowl_height_fraction: float | None
     initialized: bool
     reason: str
+
+    # silhouette_* 필드는 2D 마스크 기반 scale 재평가가 켜졌을 때의 품질/디버그 지표입니다.
     silhouette_enabled: bool = False
     silhouette_reason: str = "disabled"
     silhouette_candidate_count: int = 0
@@ -442,18 +466,25 @@ class ShapeFittingState:
 
 @dataclass
 class ShapeFittingDebug:
+    """실시간 튜닝과 로그 확인을 위한 내부 디버그 지표."""
+
+    # 입력 점군, 선택된 클러스터, 최종 출력 점군의 크기를 추적합니다.
     label: str | None
     template_id: str | None
     raw_point_count: int
     cluster_point_count: int
     output_point_count: int
     scale_buffer_count: int
+
+    # 현재 초기화/추적 상태와 고정된 스케일 값을 보여줍니다.
     initialized: bool
     scale: float | None
     scale_xyz: tuple[float, float, float] | None
     scale_mode: str
     reason: str
     tracking_mode: str
+
+    # translation-only ICP의 수행 시간과 정합 품질 지표입니다.
     icp_time_ms: float | None
     icp_fps: float | None
     icp_fitness: float | None
@@ -463,6 +494,8 @@ class ShapeFittingDebug:
     icp_target_points: int
     icp_iterations_used: int
     z_rotation_deg: float | None
+
+    # ShapeFittingState와 동일한 silhouette 디버그 값을 debug 객체에도 복사합니다.
     silhouette_enabled: bool = False
     silhouette_reason: str = "disabled"
     silhouette_candidate_count: int = 0
@@ -485,6 +518,8 @@ class ShapeFittingDebug:
 
 @dataclass(frozen=True)
 class _SilhouetteCandidateScore:
+    """silhouette 재랭킹에서 비교할 scale 후보 하나의 손실 값 묶음."""
+
     index: int
     scale_xyz: np.ndarray
     points_base: np.ndarray
@@ -524,10 +559,12 @@ class ShapeFittingTracker:
         crop_cfg = icp_cfg.get("crop", {})
         silhouette_cfg = fitting_cfg.get("silhouette_constraint", {}) or {}
 
+        # DBSCAN으로 merged point cloud에서 실제 추적할 단일 물체 클러스터를 고릅니다.
         self.dbscan_eps_m = float(cluster_cfg.get("dbscan_eps_m", 0.02))
         self.dbscan_min_points = int(cluster_cfg.get("dbscan_min_points", 10))
         self.max_cluster_jump_m = float(cluster_cfg.get("max_cluster_jump_m", 0.08))
 
+        # 초기 몇 프레임의 robust extent를 모아 템플릿 스케일을 한 번 고정합니다.
         self.scale_init_valid_frames = max(1, int(scale_cfg.get("stable_frames", 8)))
         self.scale_low_q = float(scale_cfg.get("percentile_low", 5.0))
         self.scale_high_q = float(scale_cfg.get("percentile_high", 95.0))
@@ -539,6 +576,7 @@ class ShapeFittingTracker:
         self.output_max_points = int(downsample_cfg.get("max_points", 6000))
         self.min_cluster_extent_m = float(tracking_cfg.get("min_cluster_extent_m", 1e-5))
 
+        # 추적 단계에서는 회전/스케일을 고정하고 translation-only ICP로 위치만 갱신합니다.
         self.icp_max_points = int(icp_cfg.get("max_points", 2000))
         self.icp_distance_threshold_m = float(icp_cfg.get("distance_threshold_m", 0.09))
         self.icp_max_iterations = int(icp_cfg.get("max_iterations", 12))
@@ -546,6 +584,7 @@ class ShapeFittingTracker:
         self.icp_translation_tolerance_m = float(icp_cfg.get("translation_tolerance_m", 1e-5))
         self.icp_max_centroid_jump_m = float(icp_cfg.get("max_centroid_jump_m", self.max_cluster_jump_m))
 
+        # 손/가림 영역이 섞이기 쉬운 위쪽 점들을 ICP 입력에서 선택적으로 제거합니다.
         self.icp_crop_enabled = bool(crop_cfg.get("enabled", True))
         self.icp_crop_height_axis_index = int(crop_cfg.get("height_axis_index", 2))
         self.icp_crop_target_top_fraction = crop_cfg.get("target_top_fraction", 0.10)
@@ -553,6 +592,7 @@ class ShapeFittingTracker:
         self.icp_crop_min_points_after_crop = int(crop_cfg.get("min_points_after_crop", 80))
         self.icp_crop_min_height_extent_m = float(crop_cfg.get("min_height_extent_m", 0.01))
 
+        # 2D segmentation silhouette와 3D 거리 손실을 함께 사용해 scale 후보를 재평가합니다.
         self.silhouette_enabled = bool(silhouette_cfg.get("enabled", False))
         default_silhouette_labels = ["cup", "wine glass", "glass", "bottle"]
         self.silhouette_apply_to_all = bool(silhouette_cfg.get("apply_to_all", False))
@@ -587,10 +627,15 @@ class ShapeFittingTracker:
         self.silhouette_robust_3d_max_points = int(silhouette_cfg.get("robust_3d_max_points", 2000))
         self.silhouette_debug = bool(silhouette_cfg.get("debug", False))
 
+        # 템플릿 라이브러리와 프레임 간 유지되는 추적 상태입니다.
         self._templates = self._load_template_library(template_cfg)
         self._active_template: ShapeTemplateModel | None = None
         self._tracked_cluster_centroid: np.ndarray | None = None
+
+        # 초기화 전에는 extent_buffer에 안정적인 물체 크기 샘플을 누적합니다.
         self._extent_buffer: list[np.ndarray] = []
+
+        # 초기화 후에는 scale/rotation을 고정하고 이후 프레임에서는 translation만 업데이트합니다.
         self._frozen_scale: float | None = None
         self._frozen_scale_xyz: np.ndarray | None = None
         self._frozen_scale_mode = SCALE_MODE_UNIFORM
@@ -598,7 +643,11 @@ class ShapeFittingTracker:
         self._frozen_scale_center: np.ndarray | None = None
         self._frozen_rotation = np.eye(3, dtype=np.float64)
         self._frozen_z_rotation_deg: float | None = None
+
+        # 현재 base 좌표계에 놓인 템플릿 점군입니다. 최종 출력은 여기서 downsample됩니다.
         self._current_template_points = np.empty((0, 3), dtype=np.float32)
+
+        # silhouette 재랭킹의 직전 scale과 상세 지표를 저장해 temporal penalty와 debug에 사용합니다.
         self._last_silhouette_scale_xyz: np.ndarray | None = None
         self._last_silhouette_debug = self._make_empty_silhouette_debug(
             enabled=self.silhouette_enabled,
@@ -677,6 +726,7 @@ class ShapeFittingTracker:
         silhouette_observations: list[SilhouetteObservation] | tuple[SilhouetteObservation, ...] | None = None,
         freeze_silhouette_scale: bool = False,
     ) -> ShapeFittingState:
+        # process()는 한 프레임의 merged object를 받아 템플릿 점군을 base 좌표계에 맞춘 상태로 갱신합니다.
         self._last_silhouette_debug = self._make_empty_silhouette_debug(
             enabled=self.silhouette_enabled,
             reason="disabled" if not self.silhouette_enabled else "not_evaluated",
@@ -715,6 +765,7 @@ class ShapeFittingTracker:
             )
             return self._make_state(valid=False, template=template, fitted_points=None, centroid=None, reason="no_merged_object")
 
+        # 여러 클러스터가 들어오면 이전 centroid와 가까운 클러스터를 우선해 추적 대상이 튀지 않게 합니다.
         filtered_points, cluster_centroid = self._filter_single_cluster(raw_points, self._tracked_cluster_centroid)
         if len(filtered_points) == 0 or cluster_centroid is None:
             self._tracked_cluster_centroid = None
@@ -733,6 +784,7 @@ class ShapeFittingTracker:
         filtered_points = np.asarray(filtered_points, dtype=np.float64).reshape((-1, 3))
 
         if not self._initialized:
+            # 초기화 구간에서는 여러 프레임의 물체 크기를 모은 뒤 템플릿 스케일/회전을 결정합니다.
             target_obb = _build_oriented_bbox(filtered_points)
             if target_obb is not None:
                 robust_extent = _compute_oriented_robust_extent(
@@ -787,6 +839,7 @@ class ShapeFittingTracker:
 
         assert self._frozen_scale is not None
         assert self._frozen_scale_xyz is not None
+        # 초기화 이후에는 고정된 scale/rotation으로 템플릿을 복원하고 translation ICP만 수행합니다.
         current_template_points = np.asarray(self._current_template_points, dtype=np.float64).reshape((-1, 3))
         current_centroid = np.mean(current_template_points, axis=0)
         scaled_points = _apply_similarity_pose(
@@ -818,6 +871,7 @@ class ShapeFittingTracker:
             np.isfinite(icp_rmse) and icp_rmse <= (2.5 * self.icp_distance_threshold_m)
         )
 
+        # ICP 결과가 갑자기 멀리 튀거나 품질이 낮으면 이전 템플릿 위치를 유지합니다.
         if centroid_jump <= self.icp_max_centroid_jump_m and (quality_ok or icp_translation_m > 0.0):
             self._current_template_points = proposed_points.astype(np.float32)
             output_points = proposed_output
@@ -870,6 +924,7 @@ class ShapeFittingTracker:
         silhouette_observations: list[SilhouetteObservation] | tuple[SilhouetteObservation, ...] | None,
         freeze_silhouette_scale: bool = False,
     ) -> ShapeFittingState:
+        # silhouette constraint는 3D ICP가 만든 결과를 2D 마스크 투영 품질로 한 번 더 고르는 후처리입니다.
         if not self.silhouette_enabled:
             self._last_silhouette_debug = self._make_empty_silhouette_debug(enabled=False, reason="disabled")
             self._apply_silhouette_fields_to_state(state)
@@ -921,6 +976,8 @@ class ShapeFittingTracker:
         current_centroid = np.mean(current_template_points, axis=0)
         pre_extent = _compute_robust_extent(current_template_points, 0.0, 100.0)
         scale_mode = self._scale_mode_for_template(template)
+
+        # 현재 scale을 기준으로 축별 shrink/growth 후보를 만들고 3D+2D 손실로 최적 후보를 고릅니다.
         candidate_scales = self._build_silhouette_scale_candidates(pre_scale_xyz, scale_mode=scale_mode)
         if not candidate_scales:
             self._last_silhouette_debug = self._make_empty_silhouette_debug(enabled=True, reason="no_candidates")
@@ -997,6 +1054,7 @@ class ShapeFittingTracker:
             eligible_scores = [baseline_score]
         best_score = min(eligible_scores, key=lambda score: score.total_loss)
 
+        # scale이 바뀐 경우 frozen scale과 현재 템플릿 점군을 즉시 갱신해 다음 프레임 기준으로 사용합니다.
         changed = bool(not np.allclose(best_score.scale_xyz, pre_scale_xyz, rtol=1e-4, atol=1e-6))
         post_scale_xyz = best_score.scale_xyz
         post_points = best_score.points_base
@@ -1232,6 +1290,7 @@ class ShapeFittingTracker:
                 setattr(debug, key, value)
 
     def _initialize_template(self, template: ShapeTemplateModel, target_points: np.ndarray) -> np.ndarray:
+        # 초기화는 누적된 target extent의 median으로 scale을 잡고, 가능한 z 회전 후보 중 ICP 점수가 가장 좋은 것을 선택합니다.
         median_target_extent = np.median(np.asarray(self._extent_buffer, dtype=np.float64), axis=0)
         template_obb = _build_oriented_bbox(template.canonical_points)
         scale_mode = self._scale_mode_for_template(template)
@@ -1278,6 +1337,7 @@ class ShapeFittingTracker:
         best_icp_target_points = 0
         best_icp_iterations_used = 0
 
+        # z축 회전 후보마다 동일한 scale을 적용한 뒤 translation-only ICP로 centroid 보정을 수행합니다.
         for z_rotation_deg in candidate_degrees:
             candidate_rotation = _z_axis_rotation_matrix(z_rotation_deg)
             candidate_points = _apply_similarity_pose(
@@ -1320,6 +1380,7 @@ class ShapeFittingTracker:
                 best_icp_target_points = icp_target_points
                 best_icp_iterations_used = icp_iterations_used
 
+        # 선택된 scale/rotation은 이후 추적 중 고정되어 물체 자세가 흔들리는 것을 줄입니다.
         self._frozen_scale = float(np.median(scale_xyz))
         self._frozen_scale_xyz = np.asarray(scale_xyz, dtype=np.float64).reshape(3)
         self._frozen_scale_mode = scale_mode
@@ -1377,6 +1438,7 @@ class ShapeFittingTracker:
         *,
         height_axis_index: int,
     ) -> tuple[np.ndarray, float, float, float, int, int, int]:
+        # 회전과 스케일을 바꾸지 않고, 최근접점 평균 오차로 translation만 반복 갱신합니다.
         source_fit_points = np.asarray(source_points, dtype=np.float64).reshape((-1, 3)).copy()
         target_fit_points = np.asarray(target_points, dtype=np.float64).reshape((-1, 3)).copy()
         if len(source_fit_points) == 0 or len(target_fit_points) == 0:
@@ -1409,6 +1471,7 @@ class ShapeFittingTracker:
         total_transform[:3, 3] = np.mean(target_fit_points, axis=0) - np.mean(source_fit_points, axis=0)
         transformed_source = source_fit_points + total_transform[:3, 3].reshape(1, 3)
 
+        # fitness는 거리 threshold 안에 들어온 대응점 비율, rmse는 해당 대응점들의 평균 거리입니다.
         last_fitness = 0.0
         last_rmse = float("inf")
         iterations_used = 0
@@ -1471,6 +1534,7 @@ class ShapeFittingTracker:
         points: np.ndarray,
         prev_centroid: np.ndarray | None,
     ) -> tuple[np.ndarray, np.ndarray | None]:
+        # DBSCAN 결과 중 기본적으로 가장 큰 클러스터를 쓰되, 이전 centroid 근처 클러스터가 있으면 그쪽을 유지합니다.
         points = np.asarray(points, dtype=np.float64).reshape((-1, 3))
         if len(points) == 0:
             return np.empty((0, 3), dtype=np.float32), None
@@ -1532,6 +1596,7 @@ class ShapeFittingTracker:
         if not self._initialized:
             return None
 
+        # canonical 축을 scale basis와 frozen rotation을 거쳐 base 좌표계 방향 벡터로 변환합니다.
         basis = (
             np.eye(3, dtype=np.float64)
             if self._frozen_scale_basis is None
@@ -1560,6 +1625,7 @@ class ShapeFittingTracker:
         return self._templates.get(str(label))
 
     def _load_template_library(self, template_cfg: dict[str, Any]) -> dict[str, ShapeTemplateModel]:
+        # YAML의 template_library 항목을 실제 numpy 점군과 메타데이터로 변환합니다.
         templates: dict[str, ShapeTemplateModel] = {}
         for label, entry in template_cfg.items():
             asset_path = _resolve_path(entry["asset_path"], base_dir=self._config_path.parent)
@@ -1612,6 +1678,7 @@ class ShapeFittingTracker:
         icp_iterations_used: int = 0,
         z_rotation_deg: float | None = None,
     ) -> None:
+        # last_debug는 UI/로그에서 현재 tracking 품질을 바로 읽기 위한 스냅샷입니다.
         icp_fps = None
         if icp_time_ms is not None and np.isfinite(icp_time_ms) and icp_time_ms > 0.0:
             icp_fps = 1000.0 / float(icp_time_ms)
@@ -1652,6 +1719,7 @@ class ShapeFittingTracker:
         centroid: np.ndarray | tuple[float, float, float] | None,
         reason: str,
     ) -> ShapeFittingState:
+        # last_state는 다른 모듈이 소비하는 표준 출력이므로 numpy 타입과 tuple 타입을 여기서 정리합니다.
         fitted_points_arr = (
             np.empty((0, 3), dtype=np.float32)
             if fitted_points is None
