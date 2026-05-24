@@ -361,6 +361,22 @@ perception:
           max_deg: 90.0
           # yaw 후보 간격입니다.
           step_deg: 5.0
+          coarse_to_fine:
+            # roll/pitch 후보별로 coarse yaw를 먼저 고르고 주변만 refine합니다.
+            enabled: true
+            # coarse yaw 후보 간격입니다.
+            coarse_step_deg: 15.0
+            # coarse best yaw 주변 refine 반경입니다.
+            refine_radius_deg: 10.0
+            # refine yaw 후보 간격입니다.
+            refine_step_deg: 5.0
+        axis_rotation_candidates:
+          # box-shaped snack에만 roll/pitch 90도 축 전환 후보를 추가합니다.
+          enabled: true
+          # roll 후보입니다. pitch와 동시에 적용하지 않습니다.
+          roll_deg: [90.0, -90.0]
+          # pitch 후보입니다. roll과 동시에 적용하지 않습니다.
+          pitch_deg: [90.0, -90.0]
     cluster:
       # DBSCAN cluster 반경입니다.
       dbscan_eps_m: 0.02
@@ -378,9 +394,9 @@ perception:
       # object extent 계산 upper percentile입니다.
       percentile_high: 95.0
       # template scale 최소값입니다.default 0.5
-      min_scale: 0.2  
+      min_scale: 0.5
       # template scale 최대값입니다. default 1.8
-      max_scale: 2.0
+      max_scale: 1.8
     tracking:
       # cluster extent가 이보다 작으면 tracking invalid 처리합니다.
       min_cluster_extent_m: 1.0e-5
@@ -476,9 +492,9 @@ grasp:
     # fallback lock에 motion trigger 상태를 요구할지 정합니다.
     require_motion_triggered: true
     # hand-relative fallback lock/active 여부를 콘솔에 출력합니다.
-    debug_log: true
+    debug_log: false
     # lock_frames progress가 바뀔 때만 출력합니다.
-    log_lock_progress: true
+    log_lock_progress: false
     # fallback active 로그를 몇 frame마다 출력할지 정합니다. 1이면 매 fallback frame 출력입니다.
     log_fallback_every_frames: 1
   target_selection:
@@ -542,7 +558,7 @@ robot:
     # gripper open 후 tactile baseline을 다시 잡기 전 대기 시간입니다. 0이면 비활성입니다.
     auto_baseline_reset_after_open_s: 0
     # true이면 tactile release trigger 이후 stop command/actual stop timing을 자세히 출력합니다.
-    release_stop_timing_debug: true
+    release_stop_timing_debug: false
     # actual_tcp_speed linear norm이 이 값 이하이면 실제 정지로 기록합니다.
     release_stop_speed_threshold_mps: 0.002
     # stop command 이후 실제 정지를 관찰할 최대 시간입니다.
@@ -550,7 +566,7 @@ robot:
     # 실제 정지 관찰 중 RTDE state/isSteady polling 주기입니다.
     release_stop_monitor_poll_dt_s: 0.005
     # tactile debug log 출력 여부입니다.
-    debug: true
+    debug: false
 
   live_follow:
     # robot_control_loop servo 주기입니다. 실행 인자 --control-hz가 있으면 override됩니다.
@@ -644,7 +660,7 @@ robot:
       # 계산된 position threshold 상한입니다.
       clamp_max: 255
     # gripper/RTDE debug log 출력 여부입니다.
-    debug: true
+    debug: false
     # socket mode가 아닐 때 digital output domain입니다.
     output_domain: tool
     # socket mode가 아닐 때 open에 사용할 digital output index입니다.

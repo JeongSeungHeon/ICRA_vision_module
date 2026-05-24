@@ -216,6 +216,34 @@ def _z_axis_rotation_matrix(angle_deg: float) -> np.ndarray:
     )
 
 
+def _x_axis_rotation_matrix(angle_deg: float) -> np.ndarray:
+    angle_rad = math.radians(float(angle_deg))
+    cos_angle = math.cos(angle_rad)
+    sin_angle = math.sin(angle_rad)
+    return np.asarray(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, cos_angle, -sin_angle],
+            [0.0, sin_angle, cos_angle],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _y_axis_rotation_matrix(angle_deg: float) -> np.ndarray:
+    angle_rad = math.radians(float(angle_deg))
+    cos_angle = math.cos(angle_rad)
+    sin_angle = math.sin(angle_rad)
+    return np.asarray(
+        [
+            [cos_angle, 0.0, sin_angle],
+            [0.0, 1.0, 0.0],
+            [-sin_angle, 0.0, cos_angle],
+        ],
+        dtype=np.float64,
+    )
+
+
 def _transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
     points = np.asarray(points, dtype=np.float64).reshape((-1, 3))
     if len(points) == 0:
@@ -416,6 +444,13 @@ class ShapeTemplateModel:
     z_rotation_min_deg: float
     z_rotation_max_deg: float
     z_rotation_step_deg: float
+    z_rotation_coarse_to_fine_enabled: bool
+    z_rotation_coarse_step_deg: float
+    z_rotation_refine_radius_deg: float
+    z_rotation_refine_step_deg: float
+    axis_rotation_enabled: bool
+    axis_roll_candidates_deg: tuple[float, ...]
+    axis_pitch_candidates_deg: tuple[float, ...]
 
 
 @dataclass
@@ -439,6 +474,8 @@ class ShapeFittingState:
     # template_axes_base는 canonical 템플릿 축이 base 좌표계에서 향하는 단위 벡터입니다.
     template_axes_base: tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]] | None
     z_rotation_deg: float | None
+    roll_rotation_deg: float | None
+    pitch_rotation_deg: float | None
     bowl_height_fraction: float | None
     initialized: bool
     reason: str
@@ -494,6 +531,12 @@ class ShapeFittingDebug:
     icp_target_points: int
     icp_iterations_used: int
     z_rotation_deg: float | None
+    roll_rotation_deg: float | None
+    pitch_rotation_deg: float | None
+    rotation_search_mode: str = "exhaustive"
+    rotation_coarse_candidate_count: int = 0
+    rotation_refine_candidate_count: int = 0
+    rotation_candidate_count: int = 0
 
     # ShapeFittingState와 동일한 silhouette 디버그 값을 debug 객체에도 복사합니다.
     silhouette_enabled: bool = False
@@ -643,6 +686,8 @@ class ShapeFittingTracker:
         self._frozen_scale_center: np.ndarray | None = None
         self._frozen_rotation = np.eye(3, dtype=np.float64)
         self._frozen_z_rotation_deg: float | None = None
+        self._frozen_roll_rotation_deg: float | None = None
+        self._frozen_pitch_rotation_deg: float | None = None
 
         # 현재 base 좌표계에 놓인 템플릿 점군입니다. 최종 출력은 여기서 downsample됩니다.
         self._current_template_points = np.empty((0, 3), dtype=np.float32)
@@ -666,6 +711,8 @@ class ShapeFittingTracker:
             scale_mode=SCALE_MODE_UNIFORM,
             template_axes_base=None,
             z_rotation_deg=None,
+            roll_rotation_deg=None,
+            pitch_rotation_deg=None,
             bowl_height_fraction=None,
             initialized=False,
             reason="uninitialized",
@@ -692,6 +739,9 @@ class ShapeFittingTracker:
             icp_target_points=0,
             icp_iterations_used=0,
             z_rotation_deg=None,
+            roll_rotation_deg=None,
+            pitch_rotation_deg=None,
+            rotation_search_mode="uninitialized",
         )
 
     @classmethod
@@ -711,6 +761,8 @@ class ShapeFittingTracker:
         self._frozen_scale_center = None
         self._frozen_rotation = np.eye(3, dtype=np.float64)
         self._frozen_z_rotation_deg = None
+        self._frozen_roll_rotation_deg = None
+        self._frozen_pitch_rotation_deg = None
         self._current_template_points = np.empty((0, 3), dtype=np.float32)
         self._last_silhouette_scale_xyz = None
         self._last_silhouette_debug = self._make_empty_silhouette_debug(
@@ -1325,9 +1377,20 @@ class ShapeFittingTracker:
 
         initial_center = np.mean(target_points, axis=0)
         candidate_degrees = self._z_rotation_candidate_degrees(template)
+        axis_candidate_degrees = self._axis_rotation_candidate_degrees(template)
+        rotation_search_mode = (
+            "coarse_to_fine"
+            if template.z_rotation_enabled and template.z_rotation_coarse_to_fine_enabled
+            else "exhaustive"
+        )
+        rotation_coarse_candidate_count = 0
+        rotation_refine_candidate_count = 0
+        rotation_candidate_count = 0
         best_score: tuple[float, float, float] | None = None
         best_rotation = np.eye(3, dtype=np.float64)
         best_z_rotation_deg = 0.0
+        best_roll_rotation_deg = 0.0
+        best_pitch_rotation_deg = 0.0
         best_initialized_points = np.empty((0, 3), dtype=np.float64)
         best_icp_time_ms = 0.0
         best_icp_fitness = 0.0
@@ -1337,9 +1400,27 @@ class ShapeFittingTracker:
         best_icp_target_points = 0
         best_icp_iterations_used = 0
 
-        # z축 회전 후보마다 동일한 scale을 적용한 뒤 translation-only ICP로 centroid 보정을 수행합니다.
-        for z_rotation_deg in candidate_degrees:
-            candidate_rotation = _z_axis_rotation_matrix(z_rotation_deg)
+        def evaluate_rotation_candidate(
+            roll_rotation_deg: float,
+            pitch_rotation_deg: float,
+            z_rotation_deg: float,
+            axis_rotation: np.ndarray,
+        ) -> tuple[
+            tuple[float, float, float],
+            np.ndarray,
+            float,
+            float,
+            float,
+            np.ndarray,
+            float,
+            float,
+            float,
+            float,
+            int,
+            int,
+            int,
+        ]:
+            candidate_rotation = _z_axis_rotation_matrix(z_rotation_deg) @ axis_rotation
             candidate_points = _apply_similarity_pose(
                 template.canonical_points,
                 rotation=candidate_rotation,
@@ -1367,18 +1448,132 @@ class ShapeFittingTracker:
             initialized_points = _transform_points(candidate_points, icp_transform)
             finite_rmse = icp_rmse if np.isfinite(icp_rmse) else float("inf")
             score = (float(icp_fitness), -float(finite_rmse), -float(icp_translation_m))
-            if best_score is None or score > best_score:
-                best_score = score
-                best_rotation = candidate_rotation
-                best_z_rotation_deg = float(z_rotation_deg)
-                best_initialized_points = initialized_points
-                best_icp_time_ms = icp_time_ms
-                best_icp_fitness = icp_fitness
-                best_icp_rmse = icp_rmse
-                best_icp_translation_m = icp_translation_m
-                best_icp_source_points = icp_source_points
-                best_icp_target_points = icp_target_points
-                best_icp_iterations_used = icp_iterations_used
+            return (
+                score,
+                candidate_rotation,
+                float(z_rotation_deg),
+                float(roll_rotation_deg),
+                float(pitch_rotation_deg),
+                initialized_points,
+                icp_time_ms,
+                icp_fitness,
+                icp_rmse,
+                icp_translation_m,
+                icp_source_points,
+                icp_target_points,
+                icp_iterations_used,
+            )
+
+        def update_best(
+            result: tuple[
+                tuple[float, float, float],
+                np.ndarray,
+                float,
+                float,
+                float,
+                np.ndarray,
+                float,
+                float,
+                float,
+                float,
+                int,
+                int,
+                int,
+            ],
+        ) -> None:
+            nonlocal best_score
+            nonlocal best_rotation
+            nonlocal best_z_rotation_deg
+            nonlocal best_roll_rotation_deg
+            nonlocal best_pitch_rotation_deg
+            nonlocal best_initialized_points
+            nonlocal best_icp_time_ms
+            nonlocal best_icp_fitness
+            nonlocal best_icp_rmse
+            nonlocal best_icp_translation_m
+            nonlocal best_icp_source_points
+            nonlocal best_icp_target_points
+            nonlocal best_icp_iterations_used
+
+            score = result[0]
+            if best_score is not None and score <= best_score:
+                return
+            best_score = score
+            best_rotation = result[1]
+            best_z_rotation_deg = result[2]
+            best_roll_rotation_deg = result[3]
+            best_pitch_rotation_deg = result[4]
+            best_initialized_points = result[5]
+            best_icp_time_ms = result[6]
+            best_icp_fitness = result[7]
+            best_icp_rmse = result[8]
+            best_icp_translation_m = result[9]
+            best_icp_source_points = result[10]
+            best_icp_target_points = result[11]
+            best_icp_iterations_used = result[12]
+
+        # roll/pitch 90도 축 전환 후보를 먼저 적용하고, 그 결과를 기존 yaw 후보로 회전합니다.
+        for roll_rotation_deg, pitch_rotation_deg in axis_candidate_degrees:
+            roll_rotation = _x_axis_rotation_matrix(roll_rotation_deg)
+            pitch_rotation = _y_axis_rotation_matrix(pitch_rotation_deg)
+            axis_rotation = pitch_rotation @ roll_rotation
+            if rotation_search_mode == "coarse_to_fine":
+                coarse_best: tuple[
+                    tuple[float, float, float],
+                    np.ndarray,
+                    float,
+                    float,
+                    float,
+                    np.ndarray,
+                    float,
+                    float,
+                    float,
+                    float,
+                    int,
+                    int,
+                    int,
+                ] | None = None
+                coarse_seen: set[float] = set()
+                for z_rotation_deg in self._z_rotation_coarse_candidate_degrees(template):
+                    result = evaluate_rotation_candidate(
+                        roll_rotation_deg,
+                        pitch_rotation_deg,
+                        z_rotation_deg,
+                        axis_rotation,
+                    )
+                    rotation_coarse_candidate_count += 1
+                    rotation_candidate_count += 1
+                    coarse_seen.add(float(round(z_rotation_deg, 9)))
+                    if coarse_best is None or result[0] > coarse_best[0]:
+                        coarse_best = result
+                    update_best(result)
+
+                if coarse_best is None:
+                    continue
+
+                for z_rotation_deg in self._z_rotation_refine_candidate_degrees(template, coarse_best[2]):
+                    z_key = float(round(z_rotation_deg, 9))
+                    if z_key in coarse_seen:
+                        continue
+                    result = evaluate_rotation_candidate(
+                        roll_rotation_deg,
+                        pitch_rotation_deg,
+                        z_rotation_deg,
+                        axis_rotation,
+                    )
+                    rotation_refine_candidate_count += 1
+                    rotation_candidate_count += 1
+                    update_best(result)
+            else:
+                for z_rotation_deg in candidate_degrees:
+                    result = evaluate_rotation_candidate(
+                        roll_rotation_deg,
+                        pitch_rotation_deg,
+                        z_rotation_deg,
+                        axis_rotation,
+                    )
+                    rotation_candidate_count += 1
+                    update_best(result)
 
         # 선택된 scale/rotation은 이후 추적 중 고정되어 물체 자세가 흔들리는 것을 줄입니다.
         self._frozen_scale = float(np.median(scale_xyz))
@@ -1388,6 +1583,8 @@ class ShapeFittingTracker:
         self._frozen_scale_center = None if scale_center is None else np.asarray(scale_center, dtype=np.float64).reshape(3)
         self._frozen_rotation = best_rotation
         self._frozen_z_rotation_deg = best_z_rotation_deg if template.z_rotation_enabled else None
+        self._frozen_roll_rotation_deg = best_roll_rotation_deg if template.axis_rotation_enabled else None
+        self._frozen_pitch_rotation_deg = best_pitch_rotation_deg if template.axis_rotation_enabled else None
         self._current_template_points = best_initialized_points.astype(np.float32)
         self._initialized = True
         self._set_debug(
@@ -1406,6 +1603,12 @@ class ShapeFittingTracker:
             icp_target_points=best_icp_target_points,
             icp_iterations_used=best_icp_iterations_used,
             z_rotation_deg=self._frozen_z_rotation_deg,
+            roll_rotation_deg=self._frozen_roll_rotation_deg,
+            pitch_rotation_deg=self._frozen_pitch_rotation_deg,
+            rotation_search_mode=rotation_search_mode,
+            rotation_coarse_candidate_count=rotation_coarse_candidate_count,
+            rotation_refine_candidate_count=rotation_refine_candidate_count,
+            rotation_candidate_count=rotation_candidate_count,
         )
         return best_initialized_points.astype(np.float32)
 
@@ -1413,14 +1616,22 @@ class ShapeFittingTracker:
         if not template.z_rotation_enabled:
             return [0.0]
 
-        min_deg = float(template.z_rotation_min_deg)
-        max_deg = float(template.z_rotation_max_deg)
+        return self._build_z_rotation_candidate_degrees(
+            template.z_rotation_min_deg,
+            template.z_rotation_max_deg,
+            template.z_rotation_step_deg,
+        )
+
+    @staticmethod
+    def _build_z_rotation_candidate_degrees(min_deg: float, max_deg: float, step_deg: float) -> list[float]:
+        min_deg = float(min_deg)
+        max_deg = float(max_deg)
         if not np.isfinite(min_deg) or not np.isfinite(max_deg):
             return [0.0]
         if min_deg > max_deg:
             min_deg, max_deg = max_deg, min_deg
 
-        step_deg = abs(float(template.z_rotation_step_deg))
+        step_deg = abs(float(step_deg))
         if not np.isfinite(step_deg) or step_deg <= 0.0:
             step_deg = 5.0
 
@@ -1430,6 +1641,60 @@ class ShapeFittingTracker:
         if min_deg <= 0.0 <= max_deg and not any(abs(candidate) <= 1e-9 for candidate in candidates):
             candidates.append(0.0)
         return sorted(set(round(candidate, 9) for candidate in candidates))
+
+    def _z_rotation_coarse_candidate_degrees(self, template: ShapeTemplateModel) -> list[float]:
+        if not template.z_rotation_enabled:
+            return [0.0]
+        return self._build_z_rotation_candidate_degrees(
+            template.z_rotation_min_deg,
+            template.z_rotation_max_deg,
+            template.z_rotation_coarse_step_deg,
+        )
+
+    def _z_rotation_refine_candidate_degrees(self, template: ShapeTemplateModel, center_deg: float) -> list[float]:
+        if not template.z_rotation_enabled:
+            return [0.0]
+
+        min_deg = float(template.z_rotation_min_deg)
+        max_deg = float(template.z_rotation_max_deg)
+        if min_deg > max_deg:
+            min_deg, max_deg = max_deg, min_deg
+
+        radius_deg = abs(float(template.z_rotation_refine_radius_deg))
+        if not np.isfinite(radius_deg):
+            radius_deg = 10.0
+        lower_deg = max(min_deg, float(center_deg) - radius_deg)
+        upper_deg = min(max_deg, float(center_deg) + radius_deg)
+        return self._build_z_rotation_candidate_degrees(
+            lower_deg,
+            upper_deg,
+            template.z_rotation_refine_step_deg,
+        )
+
+    @staticmethod
+    def _axis_rotation_candidate_degrees(template: ShapeTemplateModel) -> list[tuple[float, float]]:
+        if not template.axis_rotation_enabled:
+            return [(0.0, 0.0)]
+
+        candidates: list[tuple[float, float]] = [(0.0, 0.0)]
+        for roll_deg in template.axis_roll_candidates_deg:
+            roll_deg = float(roll_deg)
+            if np.isfinite(roll_deg) and abs(roll_deg) > 1e-9:
+                candidates.append((roll_deg, 0.0))
+        for pitch_deg in template.axis_pitch_candidates_deg:
+            pitch_deg = float(pitch_deg)
+            if np.isfinite(pitch_deg) and abs(pitch_deg) > 1e-9:
+                candidates.append((0.0, pitch_deg))
+
+        unique_candidates: list[tuple[float, float]] = []
+        seen: set[tuple[float, float]] = set()
+        for roll_deg, pitch_deg in candidates:
+            key = (float(round(roll_deg, 9)), float(round(pitch_deg, 9)))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_candidates.append(key)
+        return unique_candidates
 
     def _run_translation_only_icp(
         self,
@@ -1641,6 +1906,23 @@ class ShapeFittingTracker:
             z_rotation_min_deg = float(z_rotation_cfg.get("min_deg", 0.0))
             z_rotation_max_deg = float(z_rotation_cfg.get("max_deg", 0.0))
             z_rotation_step_deg = float(z_rotation_cfg.get("step_deg", 5.0))
+            coarse_to_fine_cfg = z_rotation_cfg.get("coarse_to_fine", {}) or {}
+            if isinstance(coarse_to_fine_cfg, bool):
+                coarse_to_fine_cfg = {"enabled": coarse_to_fine_cfg}
+            z_rotation_coarse_to_fine_enabled = bool(coarse_to_fine_cfg.get("enabled", False))
+            z_rotation_coarse_step_deg = float(coarse_to_fine_cfg.get("coarse_step_deg", 15.0))
+            z_rotation_refine_radius_deg = float(coarse_to_fine_cfg.get("refine_radius_deg", 10.0))
+            z_rotation_refine_step_deg = float(coarse_to_fine_cfg.get("refine_step_deg", z_rotation_step_deg))
+            axis_rotation_cfg = entry.get("axis_rotation_candidates", {}) or {}
+            if isinstance(axis_rotation_cfg, bool):
+                axis_rotation_cfg = {"enabled": axis_rotation_cfg}
+            axis_rotation_enabled = bool(axis_rotation_cfg.get("enabled", False))
+            axis_roll_candidates_deg = tuple(
+                float(value) for value in axis_rotation_cfg.get("roll_deg", [90.0, -90.0])
+            )
+            axis_pitch_candidates_deg = tuple(
+                float(value) for value in axis_rotation_cfg.get("pitch_deg", [90.0, -90.0])
+            )
             default_scale_mode = getattr(self, "_default_scale_mode", SCALE_MODE_UNIFORM)
             scale_mode = ShapeFittingTracker._normalize_scale_mode(entry.get("scale_mode", default_scale_mode))
             templates[str(label)] = ShapeTemplateModel(
@@ -1656,6 +1938,13 @@ class ShapeFittingTracker:
                 z_rotation_min_deg=z_rotation_min_deg,
                 z_rotation_max_deg=z_rotation_max_deg,
                 z_rotation_step_deg=z_rotation_step_deg,
+                z_rotation_coarse_to_fine_enabled=z_rotation_coarse_to_fine_enabled,
+                z_rotation_coarse_step_deg=z_rotation_coarse_step_deg,
+                z_rotation_refine_radius_deg=z_rotation_refine_radius_deg,
+                z_rotation_refine_step_deg=z_rotation_refine_step_deg,
+                axis_rotation_enabled=axis_rotation_enabled,
+                axis_roll_candidates_deg=axis_roll_candidates_deg,
+                axis_pitch_candidates_deg=axis_pitch_candidates_deg,
             )
         return templates
 
@@ -1677,6 +1966,12 @@ class ShapeFittingTracker:
         icp_target_points: int = 0,
         icp_iterations_used: int = 0,
         z_rotation_deg: float | None = None,
+        roll_rotation_deg: float | None = None,
+        pitch_rotation_deg: float | None = None,
+        rotation_search_mode: str = "exhaustive",
+        rotation_coarse_candidate_count: int = 0,
+        rotation_refine_candidate_count: int = 0,
+        rotation_candidate_count: int = 0,
     ) -> None:
         # last_debug는 UI/로그에서 현재 tracking 품질을 바로 읽기 위한 스냅샷입니다.
         icp_fps = None
@@ -1684,6 +1979,10 @@ class ShapeFittingTracker:
             icp_fps = 1000.0 / float(icp_time_ms)
         if z_rotation_deg is None and self._active_template is not None and self._active_template.z_rotation_enabled:
             z_rotation_deg = self._frozen_z_rotation_deg
+        if roll_rotation_deg is None and self._active_template is not None and self._active_template.axis_rotation_enabled:
+            roll_rotation_deg = self._frozen_roll_rotation_deg
+        if pitch_rotation_deg is None and self._active_template is not None and self._active_template.axis_rotation_enabled:
+            pitch_rotation_deg = self._frozen_pitch_rotation_deg
         scale_xyz = None if self._frozen_scale_xyz is None else tuple(float(v) for v in self._frozen_scale_xyz)
         self.last_debug = ShapeFittingDebug(
             label=label,
@@ -1707,6 +2006,12 @@ class ShapeFittingTracker:
             icp_target_points=int(icp_target_points),
             icp_iterations_used=int(icp_iterations_used),
             z_rotation_deg=None if z_rotation_deg is None else float(z_rotation_deg),
+            roll_rotation_deg=None if roll_rotation_deg is None else float(roll_rotation_deg),
+            pitch_rotation_deg=None if pitch_rotation_deg is None else float(pitch_rotation_deg),
+            rotation_search_mode=str(rotation_search_mode),
+            rotation_coarse_candidate_count=int(rotation_coarse_candidate_count),
+            rotation_refine_candidate_count=int(rotation_refine_candidate_count),
+            rotation_candidate_count=int(rotation_candidate_count),
         )
         self._apply_silhouette_fields_to_debug()
 
@@ -1739,6 +2044,8 @@ class ShapeFittingTracker:
             scale_mode=self._scale_mode_for_template(template),
             template_axes_base=self._template_axes_base() if valid and template is not None else None,
             z_rotation_deg=None if self._frozen_z_rotation_deg is None else float(self._frozen_z_rotation_deg),
+            roll_rotation_deg=None if self._frozen_roll_rotation_deg is None else float(self._frozen_roll_rotation_deg),
+            pitch_rotation_deg=None if self._frozen_pitch_rotation_deg is None else float(self._frozen_pitch_rotation_deg),
             bowl_height_fraction=None if template is None else template.bowl_height_fraction,
             initialized=bool(self._initialized),
             reason=str(reason),

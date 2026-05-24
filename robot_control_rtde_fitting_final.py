@@ -62,8 +62,8 @@ DEFAULT_WORKSPACE_MM = {
 
 # object motion trigger
 REFERENCE_LOCK_COUNT = 8
-MOTION_TRIGGER_MM = 400.0
-MOTION_TRIGGER_Z_MM = 400.0
+MOTION_TRIGGER_MM = 40.0
+MOTION_TRIGGER_Z_MM = 40.0
 
 # control loop
 DEFAULT_CONTROL_HZ = 30.0
@@ -77,13 +77,13 @@ EEF_Y_OFFSET_MM = 0.0
 # grasp / place behavior
 HOVER_Z_OFFSET_MM = 0
 DESCEND_EXTRA_MM = 0.0
-BACKOFF_X_MM = 75.0
+BACKOFF_X_MM = 125.0
 DEFAULT_POST_RELEASE_Z_OFFSET_MM = 0.0
-HOME_PLACE_X_OFFSET_MM = 0.0
-HOME_PLACE_Y_OFFSET_MM = -3.0
+HOME_PLACE_X_OFFSET_MM = -25.0
+HOME_PLACE_Y_OFFSET_MM = 40.0
 HOME_PLACE_MIN_Z_MM = 30.0
 PRE_RELEASE_MIN_Z_EPSILON_MM = 1e-3
-GRASP_POINT_Y_OFFSET_MM = 10.0
+GRASP_POINT_Y_OFFSET_MM = 20.0
 PLACE_Z_GRASP_BUFFER_FRAMES = 5
 PLACE_Z_MIN_VALID_SAMPLES = 3
 GRIPPER_FORCE_STOP_DELTA_N = 100000
@@ -4554,6 +4554,12 @@ def collect_runtime_profile_metrics(
         "shape_fit_icp_fitness": getattr(shape_fit_debug, "icp_fitness", None),
         "shape_fit_icp_rmse": getattr(shape_fit_debug, "icp_rmse", None),
         "shape_fit_z_rotation_deg": getattr(shape_fit_debug, "z_rotation_deg", None),
+        "shape_fit_roll_rotation_deg": getattr(shape_fit_debug, "roll_rotation_deg", None),
+        "shape_fit_pitch_rotation_deg": getattr(shape_fit_debug, "pitch_rotation_deg", None),
+        "shape_fit_rotation_search_mode": getattr(shape_fit_debug, "rotation_search_mode", None),
+        "shape_fit_rotation_candidate_count": getattr(shape_fit_debug, "rotation_candidate_count", 0),
+        "shape_fit_rotation_coarse_candidate_count": getattr(shape_fit_debug, "rotation_coarse_candidate_count", 0),
+        "shape_fit_rotation_refine_candidate_count": getattr(shape_fit_debug, "rotation_refine_candidate_count", 0),
         "shape_fit_silhouette_enabled": getattr(shape_fit_debug, "silhouette_enabled", False),
         "shape_fit_silhouette_candidate_count": getattr(shape_fit_debug, "silhouette_candidate_count", 0),
         "shape_fit_silhouette_valid_camera_count": getattr(shape_fit_debug, "silhouette_valid_camera_count", 0),
