@@ -38,7 +38,8 @@ class HandednessAwareObjectClassLockTests(unittest.TestCase):
     def test_correct_handedness_flips_configured_camera(self):
         self.assertEqual(correct_handedness("Right", 0), "left")
         self.assertEqual(correct_handedness("left", 0), "right")
-        self.assertEqual(correct_handedness("Right", 1), "right")
+        self.assertEqual(correct_handedness("Right", 1), "left")
+        self.assertEqual(correct_handedness("left", 1), "right")
 
     def test_locks_from_corrected_handedness_reference_camera(self):
         locker = HandednessAwareObjectClassLock()
@@ -58,6 +59,50 @@ class HandednessAwareObjectClassLockTests(unittest.TestCase):
             selected_hand=selected_hand,
             hand_cam0=make_hand(0, "right"),
             hand_cam1=make_hand(1, "unknown"),
+            object_cam0=object_cam0,
+            object_cam1=object_cam1,
+            object_worker_cam0=worker_cam0,
+            object_worker_cam1=worker_cam1,
+        )
+
+        self.assertEqual(locker.locked_class, "wine glass")
+        self.assertEqual(locker.locked_from_camera, 0)
+        self.assertEqual(filtered_cam0.label, "wine glass")
+        self.assertEqual(filtered_cam1.label, "wine glass")
+
+    def test_actual_right_hand_uses_cam1_reference_after_cam0_flip(self):
+        locker = HandednessAwareObjectClassLock()
+        object_cam0 = make_object(0, "wine glass", confidence=0.65)
+        object_cam1 = make_object(1, "cup", confidence=0.82)
+        worker_cam0 = SimpleNamespace(reselect_last_frame_by_label=lambda label: make_object(0, label))
+        worker_cam1 = SimpleNamespace(reselect_last_frame_by_label=lambda label: make_object(1, label))
+
+        filtered_cam0, filtered_cam1 = locker.process_states(
+            selected_hand=SelectedHandState(selected_camera=0, handedness="left", valid=True),
+            hand_cam0=make_hand(0, "left"),
+            hand_cam1=HandState(camera_id=1, valid=False),
+            object_cam0=object_cam0,
+            object_cam1=object_cam1,
+            object_worker_cam0=worker_cam0,
+            object_worker_cam1=worker_cam1,
+        )
+
+        self.assertEqual(locker.locked_class, "cup")
+        self.assertEqual(locker.locked_from_camera, 1)
+        self.assertEqual(filtered_cam0.label, "cup")
+        self.assertEqual(filtered_cam1.label, "cup")
+
+    def test_actual_left_hand_uses_cam0_reference_after_cam1_flip(self):
+        locker = HandednessAwareObjectClassLock()
+        object_cam0 = make_object(0, "wine glass", confidence=0.65)
+        object_cam1 = make_object(1, "cup", confidence=0.82)
+        worker_cam0 = SimpleNamespace(reselect_last_frame_by_label=lambda label: make_object(0, label))
+        worker_cam1 = SimpleNamespace(reselect_last_frame_by_label=lambda label: make_object(1, label))
+
+        filtered_cam0, filtered_cam1 = locker.process_states(
+            selected_hand=SelectedHandState(selected_camera=1, handedness="right", valid=True),
+            hand_cam0=HandState(camera_id=0, valid=False),
+            hand_cam1=make_hand(1, "right"),
             object_cam0=object_cam0,
             object_cam1=object_cam1,
             object_worker_cam0=worker_cam0,

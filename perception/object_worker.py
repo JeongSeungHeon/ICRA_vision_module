@@ -24,11 +24,13 @@ from utils.realsense_stream import FrameBundle
 
 DEFAULT_CONFIG_PATH = Path("configs/handover.yaml")
 DEFAULT_CLASS_LOCK_FRAMES = 15
-LEFT_SIDE_CAMERA_ID = 0
-RIGHT_SIDE_CAMERA_ID = 1
 CAMERA_HANDEDNESS_FLIP = {
     0: True,
-    1: False,
+    1: True,
+}
+REFERENCE_CAMERA_BY_CORRECTED_HAND = {
+    "left": 0,
+    "right": 1,
 }
 
 
@@ -154,11 +156,7 @@ class HandednessAwareObjectClassLock:
 
     @staticmethod
     def _reference_camera_for_handedness(handedness: str | None) -> int | None:
-        if handedness == "left":
-            return LEFT_SIDE_CAMERA_ID
-        if handedness == "right":
-            return RIGHT_SIDE_CAMERA_ID
-        return None
+        return REFERENCE_CAMERA_BY_CORRECTED_HAND.get(str(handedness))
 
     @staticmethod
     def _resolve_hand_for_lock(selected_hand: Any, hand_cam0: Any, hand_cam1: Any) -> tuple[int | None, str | None]:
