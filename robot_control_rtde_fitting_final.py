@@ -28,7 +28,7 @@ from perception.hand_relative_fallback import HandRelativeFallbackTracker
 from perception.hand_selector import HandSelector
 from perception.hand_worker import HandWorkerCam0, HandWorkerCam1
 from perception.object_merger import ObjectMerger
-from perception.object_worker import ObjectWorkerCam0, ObjectWorkerCam1
+from perception.object_worker import HandednessAwareObjectClassLock, ObjectWorkerCam0, ObjectWorkerCam1
 from perception.silhouette_constraint import SilhouetteObservation
 from perception.shape_fitting_tracker_v2 import ShapeFittingTracker
 from perception.target_predictor import TargetPredictor
@@ -2923,6 +2923,10 @@ def reset_perception_pipeline_for_system_reset(pipeline):
     if object_merger is not None and hasattr(object_merger, "reset_initial_centroid"):
         object_merger.reset_initial_centroid()
 
+    object_class_lock = pipeline.get("object_class_lock")
+    if object_class_lock is not None and hasattr(object_class_lock, "reset"):
+        object_class_lock.reset()
+
     for object_worker_key in ("object_worker_cam0", "object_worker_cam1"):
         object_worker = pipeline.get(object_worker_key)
         if object_worker is not None and hasattr(object_worker, "reset"):
@@ -4224,6 +4228,7 @@ def build_dual_perception_pipeline(args):
     hand_worker_cam1 = HandWorkerCam1.from_config(args.config)
     hand_selector = HandSelector.from_config(args.config)
     object_merger = ObjectMerger.from_config(args.config)
+    object_class_lock = HandednessAwareObjectClassLock()
     shape_fitting_tracker = ShapeFittingTracker.from_config(args.config)
     fusion = PerceptionFusion.from_config(args.config)
     grasp_planner = GraspTargetPlanner.from_config(args.config)
@@ -4241,6 +4246,7 @@ def build_dual_perception_pipeline(args):
         "hand_worker_cam1": hand_worker_cam1,
         "hand_selector": hand_selector,
         "object_merger": object_merger,
+        "object_class_lock": object_class_lock,
         "shape_fitting_tracker": shape_fitting_tracker,
         "fusion": fusion,
         "grasp_planner": grasp_planner,
@@ -4968,6 +4974,7 @@ def main():
                 if robot_status.task_ready_epoch != last_task_ready_epoch:
                     # 같은 task_ready 이벤트를 중복 처리하지 않도록 epoch를 갱신한다.
                     last_task_ready_epoch = int(robot_status.task_ready_epoch)
+                    pipeline["object_class_lock"].reset()
                     # metadata recorder에 task 시작 시각과 shared state snapshot을 기록한다.
                     task_ready_timestamp = metadata_recorder.mark_task_ready(shared_state)
                     # 영상과 debug 로그의 task-relative elapsed time 기준점을 잡는다.
@@ -4980,6 +4987,7 @@ def main():
                 if robot_status.task_done_epoch != last_task_done_epoch:
                     last_task_done_epoch = int(robot_status.task_done_epoch)
                     grasp_request_pending = False
+                    pipeline["object_class_lock"].reset()
                 # 로봇 에러 상태에서는 새 grasp 요청을 막는다.
                 if robot_status.state == ROBOT_STATE_ERROR:
                     grasp_request_pending = False
@@ -4988,6 +4996,7 @@ def main():
             # task epoch가 바뀌면 이전 task의 hand-relative fallback state를 초기화한다.
             if current_task_epoch != active_task_epoch:
                 pipeline["hand_relative_fallback"].reset()
+                pipeline["object_class_lock"].reset()
                 active_task_epoch = current_task_epoch
 
             # 두 카메라에서 시간 동기화된 frame pair를 읽는 구간을 측정한다.
@@ -4996,10 +5005,18 @@ def main():
 
             # cam0에서 object detection/segmentation을 수행한다.
             with runtime_profiler.stage("object_cam0"):
-                object_cam0 = pipeline["object_worker_cam0"].process_frame(snapshot.cam0, frame_id=snapshot.pair_index)
+                object_cam0 = pipeline["object_worker_cam0"].process_frame(
+                    snapshot.cam0,
+                    frame_id=snapshot.pair_index,
+                    class_name_filter=pipeline["object_class_lock"].locked_class,
+                )
             # cam1에서 object detection/segmentation을 수행한다.
             with runtime_profiler.stage("object_cam1"):
-                object_cam1 = pipeline["object_worker_cam1"].process_frame(snapshot.cam1, frame_id=snapshot.pair_index)
+                object_cam1 = pipeline["object_worker_cam1"].process_frame(
+                    snapshot.cam1,
+                    frame_id=snapshot.pair_index,
+                    class_name_filter=pipeline["object_class_lock"].locked_class,
+                )
             # cam0에서 hand detector/tracker를 수행한다.
             with runtime_profiler.stage("hand_cam0"):
                 hand_cam0 = pipeline["hand_worker_cam0"].process_frame(snapshot.cam0, frame_id=snapshot.pair_index)
@@ -5010,6 +5027,15 @@ def main():
             with runtime_profiler.stage("merge"):
                 # 두 카메라 중 현재 가장 신뢰할 수 있는 hand state를 선택한다.
                 selected_hand = pipeline["hand_selector"].process_states(hand_cam0, hand_cam1)
+                object_cam0, object_cam1 = pipeline["object_class_lock"].process_states(
+                    selected_hand=selected_hand,
+                    hand_cam0=hand_cam0,
+                    hand_cam1=hand_cam1,
+                    object_cam0=object_cam0,
+                    object_cam1=object_cam1,
+                    object_worker_cam0=pipeline["object_worker_cam0"],
+                    object_worker_cam1=pipeline["object_worker_cam1"],
+                )
                 # 두 카메라 object state를 base 좌표계 기준 object state로 병합한다.
                 merged_object = pipeline["object_merger"].process_states(
                     object_cam0,

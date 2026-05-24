@@ -94,7 +94,7 @@ class ObjectWorkerClassLockLogTests(unittest.TestCase):
         self.assertEqual(state.confidence, 0.40)
         self.assertEqual(worker.last_debug.selected_class_names, ("wine glass",))
 
-    def test_prints_once_when_class_lock_is_acquired(self):
+    def test_object_worker_does_not_apply_per_camera_class_lock(self):
         segmentation_engine = SimpleNamespace()
         transform_chain = SimpleNamespace(
             transform_points_camera_to_base=lambda camera_id, points: np.asarray(points, dtype=np.float32)
@@ -136,14 +136,11 @@ class ObjectWorkerClassLockLogTests(unittest.TestCase):
         ), patch("builtins.print") as mock_print:
             worker.process_frame(frame, frame_id=10)
             worker.process_frame(frame, frame_id=11)
-            worker.process_frame(frame, frame_id=12)
+            state = worker.process_frame(frame, frame_id=12)
 
-        self.assertEqual(mock_print.call_count, 1)
-        printed_text = " ".join(str(part) for part in mock_print.call_args.args)
-        self.assertIn("[CLASS_LOCK]", printed_text)
-        self.assertIn("cam1", printed_text)
-        self.assertIn("frame=11", printed_text)
-        self.assertIn("locked_label=wine glass", printed_text)
+        self.assertEqual(state.label, "wine glass")
+        self.assertIsNone(worker.class_locker.locked_label)
+        self.assertEqual(mock_print.call_count, 0)
 
 
 if __name__ == "__main__":
