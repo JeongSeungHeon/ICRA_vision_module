@@ -394,6 +394,9 @@ def run_replay(input_path: str | Path, args: argparse.Namespace) -> OfflineRepla
                 fallback_tracker = pipeline.get("hand_relative_fallback")
                 if fallback_tracker is not None and hasattr(fallback_tracker, "reset"):
                     fallback_tracker.reset()
+                grasp_z_stabilizer = pipeline.get("grasp_z_stabilizer")
+                if grasp_z_stabilizer is not None and hasattr(grasp_z_stabilizer, "reset"):
+                    grasp_z_stabilizer.reset()
                 active_task_epoch = task_epoch
             snapshot = build_offline_snapshot(data, source_index, replay_index, runtime_args.fps)
 
@@ -435,7 +438,14 @@ def run_replay(input_path: str | Path, args: argparse.Namespace) -> OfflineRepla
             measured_grasp_point_base = live.offset_point_base_mm(
                 measured_grasp_point_base,
                 y_mm=live.GRASP_POINT_Y_OFFSET_MM,
+                z_mm=getattr(live, "GRASP_POINT_Z_OFFSET_MM", 0.0),
             )
+            grasp_z_stabilizer = pipeline.get("grasp_z_stabilizer")
+            if grasp_z_stabilizer is not None:
+                measured_grasp_point_base = grasp_z_stabilizer.process(
+                    measured_object_point_base,
+                    measured_grasp_point_base,
+                )
 
             fallback_state = pipeline["hand_relative_fallback"].process(
                 measured_object_position_base=measured_object_point_base,

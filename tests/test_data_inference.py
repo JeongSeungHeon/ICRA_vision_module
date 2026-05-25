@@ -222,8 +222,9 @@ class DataInferenceTests(unittest.TestCase):
                 centroid_base=shape_fitting_state.centroid_base
             ),
             choose_point=lambda preferred, fallback: preferred if preferred is not None else fallback,
-            offset_point_base_mm=lambda point, y_mm: point,
+            offset_point_base_mm=lambda point, y_mm, z_mm=0.0: point,
             GRASP_POINT_Y_OFFSET_MM=0.0,
+            GRASP_POINT_Z_OFFSET_MM=0.0,
         )
 
         def append_debug_3d_frame(*args, **kwargs):

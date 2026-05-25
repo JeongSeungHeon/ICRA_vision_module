@@ -522,6 +522,15 @@ grasp:
     dropout_hold_frames: 8
     # 이전 후보와의 거리 penalty 가중치입니다.
     score_previous_distance_weight: 0.90
+  z_stabilization:
+    # true이면 grasp/object가 가까울 때 grasp point z만 max-step + EMA로 안정화합니다.
+    enabled: true
+    # base frame XY에서 object center와 grasp target 사이 거리가 이 값 이하일 때만 적용합니다.
+    activation_dist_xy_m: 0.065
+    # frame당 z 변화량 제한입니다.
+    max_step_z_m: 0.005
+    # 이전 filtered z에 곱하는 EMA alpha입니다.
+    ema_alpha: 0.70
 
 robot:
   return_sequence:

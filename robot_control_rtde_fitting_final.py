@@ -24,6 +24,7 @@ from object_pt_extraction.segmentation_engine import (
 from perception.fusion import PerceptionFusion
 #from perception.fill_level_estimator import FillLevelEstimator
 from perception.grasp_target import GraspTargetPlanner
+from perception.grasp_z_stabilizer import GraspPointZStabilizer
 from perception.hand_relative_fallback import HandRelativeFallbackTracker
 from perception.hand_selector import HandSelector, object_center_for_hand_selection
 from perception.hand_worker import HandWorkerCam0, HandWorkerCam1
@@ -2950,6 +2951,11 @@ def reset_perception_pipeline_for_system_reset(pipeline):
         fusion.reset()
         print("[INFO] Perception fusion reset. Filtered hand/object centers cleared.")
 
+    grasp_z_stabilizer = pipeline.get("grasp_z_stabilizer")
+    if grasp_z_stabilizer is not None and hasattr(grasp_z_stabilizer, "reset"):
+        grasp_z_stabilizer.reset()
+        print("[INFO] Grasp z stabilizer reset. Filtered grasp height cleared.")
+
     hand_relative_fallback = pipeline.get("hand_relative_fallback")
     if hand_relative_fallback is not None and hasattr(hand_relative_fallback, "reset"):
         hand_relative_fallback.reset()
@@ -4233,6 +4239,7 @@ def build_dual_perception_pipeline(args):
     shape_fitting_tracker = ShapeFittingTracker.from_config(args.config)
     fusion = PerceptionFusion.from_config(args.config)
     grasp_planner = GraspTargetPlanner.from_config(args.config)
+    grasp_z_stabilizer = GraspPointZStabilizer.from_config(args.config)
     hand_relative_fallback = HandRelativeFallbackTracker.from_config(args.config)
     # fill_level_estimator = FillLevelEstimator.from_config(args.config)
     transform_chain = load_transform_chain(args.config)
@@ -4251,6 +4258,7 @@ def build_dual_perception_pipeline(args):
         "shape_fitting_tracker": shape_fitting_tracker,
         "fusion": fusion,
         "grasp_planner": grasp_planner,
+        "grasp_z_stabilizer": grasp_z_stabilizer,
         "hand_relative_fallback": hand_relative_fallback,
         #"fill_level_estimator": fill_level_estimator,
         "transform_chain": transform_chain,
@@ -4997,6 +5005,7 @@ def main():
             # task epoch가 바뀌면 이전 task의 hand-relative fallback state를 초기화한다.
             if current_task_epoch != active_task_epoch:
                 pipeline["hand_relative_fallback"].reset()
+                pipeline["grasp_z_stabilizer"].reset()
                 pipeline["object_class_lock"].reset()
                 active_task_epoch = current_task_epoch
 
@@ -5108,6 +5117,10 @@ def main():
                     measured_grasp_point_base,
                     y_mm=GRASP_POINT_Y_OFFSET_MM,
                     z_mm=GRASP_POINT_Z_OFFSET_MM,
+                )
+                measured_grasp_point_base = pipeline["grasp_z_stabilizer"].process(
+                    measured_object_point_base,
+                    measured_grasp_point_base,
                 )
             # task recording이 시작된 뒤 현재 frame이 몇 초 지났는지 계산한다.
             frame_record_elapsed_s = (
