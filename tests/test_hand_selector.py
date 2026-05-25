@@ -1,161 +1,198 @@
-import unittest
 import sys
 import types
+import unittest
 
 sys.modules.setdefault("yaml", types.SimpleNamespace(safe_load=lambda *args, **kwargs: {}))
 
-from perception.hand_selector import HandSelector
-from system.shared_state import HandState
+from perception.hand_selector import HandSelector, object_center_for_hand_selection
+from system.shared_state import HandCandidateState, HandState, ObjectState
 
 
-def make_config(lock_after_stable_frames=8):
+OBJECT_CENTER = (0.0, 0.0, 0.0)
+
+
+def make_config():
     return {
         "perception": {
-            "hand": {
-                "handedness_selection": {
-                    "right_hand_camera": 0,
-                    "left_hand_camera": 1,
-                    "hysteresis_frames": 5,
-                    "dropout_hold_frames": 12,
-                    "confidence_drop_margin": 0.15,
-                    "lock_after_stable_frames": int(lock_after_stable_frames),
-                    "lock_hold_last_on_dropout": True,
-                }
+            "hand_selection": {
+                "active_hand_distance_threshold_m": 0.15,
+                "switch_margin_m": 0.05,
+                "switch_confirm_frames": 5,
+                "lost_timeout_s": 0.5,
+                "lock_active_hand_during_task": True,
             }
         }
     }
 
 
-def make_hand(
+def make_candidate(
     camera_id,
+    candidate_index,
     *,
+    center,
     frame_id=0,
     handedness="right",
     confidence=0.9,
-    center=(0.30, 0.10, 0.40),
     valid=True,
+    timestamp=None,
 ):
-    return HandState(
+    return HandCandidateState(
         camera_id=int(camera_id),
         frame_id=int(frame_id),
+        candidate_index=int(candidate_index),
+        candidate_id=f"cam{int(camera_id)}:hand{int(candidate_index)}",
         hand_detected=bool(valid),
         handedness=str(handedness),
         confidence=float(confidence),
         palm_center_base=None if not valid else tuple(float(v) for v in center),
         palm_normal_base=None if not valid else (0.0, 0.0, 1.0),
-        wrist_base=None if not valid else (center[0] - 0.02, center[1], center[2]),
+        wrist_base=None if not valid else (float(center[0]) - 0.02, float(center[1]), float(center[2])),
         hand_velocity_base=None if not valid else (0.0, 0.0, 0.0),
-        timestamp=float(frame_id),
+        timestamp=float(frame_id if timestamp is None else timestamp),
         valid=bool(valid),
     )
 
 
-def invalid_hand(camera_id, frame_id=0):
-    return make_hand(camera_id, frame_id=frame_id, valid=False)
+def make_hand(camera_id, candidates=(), *, frame_id=0, timestamp=None):
+    candidates = list(candidates)
+    primary = candidates[0] if candidates else None
+    return HandState(
+        camera_id=int(camera_id),
+        frame_id=int(frame_id),
+        hand_detected=primary is not None,
+        handedness="unknown" if primary is None else primary.handedness,
+        confidence=0.0 if primary is None else primary.confidence,
+        palm_center_base=None if primary is None else primary.palm_center_base,
+        palm_normal_base=None if primary is None else primary.palm_normal_base,
+        wrist_base=None if primary is None else primary.wrist_base,
+        hand_velocity_base=None if primary is None else primary.hand_velocity_base,
+        hand_candidates=candidates,
+        timestamp=float(frame_id if timestamp is None else timestamp),
+        valid=primary is not None,
+    )
 
 
-class HandSelectorLockTests(unittest.TestCase):
-    def test_locks_after_eight_stable_frames(self):
-        selector = HandSelector(make_config(lock_after_stable_frames=8))
+def empty_hand(camera_id, *, frame_id=0, timestamp=None):
+    return make_hand(camera_id, (), frame_id=frame_id, timestamp=timestamp)
 
-        selected = None
-        for frame_id in range(8):
-            selected = selector.process_states(
-                make_hand(0, frame_id=frame_id, handedness="right"),
-                invalid_hand(1, frame_id=frame_id),
-            )
 
-        self.assertIsNotNone(selected)
-        self.assertTrue(selected.valid)
-        self.assertEqual(selected.selected_camera, 0)
-        self.assertEqual(selector.last_debug.locked_camera, 0)
-        self.assertEqual(selector.last_debug.lock_stable_frames, 8)
-        self.assertEqual(selector.last_debug.selection_reason, "lock_acquired")
-
-    def test_keeps_locked_camera_when_opposite_camera_has_higher_confidence(self):
-        selector = HandSelector(make_config(lock_after_stable_frames=8))
-        for frame_id in range(8):
-            selector.process_states(
-                make_hand(0, frame_id=frame_id, handedness="right", confidence=0.7),
-                invalid_hand(1, frame_id=frame_id),
-            )
+class HandSelectorDistanceTests(unittest.TestCase):
+    def test_selects_only_hand_within_object_threshold(self):
+        selector = HandSelector(make_config())
 
         selected = selector.process_states(
-            make_hand(0, frame_id=8, handedness="right", confidence=0.4, center=(0.31, 0.10, 0.40)),
-            make_hand(1, frame_id=8, handedness="left", confidence=0.99, center=(0.80, 0.10, 0.40)),
+            make_hand(0, [make_candidate(0, 0, center=(0.10, 0.0, 0.0))]),
+            make_hand(1, [make_candidate(1, 0, center=(0.30, 0.0, 0.0), handedness="left")]),
+            object_center_base=OBJECT_CENTER,
         )
 
         self.assertTrue(selected.valid)
         self.assertEqual(selected.selected_camera, 0)
-        self.assertEqual(selected.palm_center_base, (0.31, 0.10, 0.40))
-        self.assertEqual(selector.last_debug.locked_camera, 0)
-        self.assertEqual(selector.last_debug.selection_reason, "locked_camera_current")
+        self.assertEqual(selected.selected_candidate_id, "cam0:hand0")
+        self.assertEqual(selector.last_debug.selection_reason, "select_within_object_threshold")
 
-    def test_uses_latest_locked_camera_state_even_if_handedness_flips(self):
-        selector = HandSelector(make_config(lock_after_stable_frames=8))
-        for frame_id in range(8):
-            selector.process_states(
-                make_hand(0, frame_id=frame_id, handedness="right"),
-                invalid_hand(1, frame_id=frame_id),
-            )
+    def test_chooses_closer_hand_when_both_are_within_threshold(self):
+        selector = HandSelector(make_config())
 
         selected = selector.process_states(
-            make_hand(0, frame_id=8, handedness="left", confidence=0.8, center=(0.35, 0.10, 0.40)),
-            invalid_hand(1, frame_id=8),
+            make_hand(0, [make_candidate(0, 0, center=(0.12, 0.0, 0.0))]),
+            make_hand(1, [make_candidate(1, 0, center=(0.08, 0.0, 0.0), handedness="left")]),
+            object_center_base=OBJECT_CENTER,
         )
 
         self.assertTrue(selected.valid)
-        self.assertEqual(selected.selected_camera, 0)
-        self.assertEqual(selected.handedness, "left")
-        self.assertEqual(selected.palm_center_base, (0.35, 0.10, 0.40))
-        self.assertEqual(selector.last_debug.selection_reason, "locked_camera_current")
+        self.assertEqual(selected.selected_camera, 1)
+        self.assertEqual(selected.selected_candidate_id, "cam1:hand0")
 
-    def test_holds_last_locked_state_when_locked_camera_drops_out(self):
-        selector = HandSelector(make_config(lock_after_stable_frames=8))
-        for frame_id in range(8):
-            selector.process_states(
-                make_hand(0, frame_id=frame_id, handedness="right", center=(0.30 + frame_id * 0.01, 0.10, 0.40)),
-                invalid_hand(1, frame_id=frame_id),
-            )
+    def test_returns_invalid_when_no_hand_has_entered_threshold(self):
+        selector = HandSelector(make_config())
 
         selected = selector.process_states(
-            invalid_hand(0, frame_id=8),
-            make_hand(1, frame_id=8, handedness="left", confidence=0.99, center=(0.90, 0.10, 0.40)),
-        )
-
-        self.assertTrue(selected.valid)
-        self.assertEqual(selected.selected_camera, 0)
-        self.assertEqual(selected.palm_center_base, (0.37, 0.10, 0.40))
-        self.assertEqual(selector.last_debug.locked_camera, 0)
-        self.assertEqual(selector.last_debug.selection_reason, "locked_camera_hold_last_dropout")
-
-    def test_reset_clears_lock_state(self):
-        selector = HandSelector(make_config(lock_after_stable_frames=8))
-        for frame_id in range(8):
-            selector.process_states(
-                make_hand(0, frame_id=frame_id, handedness="right"),
-                invalid_hand(1, frame_id=frame_id),
-            )
-
-        selector.reset()
-
-        self.assertIsNone(selector._locked_camera)
-        self.assertIsNone(selector._lock_stable_camera)
-        self.assertEqual(selector._lock_stable_frames, 0)
-        self.assertIsNone(selector._locked_state)
-
-    def test_records_reject_reason_for_invalid_candidate(self):
-        selector = HandSelector(make_config(lock_after_stable_frames=8))
-
-        selected = selector.process_states(
-            make_hand(0, handedness="left"),
-            invalid_hand(1),
+            make_hand(0, [make_candidate(0, 0, center=(0.20, 0.0, 0.0))]),
+            make_hand(1, [make_candidate(1, 0, center=(0.30, 0.0, 0.0), handedness="left")]),
+            object_center_base=OBJECT_CENTER,
         )
 
         self.assertFalse(selected.valid)
-        self.assertEqual(selector.last_debug.cam0_reject_reason, "handedness_mismatch:left->right")
-        self.assertEqual(selector.last_debug.cam1_reject_reason, "hand_not_detected")
-        self.assertEqual(selector.last_debug.selection_reason, "no_valid_candidate")
+        self.assertEqual(selector.last_debug.selection_reason, "no_candidate_within_threshold")
+
+    def test_keeps_previous_selected_hand_when_none_are_currently_within_threshold(self):
+        selector = HandSelector(make_config())
+        selector.process_states(
+            make_hand(0, [make_candidate(0, 0, center=(0.10, 0.0, 0.0), frame_id=0)]),
+            empty_hand(1, frame_id=0),
+            object_center_base=OBJECT_CENTER,
+        )
+
+        selected = selector.process_states(
+            make_hand(0, [make_candidate(0, 0, center=(0.20, 0.0, 0.0), frame_id=1)]),
+            make_hand(1, [make_candidate(1, 0, center=(0.25, 0.0, 0.0), frame_id=1, handedness="left")]),
+            object_center_base=OBJECT_CENTER,
+        )
+
+        self.assertTrue(selected.valid)
+        self.assertEqual(selected.selected_camera, 0)
+        self.assertEqual(selected.palm_center_base, (0.20, 0.0, 0.0))
+        self.assertEqual(selector.last_debug.selection_reason, "keep_locked_active_hand")
+
+    def test_switches_only_after_challenger_is_clearly_closer_for_confirm_frames(self):
+        selector = HandSelector(make_config())
+        selector.process_states(
+            make_hand(0, [make_candidate(0, 0, center=(0.14, 0.0, 0.0), frame_id=0)]),
+            empty_hand(1, frame_id=0),
+            object_center_base=OBJECT_CENTER,
+        )
+
+        selected = None
+        for frame_id in range(1, 5):
+            selected = selector.process_states(
+                make_hand(0, [make_candidate(0, 0, center=(0.14, 0.0, 0.0), frame_id=frame_id)]),
+                make_hand(1, [make_candidate(1, 0, center=(0.08, 0.0, 0.0), frame_id=frame_id, handedness="left")]),
+                object_center_base=OBJECT_CENTER,
+            )
+            self.assertTrue(selected.valid)
+            self.assertEqual(selected.selected_camera, 0)
+
+        selected = selector.process_states(
+            make_hand(0, [make_candidate(0, 0, center=(0.14, 0.0, 0.0), frame_id=5)]),
+            make_hand(1, [make_candidate(1, 0, center=(0.08, 0.0, 0.0), frame_id=5, handedness="left")]),
+            object_center_base=OBJECT_CENTER,
+        )
+
+        self.assertTrue(selected.valid)
+        self.assertEqual(selected.selected_camera, 1)
+        self.assertEqual(selector.last_debug.selection_reason, "switch_after_confirmed_closer_to_object")
+
+    def test_releases_current_hand_after_lost_timeout(self):
+        selector = HandSelector(make_config())
+        selector.process_states(
+            make_hand(0, [make_candidate(0, 0, center=(0.10, 0.0, 0.0), timestamp=0.0)], timestamp=0.0),
+            empty_hand(1, timestamp=0.0),
+            object_center_base=OBJECT_CENTER,
+        )
+
+        held = selector.process_states(
+            empty_hand(0, timestamp=0.4),
+            empty_hand(1, timestamp=0.4),
+            object_center_base=OBJECT_CENTER,
+        )
+        released = selector.process_states(
+            empty_hand(0, timestamp=0.6),
+            empty_hand(1, timestamp=0.6),
+            object_center_base=OBJECT_CENTER,
+        )
+
+        self.assertTrue(held.valid)
+        self.assertEqual(selector.last_debug.selection_reason, "active_hand_lost_timeout_no_replacement")
+        self.assertFalse(released.valid)
+
+    def test_object_center_helper_uses_point_count_weighted_average(self):
+        center = object_center_for_hand_selection(
+            ObjectState(camera_id=0, centroid_base=(0.0, 0.0, 0.0), point_count=1, valid=True),
+            ObjectState(camera_id=1, centroid_base=(1.0, 0.0, 0.0), point_count=3, valid=True),
+        )
+
+        self.assertEqual(center, (0.75, 0.0, 0.0))
 
 
 if __name__ == "__main__":

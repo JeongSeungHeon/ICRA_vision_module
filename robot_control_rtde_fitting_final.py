@@ -25,7 +25,7 @@ from perception.fusion import PerceptionFusion
 #from perception.fill_level_estimator import FillLevelEstimator
 from perception.grasp_target import GraspTargetPlanner
 from perception.hand_relative_fallback import HandRelativeFallbackTracker
-from perception.hand_selector import HandSelector
+from perception.hand_selector import HandSelector, object_center_for_hand_selection
 from perception.hand_worker import HandWorkerCam0, HandWorkerCam1
 from perception.object_merger import ObjectMerger
 from perception.object_worker import HandednessAwareObjectClassLock, ObjectWorkerCam0, ObjectWorkerCam1
@@ -5026,8 +5026,13 @@ def main():
                 hand_cam1 = pipeline["hand_worker_cam1"].process_frame(snapshot.cam1, frame_id=snapshot.pair_index)
             # 두 카메라의 hand/object 상태를 하나의 상태로 합치는 구간이다.
             with runtime_profiler.stage("merge"):
-                # 두 카메라 중 현재 가장 신뢰할 수 있는 hand state를 선택한다.
-                selected_hand = pipeline["hand_selector"].process_states(hand_cam0, hand_cam1)
+                # object center 근처에 들어온 hand 후보 중 handover에 사용할 단일 hand를 선택한다.
+                object_center_base = object_center_for_hand_selection(object_cam0, object_cam1)
+                selected_hand = pipeline["hand_selector"].process_states(
+                    hand_cam0,
+                    hand_cam1,
+                    object_center_base=object_center_base,
+                )
                 object_cam0, object_cam1 = pipeline["object_class_lock"].process_states(
                     selected_hand=selected_hand,
                     hand_cam0=hand_cam0,

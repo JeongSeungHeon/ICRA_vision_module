@@ -145,8 +145,8 @@ class DataInferenceTests(unittest.TestCase):
                 pass
 
         class HandSelector:
-            def process_states(self, hand_cam0, hand_cam1):
-                del hand_cam0, hand_cam1
+            def process_states(self, hand_cam0, hand_cam1, *, object_center_base=None):
+                del hand_cam0, hand_cam1, object_center_base
                 return SimpleNamespace(valid=True)
 
         class ObjectMerger:
@@ -216,6 +216,7 @@ class DataInferenceTests(unittest.TestCase):
             load_yaml_config=lambda config: {},
             apply_config_defaults=lambda runtime_args, config: runtime_args,
             build_dual_perception_pipeline=lambda runtime_args: pipeline,
+            object_center_for_hand_selection=lambda object_cam0, object_cam1: None,
             build_silhouette_observations=lambda snapshot, live_pipeline: [],
             build_fitted_merged_object=lambda merged_object, shape_fitting_state: SimpleNamespace(
                 centroid_base=shape_fitting_state.centroid_base

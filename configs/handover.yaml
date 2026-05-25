@@ -268,7 +268,7 @@ perception:
       # MediaPipe hand tracking 최소 confidence입니다.
       min_tracking_confidence: 0.5
       # 카메라별 검출할 최대 손 개수입니다.
-      max_num_hands: 1
+      max_num_hands: 2
     depth_lifting:
       # hand keypoint 주변 depth patch 반경입니다.
       patch_radius: 2
@@ -299,6 +299,18 @@ perception:
       lock_after_stable_frames: 4
       # lock 이후 손이 잠깐 invalid가 되어도 마지막 selected hand를 유지합니다.
       lock_hold_last_on_dropout: true
+
+  hand_selection:
+    # object center에서 이 거리 안으로 들어온 hand 후보만 active hand로 신규 선택합니다.
+    active_hand_distance_threshold_m: 0.15
+    # 다른 hand로 전환하려면 현재 hand보다 이 거리 이상 더 가까워야 합니다.
+    switch_margin_m: 0.05
+    # 전환 조건을 만족한 challenger가 연속 유지되어야 하는 frame 수입니다.
+    switch_confirm_frames: 5
+    # 현재 active hand가 사라졌을 때 마지막 선택을 유지하는 시간입니다.
+    lost_timeout_s: 0.5
+    # handover task 중 active hand를 보수적으로 유지합니다.
+    lock_active_hand_during_task: true
 
   fusion:
     # object centroid EMA alpha입니다. 수정 0.35  -> 0.6

@@ -402,7 +402,12 @@ def run_replay(input_path: str | Path, args: argparse.Namespace) -> OfflineRepla
             hand_cam0 = pipeline["hand_worker_cam0"].process_frame(snapshot.cam0, frame_id=snapshot.pair_index)
             hand_cam1 = pipeline["hand_worker_cam1"].process_frame(snapshot.cam1, frame_id=snapshot.pair_index)
 
-            selected_hand = pipeline["hand_selector"].process_states(hand_cam0, hand_cam1)
+            object_center_base = live.object_center_for_hand_selection(object_cam0, object_cam1)
+            selected_hand = pipeline["hand_selector"].process_states(
+                hand_cam0,
+                hand_cam1,
+                object_center_base=object_center_base,
+            )
             merged_object = pipeline["object_merger"].process_states(object_cam0, object_cam1)
             silhouette_observations = live.build_silhouette_observations(snapshot, pipeline)
             shape_fitting_state = pipeline["shape_fitting_tracker"].process(

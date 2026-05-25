@@ -112,9 +112,11 @@ class MergedObjectState(BaseState):
 
 
 @dataclass
-class HandState(BaseState):
+class HandCandidateState(BaseState):
     camera_id: int = -1
     frame_id: int = -1
+    candidate_index: int = -1
+    candidate_id: str | None = None
     hand_detected: bool = False
     handedness: str = HANDEDNESS_UNKNOWN
     confidence: float = 0.0
@@ -125,9 +127,25 @@ class HandState(BaseState):
 
 
 @dataclass
+class HandState(BaseState):
+    camera_id: int = -1
+    frame_id: int = -1
+    hand_detected: bool = False
+    handedness: str = HANDEDNESS_UNKNOWN
+    confidence: float = 0.0
+    palm_center_base: Vec3 | None = None
+    palm_normal_base: Vec3 | None = None
+    wrist_base: Vec3 | None = None
+    hand_velocity_base: Vec3 | None = None
+    hand_candidates: list[HandCandidateState] = field(default_factory=list)
+
+
+@dataclass
 class SelectedHandState(BaseState):
     frame_id: int = -1
     selected_camera: int | None = None
+    selected_candidate_index: int | None = None
+    selected_candidate_id: str | None = None
     handedness: str | None = None
     confidence: float = 0.0
     palm_center_base: Vec3 | None = None
@@ -274,6 +292,7 @@ __all__ = [
     "SensorState",
     "ObjectState",
     "MergedObjectState",
+    "HandCandidateState",
     "HandState",
     "SelectedHandState",
     "FusionState",

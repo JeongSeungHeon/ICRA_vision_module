@@ -161,6 +161,9 @@ class HandednessAwareObjectClassLock:
     @staticmethod
     def _resolve_hand_for_lock(selected_hand: Any, hand_cam0: Any, hand_cam1: Any) -> tuple[int | None, str | None]:
         selected_camera = getattr(selected_hand, "selected_camera", None)
+        if selected_camera is not None and bool(getattr(selected_hand, "valid", False)):
+            return int(selected_camera), getattr(selected_hand, "handedness", None)
+
         hand_state = None
         if selected_camera is not None:
             hand_state = hand_cam0 if int(selected_camera) == 0 else hand_cam1
