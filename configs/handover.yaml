@@ -492,7 +492,7 @@ grasp:
     # fallback lock에 motion trigger 상태를 요구할지 정합니다.
     require_motion_triggered: true
     # hand-relative fallback lock/active 여부를 콘솔에 출력합니다.
-    debug_log: false
+    debug_log: true
     # lock_frames progress가 바뀔 때만 출력합니다.
     log_lock_progress: false
     # fallback active 로그를 몇 frame마다 출력할지 정합니다. 1이면 매 fallback frame 출력입니다.

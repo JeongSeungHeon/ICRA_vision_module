@@ -84,6 +84,7 @@ HOME_PLACE_Y_OFFSET_MM = 40.0
 HOME_PLACE_MIN_Z_MM = 30.0
 PRE_RELEASE_MIN_Z_EPSILON_MM = 1e-3
 GRASP_POINT_Y_OFFSET_MM = 20.0
+GRASP_POINT_Z_OFFSET_MM = 10.0
 PLACE_Z_GRASP_BUFFER_FRAMES = 5
 PLACE_Z_MIN_VALID_SAMPLES = 3
 GRIPPER_FORCE_STOP_DELTA_N = 100000
@@ -5101,6 +5102,7 @@ def main():
                 measured_grasp_point_base = offset_point_base_mm(
                     measured_grasp_point_base,
                     y_mm=GRASP_POINT_Y_OFFSET_MM,
+                    z_mm=GRASP_POINT_Z_OFFSET_MM,
                 )
             # task recording이 시작된 뒤 현재 frame이 몇 초 지났는지 계산한다.
             frame_record_elapsed_s = (
