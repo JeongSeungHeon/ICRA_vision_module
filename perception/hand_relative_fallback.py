@@ -55,8 +55,8 @@ class HandRelativeFallbackTracker:
 
         self._anchor_locked = False
         self._lock_streak = 0
-        self._object_offset_candidates: deque[np.ndarray] = deque(maxlen=self.lock_frames)
-        self._grasp_offset_candidates: deque[np.ndarray] = deque(maxlen=self.lock_frames)
+        self._object_offset_candidates: deque[np.ndarray] = deque()
+        self._grasp_offset_candidates: deque[np.ndarray] = deque()
         self._object_offset_base: np.ndarray | None = None
         self._grasp_offset_base: np.ndarray | None = None
         self._anchor_hand_position_base: np.ndarray | None = None
@@ -150,32 +150,31 @@ class HandRelativeFallbackTracker:
             self._last_measured_timestamp = current_time
             self._last_measured_frame_id = frame_id
             self._last_measured_record_elapsed_s = record_elapsed_s
-            if not self._anchor_locked and hand_approach_ok and motion_trigger_ok:
-                self._lock_streak += 1
+            if hand_approach_ok and motion_trigger_ok:
                 self._object_offset_candidates.append(measured_object - hand_center)
                 self._grasp_offset_candidates.append(measured_grasp - hand_center)
-                if self._lock_streak >= self.lock_frames:
+                self._lock_streak = len(self._grasp_offset_candidates)
+                if len(self._grasp_offset_candidates) >= self.lock_frames:
+                    was_anchor_locked = self._anchor_locked
                     self._anchor_locked = True
-                    self._object_offset_base = self._filtered_axis_mean(self._object_offset_candidates)
-                    self._grasp_offset_base = self._filtered_axis_mean(self._grasp_offset_candidates)
                     self._anchor_hand_position_base = hand_center.copy()
                     self._anchor_frame_id = frame_id
                     self._anchor_record_elapsed_s = record_elapsed_s
                     self._fallback_log_counter = 0
                     self._last_anchor_wait_reason = None
                     self._last_anchor_wait_log_key = None
-                    self._log(
-                        "ANCHOR_LOCKED "
-                        f"clock={self._format_record_clock(record_elapsed_s)} "
-                        f"lock={self._lock_streak}/{self.lock_frames} "
-                        f"hand={self._format_vec(hand_center)} "
-                        f"object={self._format_vec(measured_object)} "
-                        f"grasp={self._format_vec(measured_grasp)} "
-                        f"anchor_samples={len(self._grasp_offset_candidates)} "
-                        f"outlier_threshold_mm={self.anchor_outlier_threshold_m * 1000.0:.1f} "
-                        f"object_offset={self._format_vec(self._object_offset_base)} "
-                        f"grasp_offset={self._format_vec(self._grasp_offset_base)}"
-                    )
+                    if not was_anchor_locked or self.log_lock_progress:
+                        log_label = "ANCHOR_READY" if not was_anchor_locked else "ANCHOR_UPDATED"
+                        self._log(
+                            f"{log_label} "
+                            f"clock={self._format_record_clock(record_elapsed_s)} "
+                            f"lock={self._lock_streak}/{self.lock_frames} "
+                            f"hand={self._format_vec(hand_center)} "
+                            f"object={self._format_vec(measured_object)} "
+                            f"grasp={self._format_vec(measured_grasp)} "
+                            f"anchor_samples={len(self._grasp_offset_candidates)} "
+                            f"outlier_threshold_mm={self.anchor_outlier_threshold_m * 1000.0:.1f}"
+                        )
                 elif self.log_lock_progress:
                     self._log_anchor_wait(
                         "measured_available",
@@ -186,10 +185,6 @@ class HandRelativeFallbackTracker:
                         hand_approach_ok=hand_approach_ok,
                         motion_trigger_ok=motion_trigger_ok,
                     )
-            elif not self._anchor_locked:
-                self._lock_streak = 0
-                self._object_offset_candidates.clear()
-                self._grasp_offset_candidates.clear()
             reason = "measured_available"
             if not hand_approach_ok:
                 reason = "hand_approach_required"
@@ -233,7 +228,6 @@ class HandRelativeFallbackTracker:
                 valid=False,
             )
 
-        self._lock_streak = 0
         if hand_center is None:
             if not self._anchor_locked:
                 self._log_anchor_wait(
@@ -246,7 +240,7 @@ class HandRelativeFallbackTracker:
                     motion_trigger_ok=motion_trigger_ok,
                 )
             return self._invalid_state(current_time, reason="no_hand_center", used_filtered_hand_center=used_filtered_hand_center, frame_id=frame_id)
-        if not self._anchor_locked or self._object_offset_base is None or self._grasp_offset_base is None:
+        if not self._anchor_locked or len(self._grasp_offset_candidates) < self.lock_frames:
             if measured_object is None:
                 reason = "no_measured_object"
             elif measured_grasp is None:
@@ -278,6 +272,8 @@ class HandRelativeFallbackTracker:
                 frame_id=frame_id,
             )
 
+        self._object_offset_base = self._filtered_axis_mean(self._object_offset_candidates)
+        self._grasp_offset_base = self._filtered_axis_mean(self._grasp_offset_candidates)
         object_position = hand_center + self._object_offset_base
         grasp_position = hand_center + self._grasp_offset_base
         self._fallback_log_counter += 1
@@ -288,6 +284,8 @@ class HandRelativeFallbackTracker:
                 f"anchor_clock={self._format_record_clock(self._anchor_record_elapsed_s)} "
                 f"last_measured_clock={self._format_record_clock(self._last_measured_record_elapsed_s)} "
                 f"dropout_age={dropout_age_s:.3f}s "
+                f"anchor_samples={len(self._grasp_offset_candidates)} "
+                f"outlier_threshold_mm={self.anchor_outlier_threshold_m * 1000.0:.1f} "
                 f"hand={self._format_vec(hand_center)} "
                 f"grasp={self._format_vec(grasp_position)} "
                 f"object={self._format_vec(object_position)} "

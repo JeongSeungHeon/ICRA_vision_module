@@ -64,6 +64,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-rrd", default=None, help="Save the Rerun recording to this .rrd path instead of opening a viewer.")
     parser.add_argument("--app-id", default="handover_3d_debug", help="Rerun application id.")
     parser.add_argument(
+        "--selected-hand-only",
+        action="store_true",
+        help="Only visualize the hand selected by the hand selector instead of both camera hands.",
+    )
+    parser.add_argument(
         "--no-point-coordinate-labels",
         action="store_true",
         help="Do not attach per-point base-frame xyz labels for Rerun selection/inspection.",
@@ -222,9 +227,13 @@ def frame_status_text(data: dict[str, Any], frame_index: int) -> str:
         return "(" + ", ".join(f"{float(v):.3f}" for v in vec) + ")"
 
     return (
-        f"[FRAME {idx + 1}/{count}] t={record_clock} label={label} template={template_id} "
-        f"fit={reason} src={source} hand_select={hand_selection} object={fmt('object_point_base')} "
-        f"grasp={fmt('grasp_point_base')} eef={fmt('eef_pose_base', 6)}"
+        f"[FRAME {idx + 1}/{count}] t={record_clock}\n"
+        f"label={label} template={template_id} fit={reason}\n"
+        f"src={source} hand_select={hand_selection}\n"
+        "=====================================\n"
+        f"object={fmt('object_point_base')}\n"
+        f"grasp={fmt('grasp_point_base')}\n"
+        f"eef={fmt('eef_pose_base', 6)}"
     )
 
 
@@ -427,18 +436,24 @@ def build_hand_payload(
     return valid_points, strips, (255, 242, 26) if selected else (255, 255, 255)
 
 
-def count_frame_entities(data: dict[str, Any], frame_index: int) -> int:
+def count_frame_entities(data: dict[str, Any], frame_index: int, *, selected_hand_only: bool = False) -> int:
     idx = int(frame_index)
     count = 1  # frame status text
     count += int(len(_as_points(data["object_points_base"][idx])) > 0)
     count += int(len(_as_points(data["template_points_base"][idx])) > 0)
     for key, _, _, _ in MARKERS:
         count += int(key in data and _is_valid_vec(data[key][idx], 3))
-    for camera_id in (0, 1):
+    selected_camera = int(data["selected_hand_camera"][idx]) if "selected_hand_camera" in data else -1
+    selected_hand_valid = bool(data["selected_hand_valid"][idx]) if "selected_hand_valid" in data else selected_camera in (0, 1)
+    if selected_hand_only:
+        camera_ids = (selected_camera,) if selected_hand_valid and selected_camera in (0, 1) else ()
+    else:
+        camera_ids = (0, 1)
+    for camera_id in camera_ids:
         points, strips, _ = build_hand_payload(
             data[f"cam{camera_id}_hand_points_base"][idx],
             data[f"cam{camera_id}_hand_valid_mask"][idx],
-            selected=int(data["selected_hand_camera"][idx]) == camera_id,
+            selected=selected_camera == camera_id,
         )
         count += int(len(points) > 0)
         count += int(len(strips) > 0)
@@ -756,6 +771,25 @@ def log_hand(
     log_line_strips(rr, f"{prefix}/skeleton", strips, color, radius=0.003)
 
 
+def log_selected_hand(rr: Any, data: dict[str, Any], idx: int, *, include_coordinate_labels: bool, point_coordinate_precision: int) -> None:
+    selected_camera = int(data["selected_hand_camera"][idx]) if "selected_hand_camera" in data else -1
+    selected_hand_valid = bool(data["selected_hand_valid"][idx]) if "selected_hand_valid" in data else selected_camera in (0, 1)
+    for camera_id in (0, 1):
+        if selected_hand_valid and selected_camera == camera_id:
+            log_hand(
+                rr,
+                data,
+                idx,
+                camera_id,
+                include_coordinate_labels=include_coordinate_labels,
+                point_coordinate_precision=point_coordinate_precision,
+            )
+        else:
+            prefix = f"/world/hands/cam{camera_id}"
+            log_clear(rr, f"{prefix}/keypoints")
+            log_clear(rr, f"{prefix}/skeleton")
+
+
 def log_marker(
     rr: Any,
     data: dict[str, Any],
@@ -880,6 +914,11 @@ def log_tactile(rr: Any, data: dict[str, Any], idx: int) -> None:
         log_clear(rr, f"/tactile/mag_{mag_idx}/z")
         log_clear(rr, f"/tactile/mag_{mag_idx}/norm")
 
+def log_source_flags(rr: Any, data: dict[str, Any], idx: int) -> None:
+    source = _string_at(data, "measurement_source", idx)
+    log_scalar(rr, "/source/hand_fallback_active", 1.0 if source == "hand_fallback" else 0.0)
+    log_scalar(rr, "/source/shape_fitting_valid", 1.0 if bool(data["shape_fitting_valid"][idx]) else 0.0)
+
 
 def log_frame(
     rr: Any,
@@ -891,6 +930,7 @@ def log_frame(
     depth_max_m: float,
     include_coordinate_labels: bool,
     point_coordinate_precision: int,
+    selected_hand_only: bool,
 ) -> None:
     set_frame_time(rr, data, idx)
 
@@ -903,26 +943,28 @@ def log_frame(
     template_labels = point_coordinate_labels(template_points, "template", point_coordinate_precision) if include_coordinate_labels else None
     log_points(rr, "/world/template/cloud", template_points, (26, 204, 242), radius=0.0025, labels=template_labels, show_labels=False)
 
-    log_hand(
-        rr,
-        data,
-        idx,
-        0,
-        include_coordinate_labels=include_coordinate_labels,
-        point_coordinate_precision=point_coordinate_precision,
-    )
-    log_hand(
-        rr,
-        data,
-        idx,
-        1,
-        include_coordinate_labels=include_coordinate_labels,
-        point_coordinate_precision=point_coordinate_precision,
-    )
+    if selected_hand_only:
+        log_selected_hand(
+            rr,
+            data,
+            idx,
+            include_coordinate_labels=include_coordinate_labels,
+            point_coordinate_precision=point_coordinate_precision,
+        )
+    else:
+        for camera_id in (0, 1):
+            log_hand(
+                rr,
+                data,
+                idx,
+                camera_id,
+                include_coordinate_labels=include_coordinate_labels,
+                point_coordinate_precision=point_coordinate_precision,
+            )
 
     for key, entity, radius, color in MARKERS:
         log_marker(rr, data, idx, key, entity, radius, color)
-
+    log_source_flags(rr, data, idx)
     log_palm_normal(rr, data, idx, normal_length_m)
     log_eef_axes(rr, data["eef_pose_base"][idx])
     log_template_axes(rr, data, idx, template_axis_length_m)
@@ -936,12 +978,19 @@ def log_frame(
         log_clear(rr, "/status/sync")
 
 
-def dry_run(data: dict[str, Any], *, normal_length_m: float, template_axis_length_m: float, depth_max_m: float) -> None:
+def dry_run(
+    data: dict[str, Any],
+    *,
+    normal_length_m: float,
+    template_axis_length_m: float,
+    depth_max_m: float,
+    selected_hand_only: bool,
+) -> None:
     print("[INFO] Debug recording summary:")
     print(recording_summary_text(data))
     frame_count = int(data["frame_count"])
-    first_entities = count_frame_entities(data, 0)
-    last_entities = count_frame_entities(data, frame_count - 1)
+    first_entities = count_frame_entities(data, 0, selected_hand_only=selected_hand_only)
+    last_entities = count_frame_entities(data, frame_count - 1, selected_hand_only=selected_hand_only)
     object_points = len(_as_points(data["object_points_base"][0]))
     template_points = len(_as_points(data["template_points_base"][0]))
     print(
@@ -953,6 +1002,7 @@ def dry_run(data: dict[str, Any], *, normal_length_m: float, template_axis_lengt
         print(f"[INFO] Last frame converts to {last_entities} Rerun entities.")
     if _valid_palm_normal(data, 0):
         print(f"[INFO] Palm normal line length: {float(normal_length_m):.3f} m.")
+    print(f"[INFO] Hand visualization mode: {'selected hand only' if selected_hand_only else 'both camera hands'}.")
     axes_first = _first_valid_template_axes_index(data)
     if axes_first is None:
         print("[INFO] Template local axes: not recorded or no valid axes.")
@@ -986,7 +1036,13 @@ def main() -> int:
         raise RuntimeError("Recording contains no frames.")
 
     if args.dry_run:
-        dry_run(data, normal_length_m=args.normal_length, template_axis_length_m=args.template_axis_length, depth_max_m=args.depth_max_m)
+        dry_run(
+            data,
+            normal_length_m=args.normal_length,
+            template_axis_length_m=args.template_axis_length,
+            depth_max_m=args.depth_max_m,
+            selected_hand_only=bool(args.selected_hand_only),
+        )
         return 0
 
     rr = _import_rerun()
@@ -1003,6 +1059,7 @@ def main() -> int:
             depth_max_m=args.depth_max_m,
             include_coordinate_labels=not args.no_point_coordinate_labels,
             point_coordinate_precision=args.point_coordinate_precision,
+            selected_hand_only=bool(args.selected_hand_only),
         )
         print(frame_status_text(data, idx), flush=True)
 

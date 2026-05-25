@@ -308,7 +308,7 @@ perception:
     # 전환 조건을 만족한 challenger가 연속 유지되어야 하는 frame 수입니다.
     switch_confirm_frames: 5
     # 현재 active hand가 사라졌을 때 마지막 선택을 유지하는 시간입니다.
-    lost_timeout_s: 0.5
+    lost_timeout_s: 1.5
     # handover task 중 active hand를 보수적으로 유지합니다.
     lock_active_hand_during_task: true
 
@@ -495,9 +495,9 @@ grasp:
   hand_relative_fallback:
     # object 측정 dropout 때 hand-relative fallback을 사용할지 정합니다.
     enabled: true
-    # hand/object 상대 위치를 lock하기 전 필요한 frame 수입니다.
-    lock_frames: 3
-    # lock frame 샘플 평균에서 축별 median 대비 이 거리 이상 튄 값은 제외합니다.
+    # fallback을 사용하기 전 필요한 task 누적 valid frame 수입니다.
+    lock_frames: 1
+    # task 누적 샘플 평균에서 축별 median 대비 이 거리 이상 튄 값은 제외합니다.
     anchor_outlier_threshold_m: 0.10
     # 측정이 끊겨도 fallback을 유지할 최대 시간입니다.
     max_dropout_sec: 3.0
