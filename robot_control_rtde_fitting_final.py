@@ -5118,9 +5118,38 @@ def main():
                     y_mm=GRASP_POINT_Y_OFFSET_MM,
                     z_mm=GRASP_POINT_Z_OFFSET_MM,
                 )
+
+            # 현재 end-effector pose는 grasp z-stabilization과 shared state target update에 사용한다.
+            eef_pose_base = None
+            # shared state에는 end-effector xyz를 mm 단위로 넣기 위해 별도 변수로 둔다.
+            eef_xyz_mm = None
+            # measured target이 있거나 3D debug 기록이 켜져 있으면 로봇 pose가 필요하다.
+            need_robot_pose = (
+                measured_grasp_point_base is not None
+                or measured_object_point_base is not None
+                or debug_3d_recorder is not None
+            )
+            # 로봇 worker가 있고 pose가 필요한 frame에서만 status를 다시 읽는다.
+            if robot_worker is not None and need_robot_pose:
+                # robot status read 시간도 profiler stage로 기록한다.
+                with runtime_profiler.stage("robot_read"):
+                    robot_status = robot_worker.get_status()
+                # status에 최신 robot pose가 있으면 tuple(float) 형태로 정규화한다.
+                if robot_status.last_robot_pose is not None:
+                    eef_pose_base = tuple(float(v) for v in robot_status.last_robot_pose)
+                    # robot pose의 xyz[m]를 xyz[mm]로 변환한다.
+                    eef_xyz_mm = meters_to_mm(eef_pose_base[:3])
+
+            with runtime_profiler.stage("grasp_z_stabilization"):
+                reference_xyz_mm = (
+                    None
+                    if measured_grasp_point_base is None
+                    else meters_to_mm(measured_grasp_point_base)
+                )
                 measured_grasp_point_base = pipeline["grasp_z_stabilizer"].process(
-                    measured_object_point_base,
                     measured_grasp_point_base,
+                    reference_xyz_mm=reference_xyz_mm,
+                    eef_xyz_mm=eef_xyz_mm,
                 )
             # task recording이 시작된 뒤 현재 frame이 몇 초 지났는지 계산한다.
             frame_record_elapsed_s = (
@@ -5170,21 +5199,16 @@ def main():
                 snapshot.cam0.color_image.shape[0],
             )
 
-            # 현재 end-effector pose는 필요할 때만 robot status에서 읽는다.
-            eef_pose_base = None
-            # shared state에는 end-effector xyz를 mm 단위로 넣기 위해 별도 변수로 둔다.
-            eef_xyz_mm = None
-            # object target이 있거나 3D debug 기록이 켜져 있으면 로봇 pose가 필요하다.
-            need_robot_pose = object_point_base is not None or debug_3d_recorder is not None
-            # 로봇 worker가 있고 pose가 필요한 frame에서만 status를 다시 읽는다.
-            if robot_worker is not None and need_robot_pose:
-                # robot status read 시간도 profiler stage로 기록한다.
+            # 측정값은 없지만 fallback target이 생긴 frame에서는 기존처럼 EEF pose를 읽어 target update에 쓴다.
+            if (
+                robot_worker is not None
+                and eef_xyz_mm is None
+                and (object_point_base is not None or debug_3d_recorder is not None)
+            ):
                 with runtime_profiler.stage("robot_read"):
                     robot_status = robot_worker.get_status()
-                # status에 최신 robot pose가 있으면 tuple(float) 형태로 정규화한다.
                 if robot_status.last_robot_pose is not None:
                     eef_pose_base = tuple(float(v) for v in robot_status.last_robot_pose)
-                    # robot pose의 xyz[m]를 xyz[mm]로 변환한다.
                     eef_xyz_mm = meters_to_mm(eef_pose_base[:3])
 
             # 3D debug recorder가 켜져 있으면 현재 frame의 모든 중간 결과를 buffer에 쌓는다.

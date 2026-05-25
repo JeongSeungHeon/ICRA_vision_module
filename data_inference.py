@@ -440,11 +440,21 @@ def run_replay(input_path: str | Path, args: argparse.Namespace) -> OfflineRepla
                 y_mm=live.GRASP_POINT_Y_OFFSET_MM,
                 z_mm=getattr(live, "GRASP_POINT_Z_OFFSET_MM", 0.0),
             )
+            eef_pose_base = optional_vec(data, "eef_pose_base", source_index, 6)
+            eef_xyz_mm = None
+            if eef_pose_base is not None:
+                eef_xyz_mm = np.asarray(eef_pose_base[:3], dtype=np.float32) * 1000.0
             grasp_z_stabilizer = pipeline.get("grasp_z_stabilizer")
             if grasp_z_stabilizer is not None:
+                reference_xyz_mm = (
+                    None
+                    if measured_grasp_point_base is None
+                    else np.asarray(measured_grasp_point_base, dtype=np.float32).reshape(3) * 1000.0
+                )
                 measured_grasp_point_base = grasp_z_stabilizer.process(
-                    measured_object_point_base,
                     measured_grasp_point_base,
+                    reference_xyz_mm=reference_xyz_mm,
+                    eef_xyz_mm=eef_xyz_mm,
                 )
 
             fallback_state = pipeline["hand_relative_fallback"].process(
@@ -479,7 +489,7 @@ def run_replay(input_path: str | Path, args: argparse.Namespace) -> OfflineRepla
                 shape_fitting_state=shape_fitting_state,
                 object_point_base=object_point_base,
                 grasp_point_base=grasp_point_base,
-                eef_pose_base=optional_vec(data, "eef_pose_base", source_index, 6),
+                eef_pose_base=eef_pose_base,
                 measurement_source=measurement_source,
             )
 

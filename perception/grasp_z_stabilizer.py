@@ -56,10 +56,12 @@ class GraspPointZStabilizer:
 
     def process(
         self,
-        measured_object_point_base,
         measured_grasp_point_base,
+        *,
+        reference_xyz_mm=None,
+        eef_xyz_mm=None,
     ) -> tuple[float, float, float] | None:
-        """Return raw x/y plus stabilized z when close enough in base-frame XY."""
+        """Return raw x/y plus stabilized z when reference target is close to EEF."""
 
         if measured_grasp_point_base is None:
             self._reset_history(reason="no_grasp_point")
@@ -75,24 +77,31 @@ class GraspPointZStabilizer:
             self._set_inactive_baseline(raw_z, reason="disabled")
             return tuple(float(v) for v in grasp_point)
 
-        if measured_object_point_base is None:
-            self._clear_history_with_raw_debug(grasp_point, reason="no_object_point")
+        if reference_xyz_mm is None:
+            self._clear_history_with_raw_debug(grasp_point, reason="no_reference_target")
+            return tuple(float(v) for v in grasp_point)
+        if eef_xyz_mm is None:
+            self._clear_history_with_raw_debug(grasp_point, reason="no_eef_position")
             return tuple(float(v) for v in grasp_point)
 
-        object_point = np.asarray(measured_object_point_base, dtype=np.float32).reshape(3)
-        if not np.all(np.isfinite(object_point)):
-            self._clear_history_with_raw_debug(grasp_point, reason="non_finite_object_point")
+        reference_xyz_mm = np.asarray(reference_xyz_mm, dtype=np.float32).reshape(3)
+        eef_xyz_mm = np.asarray(eef_xyz_mm, dtype=np.float32).reshape(3)
+        if not np.all(np.isfinite(reference_xyz_mm)):
+            self._clear_history_with_raw_debug(grasp_point, reason="non_finite_reference_target")
+            return tuple(float(v) for v in grasp_point)
+        if not np.all(np.isfinite(eef_xyz_mm)):
+            self._clear_history_with_raw_debug(grasp_point, reason="non_finite_eef_position")
             return tuple(float(v) for v in grasp_point)
 
-        ref_err_xyz = grasp_point - object_point
-        dist_xy = float(np.linalg.norm(np.asarray(ref_err_xyz, dtype=np.float32)[:2]))
-        if dist_xy > self.activation_dist_xy_m:
+        dist_xy = float(np.linalg.norm(reference_xyz_mm[:2] - eef_xyz_mm[:2]))
+        dist_xy_m = dist_xy / 1000.0
+        if dist_xy_m > self.activation_dist_xy_m:
             self._previous_filtered_z = raw_z
             self._was_active = False
             self.last_debug = GraspPointZStabilizerDebug(
                 enabled=self.enabled,
                 active=False,
-                dist_xy_m=dist_xy,
+                dist_xy_m=dist_xy_m,
                 raw_z_m=raw_z,
                 limited_z_m=raw_z,
                 filtered_z_m=raw_z,
@@ -108,7 +117,7 @@ class GraspPointZStabilizer:
             self.last_debug = GraspPointZStabilizerDebug(
                 enabled=self.enabled,
                 active=True,
-                dist_xy_m=dist_xy,
+                dist_xy_m=dist_xy_m,
                 raw_z_m=raw_z,
                 limited_z_m=raw_z,
                 filtered_z_m=raw_z,
@@ -129,7 +138,7 @@ class GraspPointZStabilizer:
         self.last_debug = GraspPointZStabilizerDebug(
             enabled=self.enabled,
             active=True,
-            dist_xy_m=dist_xy,
+            dist_xy_m=dist_xy_m,
             raw_z_m=raw_z,
             limited_z_m=float(limited_z),
             filtered_z_m=float(filtered_z),
