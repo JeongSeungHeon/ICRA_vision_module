@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -47,12 +48,15 @@ class HandRelativeFallbackTracker:
         self.max_dropout_sec = max(float(fallback_cfg.get("max_dropout_sec", 1.0)), 0.0)
         self.require_hand_approach = bool(fallback_cfg.get("require_hand_approach", True))
         self.require_motion_triggered = bool(fallback_cfg.get("require_motion_triggered", True))
+        self.anchor_outlier_threshold_m = max(float(fallback_cfg.get("anchor_outlier_threshold_m", 0.10)), 0.0)
         self.debug_log = bool(fallback_cfg.get("debug_log", False))
         self.log_lock_progress = bool(fallback_cfg.get("log_lock_progress", True))
         self.log_fallback_every_frames = max(1, int(fallback_cfg.get("log_fallback_every_frames", 1)))
 
         self._anchor_locked = False
         self._lock_streak = 0
+        self._object_offset_candidates: deque[np.ndarray] = deque(maxlen=self.lock_frames)
+        self._grasp_offset_candidates: deque[np.ndarray] = deque(maxlen=self.lock_frames)
         self._object_offset_base: np.ndarray | None = None
         self._grasp_offset_base: np.ndarray | None = None
         self._anchor_hand_position_base: np.ndarray | None = None
@@ -81,6 +85,8 @@ class HandRelativeFallbackTracker:
     def reset(self) -> None:
         self._anchor_locked = False
         self._lock_streak = 0
+        self._object_offset_candidates.clear()
+        self._grasp_offset_candidates.clear()
         self._object_offset_base = None
         self._grasp_offset_base = None
         self._anchor_hand_position_base = None
@@ -146,10 +152,12 @@ class HandRelativeFallbackTracker:
             self._last_measured_record_elapsed_s = record_elapsed_s
             if not self._anchor_locked and hand_approach_ok and motion_trigger_ok:
                 self._lock_streak += 1
+                self._object_offset_candidates.append(measured_object - hand_center)
+                self._grasp_offset_candidates.append(measured_grasp - hand_center)
                 if self._lock_streak >= self.lock_frames:
                     self._anchor_locked = True
-                    self._object_offset_base = measured_object - hand_center
-                    self._grasp_offset_base = measured_grasp - hand_center
+                    self._object_offset_base = self._filtered_axis_mean(self._object_offset_candidates)
+                    self._grasp_offset_base = self._filtered_axis_mean(self._grasp_offset_candidates)
                     self._anchor_hand_position_base = hand_center.copy()
                     self._anchor_frame_id = frame_id
                     self._anchor_record_elapsed_s = record_elapsed_s
@@ -163,6 +171,8 @@ class HandRelativeFallbackTracker:
                         f"hand={self._format_vec(hand_center)} "
                         f"object={self._format_vec(measured_object)} "
                         f"grasp={self._format_vec(measured_grasp)} "
+                        f"anchor_samples={len(self._grasp_offset_candidates)} "
+                        f"outlier_threshold_mm={self.anchor_outlier_threshold_m * 1000.0:.1f} "
                         f"object_offset={self._format_vec(self._object_offset_base)} "
                         f"grasp_offset={self._format_vec(self._grasp_offset_base)}"
                     )
@@ -178,6 +188,8 @@ class HandRelativeFallbackTracker:
                     )
             elif not self._anchor_locked:
                 self._lock_streak = 0
+                self._object_offset_candidates.clear()
+                self._grasp_offset_candidates.clear()
             reason = "measured_available"
             if not hand_approach_ok:
                 reason = "hand_approach_required"
@@ -357,6 +369,22 @@ class HandRelativeFallbackTracker:
         if values is None:
             return None
         return tuple(float(v) for v in np.asarray(values, dtype=np.float32).reshape(3))
+
+    def _filtered_axis_mean(self, samples: deque[np.ndarray]) -> np.ndarray:
+        sample_array = np.asarray(list(samples), dtype=np.float32).reshape(-1, 3)
+        medians = np.median(sample_array, axis=0)
+        if self.anchor_outlier_threshold_m <= 0.0:
+            return np.mean(sample_array, axis=0).astype(np.float32)
+
+        filtered_mean = np.empty((3,), dtype=np.float32)
+        for axis in range(3):
+            axis_values = sample_array[:, axis]
+            keep_mask = np.abs(axis_values - medians[axis]) <= self.anchor_outlier_threshold_m
+            if np.any(keep_mask):
+                filtered_mean[axis] = float(np.mean(axis_values[keep_mask]))
+            else:
+                filtered_mean[axis] = float(medians[axis])
+        return filtered_mean
 
     @staticmethod
     def _format_frame(frame_id: int | None) -> str:

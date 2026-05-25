@@ -4,6 +4,6 @@ python robot_control_rtde_fitting_final.py   \
  --3d-debug \
  --save-image \
  --enable-pre-release-descend-before-open \
+#  --profile-runtime
  #--record-video \
  #--debug-tactile
- #--profile-runtime
