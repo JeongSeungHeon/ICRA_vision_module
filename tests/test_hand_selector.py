@@ -1,6 +1,8 @@
 import sys
 import types
 import unittest
+import contextlib
+import io
 
 sys.modules.setdefault("yaml", types.SimpleNamespace(safe_load=lambda *args, **kwargs: {}))
 
@@ -306,6 +308,29 @@ class HandSelectorDistanceTests(unittest.TestCase):
 
         self.assertTrue(selected.valid)
         self.assertEqual(selected.selected_candidate_id, "cam0:right")
+
+    def test_logs_selected_active_hand_candidate_when_enabled(self):
+        config = make_config()
+        config["perception"]["hand_selection"]["log_active_hand_selection"] = True
+        selector = HandSelector(config)
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            selected = selector.process_states(
+                make_hand(0, [make_candidate(0, 0, center=(0.12, 0.0, 0.0), handedness="right")]),
+                make_hand(1, [make_candidate(1, 0, center=(0.08, 0.0, 0.0), handedness="left")]),
+                object_center_base=OBJECT_CENTER,
+            )
+
+        log_text = output.getvalue()
+        self.assertTrue(selected.valid)
+        self.assertEqual(selected.selected_candidate_id, "cam1:left")
+        self.assertIn("[HandSelector] ACTIVE_HAND_SELECTED", log_text)
+        self.assertIn("active=cam1:left", log_text)
+        self.assertIn("cam0:right:", log_text)
+        self.assertIn("cam1:left:", log_text)
+        self.assertIn("cam0:left:missing", log_text)
+        self.assertIn("cam1:right:missing", log_text)
 
 
 if __name__ == "__main__":

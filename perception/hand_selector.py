@@ -13,6 +13,7 @@ from system.shared_state import HandCandidateState, HandState, ObjectState, Sele
 
 DEFAULT_CONFIG_PATH = Path("configs/handover.yaml")
 KNOWN_HANDEDNESS = {"left", "right"}
+TRACKED_ACTIVE_HAND_IDS = ("cam0:right", "cam1:left", "cam0:left", "cam1:right")
 
 
 @dataclass
@@ -69,6 +70,13 @@ class HandSelector:
         self.lock_active_hand_during_task = bool(selection_cfg.get("lock_active_hand_during_task", True))
         # true이면 active hand가 실제로 교체되는 순간 교체 기준과 거리 정보를 콘솔에 남긴다.
         self.log_active_hand_switches = bool(selection_cfg.get("log_active_hand_switches", False))
+        # true이면 최종 active hand가 네 후보 중 무엇인지 콘솔에 남긴다.
+        self.log_active_hand_selection = bool(
+            selection_cfg.get("log_active_hand_selection", self.log_active_hand_switches)
+        )
+        self.log_active_hand_selection_every_frame = bool(
+            selection_cfg.get("log_active_hand_selection_every_frame", False)
+        )
         self.candidate_identity_mode = str(selection_cfg.get("candidate_identity_mode", "handedness")).strip().lower()
         if self.candidate_identity_mode not in {"handedness", "index"}:
             self.candidate_identity_mode = "handedness"
@@ -82,6 +90,8 @@ class HandSelector:
         # _locked_*는 디버깅용 lock 상태다. 현재 구현은 선택 시 즉시 current를 lock 관찰값으로 기록한다.
         self._locked_candidate_id: str | None = None
         self._lock_stable_frames = 0
+        self._last_logged_active_candidate_id: str | None = None
+        self._last_logged_active_valid: bool | None = None
         # last_debug를 overlay/profile에서 읽으면 이번 frame의 선택 이유를 추적할 수 있다.
         self.last_debug: HandSelectorDebug | None = None
 
@@ -98,6 +108,8 @@ class HandSelector:
         self._pending_frames = 0
         self._locked_candidate_id = None
         self._lock_stable_frames = 0
+        self._last_logged_active_candidate_id = None
+        self._last_logged_active_valid = None
         self.last_debug = None
 
     def process_states(
@@ -376,6 +388,13 @@ class HandSelector:
             current_distance_m=None if self._current_candidate_id is None else distances.get(self._current_candidate_id),
             duplicate_drop_reasons=tuple(duplicate_drop_reasons),
         )
+        self._log_active_hand_selection(
+            selected=selected,
+            candidates=candidates,
+            object_center_base=object_center_base,
+            distances=distances,
+            selection_reason=selection_reason,
+        )
 
     def _log_active_hand_switch(
         self,
@@ -425,6 +444,45 @@ class HandSelector:
             parts.append(f"prev_age={previous_age_s:.3f}s")
         if lost_timeout_s is not None:
             parts.append(f"lost_timeout={float(lost_timeout_s):.3f}s")
+        print(" ".join(parts))
+
+    def _log_active_hand_selection(
+        self,
+        *,
+        selected: SelectedHandState,
+        candidates: dict[str, HandCandidateState],
+        object_center_base: Vec3 | None,
+        distances: dict[str, float],
+        selection_reason: str,
+    ) -> None:
+        """최종 active hand ID와 네 tracked 후보의 현재 상태를 콘솔에 남긴다."""
+
+        if not self.log_active_hand_selection:
+            return
+
+        active_id = selected.selected_candidate_id if bool(selected.valid) else None
+        active_valid = bool(selected.valid)
+        if (
+            not self.log_active_hand_selection_every_frame
+            and self._last_logged_active_candidate_id == active_id
+            and self._last_logged_active_valid == active_valid
+        ):
+            return
+
+        self._last_logged_active_candidate_id = active_id
+        self._last_logged_active_valid = active_valid
+        selected_distance = None if active_id is None else distances.get(active_id)
+        parts = [
+            "====================================",
+            "[HandSelector] ACTIVE_HAND_SELECTED",
+            f"active={active_id or 'none'}",
+            f"valid={str(active_valid).lower()}",
+            f"reason={selection_reason}",
+            f"selected={self._format_selected_state_for_log(selected, selected_distance)}",
+            f"options={self._format_active_hand_options_for_log(candidates, distances)}",
+            f"object={self._format_vec_for_log(object_center_base)}",
+            "====================================",
+        ]
         print(" ".join(parts))
 
     @staticmethod
@@ -606,6 +664,36 @@ class HandSelector:
             f"center={HandSelector._format_vec_for_log(candidate.palm_center_base)},"
             f"ts={float(candidate.timestamp):.3f})"
         )
+
+    @staticmethod
+    def _format_selected_state_for_log(selected: SelectedHandState, distance_m: float | None) -> str:
+        if not bool(selected.valid):
+            return "none"
+        return (
+            f"{selected.selected_candidate_id}"
+            f"(cam={selected.selected_camera},idx={selected.selected_candidate_index},"
+            f"hand={selected.handedness},conf={float(selected.confidence):.3f},"
+            f"dist={HandSelector._format_m_for_log(distance_m)},"
+            f"center={HandSelector._format_vec_for_log(selected.palm_center_base)},"
+            f"ts={float(selected.timestamp):.3f})"
+        )
+
+    @staticmethod
+    def _format_active_hand_options_for_log(
+        candidates: dict[str, HandCandidateState],
+        distances: dict[str, float],
+    ) -> str:
+        option_ids = list(TRACKED_ACTIVE_HAND_IDS)
+        option_ids.extend(
+            sorted(candidate_id for candidate_id in candidates if candidate_id not in TRACKED_ACTIVE_HAND_IDS)
+        )
+        entries: list[str] = []
+        for candidate_id in option_ids:
+            if candidate_id not in candidates:
+                entries.append(f"{candidate_id}:missing")
+                continue
+            entries.append(f"{candidate_id}:{HandSelector._format_m_for_log(distances.get(candidate_id))}")
+        return ",".join(entries) if entries else "none"
 
     @staticmethod
     def _format_m_for_log(value_m: float | None) -> str:

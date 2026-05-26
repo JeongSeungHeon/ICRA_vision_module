@@ -304,7 +304,7 @@ perception:
     # active hand 후보 ID 생성 방식입니다. handedness이면 cam0:right/cam0:left처럼 MediaPipe handedness를 ID로 씁니다.
     candidate_identity_mode: handedness
     # object center에서 이 거리 안으로 들어온 hand 후보만 active hand로 신규 선택합니다.
-    active_hand_distance_threshold_m: 0.15
+    active_hand_distance_threshold_m: 0.10
     # 다른 hand로 전환하려면 현재 hand보다 이 거리 이상 더 가까워야 합니다.
     switch_margin_m: 0.95
     # 전환 조건을 만족한 challenger가 연속 유지되어야 하는 frame 수입니다.
@@ -315,6 +315,10 @@ perception:
     lock_active_hand_during_task: true
     # true이면 active hand가 실제로 바뀌는 순간 교체 기준과 거리 정보를 콘솔에 출력합니다.
     log_active_hand_switches: true
+    # true이면 cam0:right/cam1:left/cam0:left/cam1:right 중 최종 active hand를 콘솔에 출력합니다.
+    log_active_hand_selection: true
+    # true이면 매 frame마다 출력합니다. false이면 active hand 또는 valid 상태가 바뀔 때만 출력합니다.
+    log_active_hand_selection_every_frame: false
 
   fusion:
     # object centroid EMA alpha입니다. 수정 0.35  -> 0.6
