@@ -304,11 +304,11 @@ perception:
     # object center에서 이 거리 안으로 들어온 hand 후보만 active hand로 신규 선택합니다.
     active_hand_distance_threshold_m: 0.15
     # 다른 hand로 전환하려면 현재 hand보다 이 거리 이상 더 가까워야 합니다.
-    switch_margin_m: 0.05
+    switch_margin_m: 0.95
     # 전환 조건을 만족한 challenger가 연속 유지되어야 하는 frame 수입니다.
-    switch_confirm_frames: 5
+    switch_confirm_frames: 15
     # 현재 active hand가 사라졌을 때 마지막 선택을 유지하는 시간입니다.
-    lost_timeout_s: 1.5
+    lost_timeout_s: 1000000000.5
     # handover task 중 active hand를 보수적으로 유지합니다.
     lock_active_hand_during_task: true
 
@@ -523,9 +523,9 @@ grasp:
     # 이전 후보와의 거리 penalty 가중치입니다.
     score_previous_distance_weight: 0.90
   z_stabilization:
-    # true이면 reference target과 EEF가 가까울 때 grasp point z만 max-step + EMA로 안정화합니다.
+    # true이면 grasp/object가 가까울 때 grasp point z만 max-step + EMA로 안정화합니다.
     enabled: true
-    # base frame XY에서 reference target과 EEF 사이 거리가 이 값 이하일 때만 적용합니다.
+    # base frame XY에서 object center와 grasp target 사이 거리가 이 값 이하일 때만 적용합니다.
     activation_dist_xy_m: 0.065
     # frame당 z 변화량 제한입니다.
     max_step_z_m: 0.005
