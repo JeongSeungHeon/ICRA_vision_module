@@ -311,6 +311,8 @@ perception:
     lost_timeout_s: 1000000000.5
     # handover task 중 active hand를 보수적으로 유지합니다.
     lock_active_hand_during_task: true
+    # true이면 active hand가 실제로 바뀌는 순간 교체 기준과 거리 정보를 콘솔에 출력합니다.
+    log_active_hand_switches: true
 
   fusion:
     # object centroid EMA alpha입니다. 수정 0.35  -> 0.6
