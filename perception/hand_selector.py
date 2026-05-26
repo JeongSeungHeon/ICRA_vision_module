@@ -20,7 +20,7 @@ TRACKED_ACTIVE_HAND_IDS = ("cam0:right", "cam1:left", "cam0:left", "cam1:right")
 class HandSelectorDebug:
     """최근 selection frame에서 왜 특정 hand가 선택/유지/거절됐는지 남기는 디버그 스냅샷."""
 
-    # 현재 frame에서 후보로 인정된 hand들의 camera/handedness 목록이다.
+    # 현재 frame에서 geometry상 valid한 전체 hand 후보들의 camera/handedness 목록이다.
     candidate_cameras: tuple[int, ...]
     candidate_handedness: tuple[str, ...]
     # 카메라별 후보가 선택 pool에 못 들어온 이유다. 빈 문자열이면 후보가 하나 이상 있었다는 뜻이다.
@@ -39,6 +39,10 @@ class HandSelectorDebug:
     lock_after_stable_frames: int
     # selection_reason은 downstream 로그에서 가장 먼저 봐야 하는 분기 결과다.
     selection_reason: str
+    # active hand selection에 실제로 참여하는 후보와 필터로 제외된 후보 ID다.
+    active_candidate_ids: tuple[str, ...] = ()
+    disallowed_candidate_ids: tuple[str, ...] = ()
+    active_candidate_filter_reasons: tuple[str, ...] = ()
     chosen_candidate_id: str | None = None
     current_candidate_id: str | None = None
     pending_candidate_id: str | None = None
@@ -80,6 +84,15 @@ class HandSelector:
         self.candidate_identity_mode = str(selection_cfg.get("candidate_identity_mode", "handedness")).strip().lower()
         if self.candidate_identity_mode not in {"handedness", "index"}:
             self.candidate_identity_mode = "handedness"
+        allowed_candidate_ids = selection_cfg.get("allowed_active_candidate_ids")
+        if allowed_candidate_ids is None:
+            self.allowed_active_candidate_ids: tuple[str, ...] | None = None
+        else:
+            self.allowed_active_candidate_ids = tuple(
+                str(candidate_id).strip()
+                for candidate_id in allowed_candidate_ids
+                if str(candidate_id).strip()
+            )
 
         # _current_*는 fusion/grasp에 실제로 넘길 active hand다.
         self._current_candidate_id: str | None = None
@@ -127,9 +140,13 @@ class HandSelector:
             hand_cam1,
             object_center_base=object_center_base,
         )
-        # 2) handover에 참여하는 손은 object에 가까워야 하므로 object center와의 3D 거리를 계산한다.
-        distances = self._compute_distances(candidates, object_center_base)
-        # 3) dropout hold 판단에는 wall-clock 대신 입력 state들의 최신 timestamp를 사용한다.
+        # 2) active hand로 쓸 수 있는 ID만 먼저 남긴다. 제외된 후보는 distance 계산에도 참여하지 않는다.
+        active_candidates, disallowed_candidate_ids, active_candidate_filter_reasons = (
+            self._filter_active_candidates(candidates)
+        )
+        # 3) handover에 참여하는 손은 object에 가까워야 하므로 object center와의 3D 거리를 계산한다.
+        distances = self._compute_distances(active_candidates, object_center_base)
+        # 4) dropout hold 판단에는 wall-clock 대신 입력 state들의 최신 timestamp를 사용한다.
         now_timestamp = self._resolve_now_timestamp(hand_cam0, hand_cam1, candidates)
         selection_reason = "no_valid_candidate"
 
@@ -138,12 +155,15 @@ class HandSelector:
             selected, selection_reason = self._hold_or_invalidate(
                 hand_cam0,
                 hand_cam1,
-                candidates,
+                active_candidates,
                 now_timestamp,
                 "no_object_center",
             )
             self._set_debug(
                 candidates,
+                active_candidates,
+                disallowed_candidate_ids,
+                active_candidate_filter_reasons,
                 reject_reasons,
                 selected,
                 object_center_base,
@@ -159,20 +179,27 @@ class HandSelector:
             for candidate_id, distance in distances.items()
             if distance <= self.active_hand_distance_threshold_m
         ]
-        eligible_ids = self._prefer_known_handedness_candidates(candidates, threshold_eligible_ids)
+        eligible_ids = self._prefer_known_handedness_candidates(active_candidates, threshold_eligible_ids)
         best_candidate_id = min(eligible_ids, key=lambda candidate_id: distances[candidate_id], default=None)
 
         if self._current_candidate_id is None:
             # 아직 active hand가 없으면 threshold 안의 가장 가까운 후보를 바로 선택한다.
             if best_candidate_id is None:
                 selected = self._build_invalid_state(hand_cam0, hand_cam1)
-                selection_reason = "no_candidate_within_threshold"
+                selection_reason = (
+                    "no_allowed_candidate"
+                    if not active_candidates
+                    else "no_allowed_candidate_within_threshold"
+                )
             else:
-                self._select_candidate(candidates[best_candidate_id])
+                self._select_candidate(active_candidates[best_candidate_id])
                 selected = self._build_selected_state(self._current_candidate)
                 selection_reason = "select_within_object_threshold"
             self._set_debug(
                 candidates,
+                active_candidates,
+                disallowed_candidate_ids,
+                active_candidate_filter_reasons,
                 reject_reasons,
                 selected,
                 object_center_base,
@@ -182,13 +209,13 @@ class HandSelector:
             )
             return selected
 
-        current_candidate = candidates.get(self._current_candidate_id)
+        current_candidate = active_candidates.get(self._current_candidate_id)
         if current_candidate is None:
             # 기존 active hand가 이번 frame에서 사라졌다. lost_timeout_s 안이면 마지막 값을 유지한다.
             selected, selection_reason = self._handle_current_lost(
                 hand_cam0,
                 hand_cam1,
-                candidates,
+                active_candidates,
                 now_timestamp,
                 best_candidate_id,
                 object_center_base=object_center_base,
@@ -196,6 +223,9 @@ class HandSelector:
             )
             self._set_debug(
                 candidates,
+                active_candidates,
+                disallowed_candidate_ids,
+                active_candidate_filter_reasons,
                 reject_reasons,
                 selected,
                 object_center_base,
@@ -220,7 +250,7 @@ class HandSelector:
             if self._pending_frames >= self.switch_confirm_frames:
                 # hysteresis를 채우면 active hand를 challenger로 교체한다.
                 previous_candidate = self._current_candidate
-                next_candidate = candidates[challenger_id]
+                next_candidate = active_candidates[challenger_id]
                 self._log_active_hand_switch(
                     reason="switch_after_confirmed_closer_to_object",
                     previous_candidate=previous_candidate,
@@ -241,6 +271,9 @@ class HandSelector:
         selected = self._build_selected_state(self._current_candidate)
         self._set_debug(
             candidates,
+            active_candidates,
+            disallowed_candidate_ids,
+            active_candidate_filter_reasons,
             reject_reasons,
             selected,
             object_center_base,
@@ -263,7 +296,8 @@ class HandSelector:
     ) -> tuple[SelectedHandState, str]:
         """현재 active hand가 후보 pool에서 사라졌을 때 hold, replacement, invalid 중 하나를 결정한다."""
 
-        if self._can_hold_current(now_timestamp):
+        current_candidate_id = self._current_candidate_id
+        if self._is_candidate_id_allowed(current_candidate_id) and self._can_hold_current(now_timestamp):
             self._pending_candidate_id = None
             self._pending_frames = 0
             return self._build_selected_state(self._current_candidate), "hold_active_hand_lost_timeout"
@@ -284,7 +318,9 @@ class HandSelector:
             )
             self._select_candidate(next_candidate)
             return self._build_selected_state(self._current_candidate), "select_after_lost_timeout"
-        return self._build_invalid_state(hand_cam0, hand_cam1), "active_hand_lost_timeout_no_replacement"
+        if not candidates:
+            return self._build_invalid_state(hand_cam0, hand_cam1), "no_allowed_candidate"
+        return self._build_invalid_state(hand_cam0, hand_cam1), "no_allowed_candidate_within_threshold"
 
     def _hold_or_invalidate(
         self,
@@ -299,10 +335,38 @@ class HandSelector:
         if self._current_candidate_id in candidates:
             self._current_candidate = candidates[self._current_candidate_id]
             return self._build_selected_state(self._current_candidate), f"{reason_prefix}_keep_current"
-        if self._can_hold_current(now_timestamp):
+        if self._is_candidate_id_allowed(self._current_candidate_id) and self._can_hold_current(now_timestamp):
             return self._build_selected_state(self._current_candidate), f"{reason_prefix}_hold_current"
         self._clear_current()
         return self._build_invalid_state(hand_cam0, hand_cam1), reason_prefix
+
+    def _filter_active_candidates(
+        self,
+        candidates: dict[str, HandCandidateState],
+    ) -> tuple[dict[str, HandCandidateState], tuple[str, ...], tuple[str, ...]]:
+        """설정된 allowed_active_candidate_ids에 포함된 후보만 active selection pool에 남긴다."""
+
+        if self.allowed_active_candidate_ids is None:
+            return dict(candidates), (), ()
+
+        allowed_ids = set(self.allowed_active_candidate_ids)
+        active_candidates: dict[str, HandCandidateState] = {}
+        disallowed_candidate_ids: list[str] = []
+        filter_reasons: list[str] = []
+        for candidate_id, candidate in candidates.items():
+            if candidate_id in allowed_ids:
+                active_candidates[candidate_id] = candidate
+                continue
+            disallowed_candidate_ids.append(candidate_id)
+            filter_reasons.append(f"{candidate_id}:not_in_allowed_active_candidate_ids")
+        return active_candidates, tuple(disallowed_candidate_ids), tuple(filter_reasons)
+
+    def _is_candidate_id_allowed(self, candidate_id: str | None) -> bool:
+        """현재 active ID가 configured active 후보 pool에 남아 있을 수 있는지 확인한다."""
+
+        if candidate_id is None:
+            return False
+        return self.allowed_active_candidate_ids is None or candidate_id in self.allowed_active_candidate_ids
 
     def _find_switch_challenger(
         self,
@@ -355,6 +419,9 @@ class HandSelector:
     def _set_debug(
         self,
         candidates: dict[str, HandCandidateState],
+        active_candidates: dict[str, HandCandidateState],
+        disallowed_candidate_ids: tuple[str, ...],
+        active_candidate_filter_reasons: tuple[str, ...],
         reject_reasons: dict[int, str],
         selected: SelectedHandState,
         object_center_base: Vec3 | None,
@@ -365,10 +432,14 @@ class HandSelector:
         """selection 분기 결과와 후보 거리를 last_debug에 저장한다."""
 
         candidate_items = sorted(candidates.items(), key=lambda item: (int(item[1].camera_id), int(item[1].candidate_index)))
+        active_candidate_items = sorted(active_candidates.items(), key=lambda item: (int(item[1].camera_id), int(item[1].candidate_index)))
         chosen_id = selected.selected_candidate_id
         self.last_debug = HandSelectorDebug(
             candidate_cameras=tuple(int(candidate.camera_id) for _, candidate in candidate_items),
             candidate_handedness=tuple(str(candidate.handedness) for _, candidate in candidate_items),
+            active_candidate_ids=tuple(candidate_id for candidate_id, _ in active_candidate_items),
+            disallowed_candidate_ids=tuple(disallowed_candidate_ids),
+            active_candidate_filter_reasons=tuple(active_candidate_filter_reasons),
             cam0_reject_reason=str(reject_reasons.get(0, "")),
             cam1_reject_reason=str(reject_reasons.get(1, "")),
             chosen_camera=selected.selected_camera,
@@ -391,6 +462,7 @@ class HandSelector:
         self._log_active_hand_selection(
             selected=selected,
             candidates=candidates,
+            disallowed_candidate_ids=disallowed_candidate_ids,
             object_center_base=object_center_base,
             distances=distances,
             selection_reason=selection_reason,
@@ -451,6 +523,7 @@ class HandSelector:
         *,
         selected: SelectedHandState,
         candidates: dict[str, HandCandidateState],
+        disallowed_candidate_ids: tuple[str, ...],
         object_center_base: Vec3 | None,
         distances: dict[str, float],
         selection_reason: str,
@@ -479,7 +552,7 @@ class HandSelector:
             f"valid={str(active_valid).lower()}",
             f"reason={selection_reason}",
             f"selected={self._format_selected_state_for_log(selected, selected_distance)}",
-            f"options={self._format_active_hand_options_for_log(candidates, distances)}",
+            f"options={self._format_active_hand_options_for_log(candidates, distances, disallowed_candidate_ids)}",
             f"object={self._format_vec_for_log(object_center_base)}",
             "====================================",
         ]
@@ -682,7 +755,9 @@ class HandSelector:
     def _format_active_hand_options_for_log(
         candidates: dict[str, HandCandidateState],
         distances: dict[str, float],
+        disallowed_candidate_ids: tuple[str, ...] = (),
     ) -> str:
+        disallowed_ids = set(disallowed_candidate_ids)
         option_ids = list(TRACKED_ACTIVE_HAND_IDS)
         option_ids.extend(
             sorted(candidate_id for candidate_id in candidates if candidate_id not in TRACKED_ACTIVE_HAND_IDS)
@@ -691,6 +766,9 @@ class HandSelector:
         for candidate_id in option_ids:
             if candidate_id not in candidates:
                 entries.append(f"{candidate_id}:missing")
+                continue
+            if candidate_id in disallowed_ids:
+                entries.append(f"{candidate_id}:blocked")
                 continue
             entries.append(f"{candidate_id}:{HandSelector._format_m_for_log(distances.get(candidate_id))}")
         return ",".join(entries) if entries else "none"

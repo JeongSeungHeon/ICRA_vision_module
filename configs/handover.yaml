@@ -303,6 +303,8 @@ perception:
   hand_selection:
     # active hand 후보 ID 생성 방식입니다. handedness이면 cam0:right/cam0:left처럼 MediaPipe handedness를 ID로 씁니다.
     candidate_identity_mode: handedness
+    # active hand selection과 distance 계산에 참여할 후보 ID입니다. 오른손은 cam1, 왼손은 cam0 관측만 사용합니다.
+    allowed_active_candidate_ids: ["cam0:left", "cam1:right"]
     # object center에서 이 거리 안으로 들어온 hand 후보만 active hand로 신규 선택합니다.
     active_hand_distance_threshold_m: 0.10
     # 다른 hand로 전환하려면 현재 hand보다 이 거리 이상 더 가까워야 합니다.
