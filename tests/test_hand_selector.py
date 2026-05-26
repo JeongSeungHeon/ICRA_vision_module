@@ -15,6 +15,7 @@ def make_config():
     return {
         "perception": {
             "hand_selection": {
+                "candidate_identity_mode": "handedness",
                 "active_hand_distance_threshold_m": 0.15,
                 "switch_margin_m": 0.05,
                 "switch_confirm_frames": 5,
@@ -35,12 +36,19 @@ def make_candidate(
     confidence=0.9,
     valid=True,
     timestamp=None,
+    candidate_id=None,
 ):
+    normalized_handedness = str(handedness).strip().lower()
+    if candidate_id is None:
+        if normalized_handedness in {"left", "right"}:
+            candidate_id = f"cam{int(camera_id)}:{normalized_handedness}"
+        else:
+            candidate_id = f"cam{int(camera_id)}:unknown:hand{int(candidate_index)}"
     return HandCandidateState(
         camera_id=int(camera_id),
         frame_id=int(frame_id),
         candidate_index=int(candidate_index),
-        candidate_id=f"cam{int(camera_id)}:hand{int(candidate_index)}",
+        candidate_id=candidate_id,
         hand_detected=bool(valid),
         handedness=str(handedness),
         confidence=float(confidence),
@@ -88,7 +96,7 @@ class HandSelectorDistanceTests(unittest.TestCase):
 
         self.assertTrue(selected.valid)
         self.assertEqual(selected.selected_camera, 0)
-        self.assertEqual(selected.selected_candidate_id, "cam0:hand0")
+        self.assertEqual(selected.selected_candidate_id, "cam0:right")
         self.assertEqual(selector.last_debug.selection_reason, "select_within_object_threshold")
 
     def test_chooses_closer_hand_when_both_are_within_threshold(self):
@@ -102,7 +110,7 @@ class HandSelectorDistanceTests(unittest.TestCase):
 
         self.assertTrue(selected.valid)
         self.assertEqual(selected.selected_camera, 1)
-        self.assertEqual(selected.selected_candidate_id, "cam1:hand0")
+        self.assertEqual(selected.selected_candidate_id, "cam1:left")
 
     def test_returns_invalid_when_no_hand_has_entered_threshold(self):
         selector = HandSelector(make_config())
@@ -193,6 +201,111 @@ class HandSelectorDistanceTests(unittest.TestCase):
         )
 
         self.assertEqual(center, (0.75, 0.0, 0.0))
+
+    def test_initial_selection_chooses_closest_handedness_candidate(self):
+        selector = HandSelector(make_config())
+
+        selected = selector.process_states(
+            make_hand(
+                0,
+                [
+                    make_candidate(0, 0, center=(0.13, 0.0, 0.0), handedness="right"),
+                    make_candidate(0, 1, center=(0.11, 0.0, 0.0), handedness="left"),
+                ],
+            ),
+            make_hand(
+                1,
+                [
+                    make_candidate(1, 0, center=(0.09, 0.0, 0.0), handedness="right"),
+                    make_candidate(1, 1, center=(0.07, 0.0, 0.0), handedness="left"),
+                ],
+            ),
+            object_center_base=OBJECT_CENTER,
+        )
+
+        self.assertTrue(selected.valid)
+        self.assertEqual(selected.selected_candidate_id, "cam1:left")
+
+    def test_keeps_same_handedness_candidate_when_mediapipe_index_swaps(self):
+        selector = HandSelector(make_config())
+        selector.process_states(
+            make_hand(0, [make_candidate(0, 0, center=(0.10, 0.0, 0.0), handedness="right", frame_id=0)]),
+            empty_hand(1, frame_id=0),
+            object_center_base=OBJECT_CENTER,
+        )
+
+        selected = selector.process_states(
+            make_hand(
+                0,
+                [
+                    make_candidate(0, 0, center=(0.04, 0.0, 0.0), handedness="left", frame_id=1),
+                    make_candidate(0, 1, center=(0.11, 0.0, 0.0), handedness="right", frame_id=1),
+                ],
+            ),
+            empty_hand(1, frame_id=1),
+            object_center_base=OBJECT_CENTER,
+        )
+
+        self.assertTrue(selected.valid)
+        self.assertEqual(selected.selected_candidate_id, "cam0:right")
+        self.assertEqual(selected.selected_candidate_index, 1)
+        self.assertEqual(selector.last_debug.selection_reason, "pending_switch_closer_to_object")
+
+    def test_duplicate_same_handedness_keeps_higher_confidence_candidate(self):
+        selector = HandSelector(make_config())
+
+        selected = selector.process_states(
+            make_hand(
+                0,
+                [
+                    make_candidate(0, 0, center=(0.06, 0.0, 0.0), handedness="right", confidence=0.40),
+                    make_candidate(0, 1, center=(0.12, 0.0, 0.0), handedness="right", confidence=0.90),
+                ],
+            ),
+            empty_hand(1),
+            object_center_base=OBJECT_CENTER,
+        )
+
+        self.assertTrue(selected.valid)
+        self.assertEqual(selected.selected_candidate_id, "cam0:right")
+        self.assertEqual(selected.selected_candidate_index, 1)
+        self.assertIn("duplicate_handedness_candidate", selector.last_debug.duplicate_drop_reasons[0])
+
+    def test_duplicate_same_handedness_tie_keeps_closer_candidate(self):
+        selector = HandSelector(make_config())
+
+        selected = selector.process_states(
+            make_hand(
+                0,
+                [
+                    make_candidate(0, 0, center=(0.12, 0.0, 0.0), handedness="right", confidence=0.90),
+                    make_candidate(0, 1, center=(0.06, 0.0, 0.0), handedness="right", confidence=0.90),
+                ],
+            ),
+            empty_hand(1),
+            object_center_base=OBJECT_CENTER,
+        )
+
+        self.assertTrue(selected.valid)
+        self.assertEqual(selected.selected_candidate_index, 1)
+
+    def test_unknown_handedness_does_not_override_known_candidate(self):
+        selector = HandSelector(make_config())
+
+        selected = selector.process_states(
+            make_hand(
+                0,
+                [
+                    make_candidate(0, 0, center=(0.12, 0.0, 0.0), handedness="right"),
+                    make_candidate(0, 1, center=(0.03, 0.0, 0.0), handedness="unknown"),
+                ],
+            ),
+            empty_hand(1),
+            object_center_base=OBJECT_CENTER,
+        )
+
+        self.assertTrue(selected.valid)
+        self.assertEqual(selected.selected_candidate_id, "cam0:right")
 
 
 if __name__ == "__main__":

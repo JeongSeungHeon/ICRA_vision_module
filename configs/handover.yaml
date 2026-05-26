@@ -301,6 +301,8 @@ perception:
       lock_hold_last_on_dropout: true
 
   hand_selection:
+    # active hand 후보 ID 생성 방식입니다. handedness이면 cam0:right/cam0:left처럼 MediaPipe handedness를 ID로 씁니다.
+    candidate_identity_mode: handedness
     # object center에서 이 거리 안으로 들어온 hand 후보만 active hand로 신규 선택합니다.
     active_hand_distance_threshold_m: 0.15
     # 다른 hand로 전환하려면 현재 hand보다 이 거리 이상 더 가까워야 합니다.

@@ -20,6 +20,7 @@ from utils.realsense_stream import FrameBundle
 
 DEFAULT_CONFIG_PATH = Path("configs/handover.yaml")
 MP_HANDS = mp.solutions.hands
+KNOWN_HANDEDNESS = {"left", "right"}
 
 
 @dataclass
@@ -47,6 +48,7 @@ class HandWorker:
         self.config = config
 
         hand_cfg = config.get("perception", {}).get("hand", {})
+        selection_cfg = config.get("perception", {}).get("hand_selection", {})
         detector_cfg = hand_cfg.get("detector", {})
         depth_cfg = hand_cfg.get("depth_lifting", {})
 
@@ -60,6 +62,9 @@ class HandWorker:
         self._detector_min_detection_confidence = float(detector_cfg.get("min_detection_confidence", 0.5))
         self._detector_max_num_hands = int(detector_cfg.get("max_num_hands", 2))
         self._detector_min_tracking_confidence = float(detector_cfg.get("min_tracking_confidence", 0.5))
+        self.candidate_identity_mode = str(selection_cfg.get("candidate_identity_mode", "handedness")).strip().lower()
+        if self.candidate_identity_mode not in {"handedness", "index"}:
+            self.candidate_identity_mode = "handedness"
 
         self._hands = self._create_hands()
         self._candidate_filters: dict[str, dict[str, Any]] = {}
@@ -158,7 +163,7 @@ class HandWorker:
                 filter_state["smoothed_velocity"] = None
 
             if hand_detected:
-                candidate_id = f"cam{self.camera_id}:hand{candidate_index}"
+                candidate_id = self._candidate_id(candidate_index, normalized_handedness)
                 candidates.append(
                     HandCandidateState(
                         camera_id=self.camera_id,
@@ -279,8 +284,18 @@ class HandWorker:
         filter_state["previous_timestamp"] = float(timestamp_s)
         return filter_state["smoothed_velocity"].copy()
 
-    @staticmethod
-    def _candidate_filter_key(candidate_index: int, handedness: str | None) -> str:
+    def _candidate_id(self, candidate_index: int, handedness: str | None) -> str:
+        if self.candidate_identity_mode == "handedness":
+            if handedness in KNOWN_HANDEDNESS:
+                return f"cam{self.camera_id}:{handedness}"
+            return f"cam{self.camera_id}:{HANDEDNESS_UNKNOWN}:hand{int(candidate_index)}"
+        return f"cam{self.camera_id}:hand{int(candidate_index)}"
+
+    def _candidate_filter_key(self, candidate_index: int, handedness: str | None) -> str:
+        if self.candidate_identity_mode == "handedness":
+            if handedness in KNOWN_HANDEDNESS:
+                return str(handedness)
+            return f"{HANDEDNESS_UNKNOWN}:hand{int(candidate_index)}"
         return f"{int(candidate_index)}:{handedness or HANDEDNESS_UNKNOWN}"
 
     @staticmethod
