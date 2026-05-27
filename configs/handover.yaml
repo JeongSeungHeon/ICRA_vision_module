@@ -28,12 +28,12 @@ cameras:
   cam0:
     # DualSensorHub가 cam0 RealSense 장치를 열 때 사용할 serial입니다.
     serial: "148522072369"
-    # cam0 color/depth stream 폭입니다. 실행 인자 --width가 있으면 런타임에 override됩니다.
-    width: 640
-    # cam0 color/depth stream 높이입니다. 실행 인자 --height가 있으면 런타임에 override됩니다.
-    height: 480
-    # cam0 stream FPS입니다. 실행 인자 --fps가 있으면 런타임에 override됩니다.
-    fps: 30
+    # # cam0 color/depth stream 폭입니다. 실행 인자 --width가 있으면 런타임에 override됩니다.
+    # width: 640
+    # # cam0 color/depth stream 높이입니다. 실행 인자 --height가 있으면 런타임에 override됩니다.
+    # height: 480
+    # # cam0 stream FPS입니다. 실행 인자 --fps가 있으면 런타임에 override됩니다.
+    # fps: 30
     depth_filters:
       spatial:
         # RealSense spatial depth filter 사용 여부입니다.
@@ -180,7 +180,7 @@ perception:
       # segmentation inference image size입니다. 실행 인자 --imgsz가 있으면 override됩니다.
       imgsz: 640
       # YOLOE inference confidence threshold입니다. 실행 인자 --conf가 있으면 override됩니다.
-      conf: 0.15
+      # conf: 0.15
       # NMS IoU threshold입니다. 실행 인자 --iou가 있으면 override됩니다.
       iou: 0.45
       # frame당 최대 detection 수입니다. 실행 인자 --max-det가 있으면 override됩니다.
@@ -306,7 +306,7 @@ perception:
     # active hand selection과 distance 계산에 참여할 후보 ID입니다. 오른손은 cam1, 왼손은 cam0 관측만 사용합니다.
     allowed_active_candidate_ids: ["cam0:left", "cam1:right"]
     # object center에서 이 거리 안으로 들어온 hand 후보만 active hand로 신규 선택합니다.
-    active_hand_distance_threshold_m: 0.10
+    active_hand_distance_threshold_m: 0.15
     # 다른 hand로 전환하려면 현재 hand보다 이 거리 이상 더 가까워야 합니다.
     switch_margin_m: 0.95
     # 전환 조건을 만족한 challenger가 연속 유지되어야 하는 frame 수입니다.
@@ -583,7 +583,7 @@ robot:
     # 고정 위치 release trigger 대기용 timeout입니다. tactile continuous descent에서는 min_z가 fallback 한계입니다.
     # release_timeout_s: 1.0
     # tactile release descent에서 허용할 최소 robot base Z입니다.
-    release_descent_min_z_mm: 30.0
+    release_descent_min_z_mm: 90.0
     # legacy step mode용 값입니다. 현재 single-target tactile release descent에서는 사용하지 않습니다.
     release_descent_step_mm: 2.0
     # tactile release descent 중 step 사이 tactile 확인 주기입니다.
@@ -609,7 +609,7 @@ robot:
 
   rtde:
     # UR robot IP입니다. 실행 인자 --robot-ip가 있으면 override됩니다.
-    robot_ip: 192.168.56.101
+    # robot_ip: 192.168.56.101
     # UR dashboard port입니다.
     dashboard_port: 29999
     # RTDE controller 내부 control 주기입니다.
@@ -721,9 +721,9 @@ robot:
 
 safety:
   workspace_bounds_m:
-    # robot base X clamp 범위입니다. 실행 인자 --workspace-x가 있으면 override됩니다.
-    x: [-0.60, 0.80]
-    # robot base Y clamp 범위입니다. 실행 인자 --workspace-y가 있으면 override됩니다.
+    # robot base X clamp 범위입니다. 이 YAML 값으로만 조절합니다.
+    x: [-0.20, 1.10]
+    # robot base Y clamp 범위입니다. 이 YAML 값으로만 조절합니다.
     y: [-0.80, 0.80]
-    # robot base Z clamp 범위입니다. 실행 인자 --workspace-z가 있으면 override됩니다.
+    # robot base Z clamp 범위입니다. 이 YAML 값으로만 조절합니다.
     z: [0.00, 0.80]

@@ -1,6 +1,7 @@
 """Dual-camera grasp-target follow script adapted for UR5 RTDE control."""
 
 import argparse
+import os
 import queue
 import sys
 import time
@@ -55,11 +56,7 @@ from utils.runtime_profiler import RuntimeProfiler
 # Constants
 # =========================
 DEFAULT_CONFIG_PATH = Path("configs/handover.yaml")
-DEFAULT_WORKSPACE_MM = {
-    "x": (-600.0, 800.0),
-    "y": (-200.0, 800.0),
-    "z": (0.0, 800.0),
-}
+
 
 # object motion trigger
 REFERENCE_LOCK_COUNT = 8
@@ -80,11 +77,11 @@ HOVER_Z_OFFSET_MM = 0
 DESCEND_EXTRA_MM = 0.0
 BACKOFF_X_MM = 125.0
 DEFAULT_POST_RELEASE_Z_OFFSET_MM = 0.0
-HOME_PLACE_X_OFFSET_MM = -25.0
-HOME_PLACE_Y_OFFSET_MM = 40.0
-HOME_PLACE_MIN_Z_MM = 30.0
+HOME_PLACE_X_OFFSET_MM = 0.0
+HOME_PLACE_Y_OFFSET_MM = 0.0
+HOME_PLACE_MIN_Z_MM = 90.0
 PRE_RELEASE_MIN_Z_EPSILON_MM = 1e-3
-GRASP_POINT_Y_OFFSET_MM = 20.0
+GRASP_POINT_Y_OFFSET_MM = 0.0
 GRASP_POINT_Z_OFFSET_MM = 10.0
 PLACE_Z_GRASP_BUFFER_FRAMES = 5
 PLACE_Z_MIN_VALID_SAMPLES = 3
@@ -232,9 +229,9 @@ def parse_args():
     parser.add_argument("--robot-ip", type=str, default="192.168.56.101", help="Optional UR5 IP override.")
     parser.add_argument("--min-valid-count", type=int, default=3, help="Min consecutive valid detections before follow.")
     parser.add_argument("--target-timeout-s", type=float, default=0.5, help="Stop following if target is stale.")
-    parser.add_argument("--workspace-x", nargs=2, type=float, default=None, help="Workspace X limits in mm.")
-    parser.add_argument("--workspace-y", nargs=2, type=float, default=None, help="Workspace Y limits in mm.")
-    parser.add_argument("--workspace-z", nargs=2, type=float, default=None, help="Workspace Z limits in mm.")
+    # parser.add_argument("--workspace-x", nargs=2, type=float, default=None, help="Workspace X limits in mm.")
+    # parser.add_argument("--workspace-y", nargs=2, type=float, default=None, help="Workspace Y limits in mm.")
+    # parser.add_argument("--workspace-z", nargs=2, type=float, default=None, help="Workspace Z limits in mm.")
     parser.add_argument("--move-to-base", action="store_true", help="Reserved for compatibility; HOME now uses joint targets.")
     parser.add_argument("--open-gripper", action="store_true", help="Open gripper during init.")
     parser.add_argument("--verbose-robot", action="store_true", help="Print detailed robot command logs.")
@@ -454,17 +451,18 @@ def apply_config_defaults(args, config):
         )
     )
 
+    # Workspace bounds are controlled only by configs/handover.yaml.
+    # CLI override args (--workspace-x/y/z) are intentionally disabled.
     for axis_name in ("x", "y", "z"):
         arg_name = f"workspace_{axis_name}"
-        current_value = getattr(args, arg_name)
-        if current_value is not None:
-            continue
+        # current_value = getattr(args, arg_name)
+        # if current_value is not None:
+        #     continue
         config_bounds = workspace_cfg.get(axis_name)
-        if config_bounds is not None and len(config_bounds) == 2:
-            mm_bounds = [float(config_bounds[0]) * 1000.0, float(config_bounds[1]) * 1000.0]
-            setattr(args, arg_name, mm_bounds)
-        else:
-            setattr(args, arg_name, list(DEFAULT_WORKSPACE_MM[axis_name]))
+        if config_bounds is None or len(config_bounds) != 2:
+            raise ValueError(f"Missing safety.workspace_bounds_m.{axis_name} in YAML config.")
+        mm_bounds = [float(config_bounds[0]) * 1000.0, float(config_bounds[1]) * 1000.0]
+        setattr(args, arg_name, mm_bounds)
 
     args.tactile_enabled = bool(tactile_cfg.get("enabled", False))
     args.tactile_port = str(tactile_cfg.get("port", DEFAULT_TACTILE_PORT))
@@ -586,6 +584,71 @@ class AnySkinTactileManager:
         self.release_status = "off"
         self.last_sample_perf_s = np.nan
         self.last_sample_unix_s = np.nan
+        self.sample_timeout_s = max(0.25, self.startup_delay_s + 1.0)
+        self.last_warn_perf_s = 0.0
+
+    def _warn(self, message, *, min_interval_s=1.0):
+        now = time.perf_counter()
+        if now - self.last_warn_perf_s >= float(min_interval_s):
+            print(message)
+            self.last_warn_perf_s = now
+
+    def _stream_is_alive(self):
+        if self.stream is None:
+            return False
+        is_alive = getattr(self.stream, "is_alive", None)
+        if callable(is_alive):
+            try:
+                return bool(is_alive())
+            except Exception:
+                return True
+        return True
+
+    def _collect_samples(self, num_samples, *, timeout_s=None):
+        if self.stream is None:
+            return np.empty((0, self.num_mags * 3 + 1), dtype=np.float32)
+
+        num_samples = max(1, int(num_samples))
+        timeout_s = self.sample_timeout_s if timeout_s is None else max(0.0, float(timeout_s))
+        deadline = time.perf_counter() + timeout_s
+        samples = []
+        last_cnt = int(getattr(self.stream, "sample_cnt", 0) or 0)
+
+        if last_cnt > 0:
+            samples.append(np.asarray(self.stream.last_reading, dtype=np.float32).copy())
+
+        while len(samples) < num_samples and time.perf_counter() < deadline:
+            if not self._stream_is_alive():
+                break
+            sample_cnt = int(getattr(self.stream, "sample_cnt", 0) or 0)
+            if sample_cnt != last_cnt and sample_cnt > 0:
+                samples.append(np.asarray(self.stream.last_reading, dtype=np.float32).copy())
+                last_cnt = sample_cnt
+                continue
+            time.sleep(0.002)
+
+        if not samples:
+            return np.empty((0, self.num_mags * 3 + 1), dtype=np.float32)
+        return np.asarray(samples, dtype=np.float32)
+
+    def _disable_after_startup_failure(self, reason):
+        self.last_error = str(reason)
+        self.status = "unavailable"
+        self.release_status = "off"
+        self.enabled = False
+        self._warn(
+            f"[WARN] AnySkin tactile reader unavailable on {self.port}; disabling tactile mode. reason={reason}",
+            min_interval_s=0.0,
+        )
+        self.close()
+
+    def _stream_startup_failure_reason(self, reason):
+        port_path = Path(self.port)
+        if not port_path.exists():
+            return f"{reason}; port does not exist: {self.port}"
+        if not os.access(self.port, os.R_OK | os.W_OK):
+            return f"{reason}; port is not readable/writable by this user: {self.port}"
+        return str(reason)
 
     def start(self):
         if not self.enabled:
@@ -601,9 +664,18 @@ class AnySkinTactileManager:
         try:
             self.stream = AnySkinProcess(num_mags=self.num_mags, port=self.port)
             self.stream.start()
+            if hasattr(self.stream, "start_streaming"):
+                self.stream.start_streaming()
             if self.startup_delay_s > 0.0:
                 time.sleep(self.startup_delay_s)
-            self.reset_baseline()
+            if self._collect_samples(1, timeout_s=self.sample_timeout_s).shape[0] == 0:
+                self._disable_after_startup_failure(
+                    self._stream_startup_failure_reason("no samples received after starting stream")
+                )
+                return
+            if not self.reset_baseline():
+                self._disable_after_startup_failure(self.last_error or "baseline reset failed")
+                return
             self.status = "ready"
             if self.debug:
                 print(f"[Tactile] AnySkin stream started on {self.port} ({self.num_mags} mags).")
@@ -618,8 +690,7 @@ class AnySkinTactileManager:
             if self.stream is None:
                 return False
             try:
-                baseline_data = self.stream.get_data(num_samples=self.baseline_samples)
-                baseline_data = np.asarray(baseline_data, dtype=np.float32)
+                baseline_data = self._collect_samples(self.baseline_samples)
                 if baseline_data.ndim != 2 or baseline_data.shape[1] < self.num_mags * 3 + 1:
                     raise RuntimeError(f"Unexpected AnySkin baseline shape: {baseline_data.shape}")
                 self.baseline = np.mean(baseline_data[:, 1 : 1 + self.num_mags * 3], axis=0)
@@ -634,7 +705,7 @@ class AnySkinTactileManager:
             except Exception as exc:
                 self.last_error = str(exc)
                 self.status = "read_error"
-                print(f"[WARN] Tactile baseline reset failed: {exc}")
+                self._warn(f"[WARN] Tactile baseline reset failed: {exc}")
                 return False
 
     def read(self):
@@ -642,9 +713,13 @@ class AnySkinTactileManager:
             if not self.enabled or self.stream is None:
                 return self.latest.copy()
             if self.baseline is None:
-                self.reset_baseline()
+                if not self.reset_baseline():
+                    return self.latest.copy()
             try:
-                sensor_data = self.stream.get_data(num_samples=1)[0]
+                sensor_samples = self._collect_samples(1)
+                if sensor_samples.shape[0] == 0:
+                    raise RuntimeError("No AnySkin samples received")
+                sensor_data = sensor_samples[-1]
                 sensor_data = np.asarray(sensor_data, dtype=np.float32)[1 : 1 + self.num_mags * 3]
                 if sensor_data.shape[0] != self.num_mags * 3:
                     raise RuntimeError(f"Unexpected AnySkin sample length: {sensor_data.shape[0]}")
@@ -659,7 +734,7 @@ class AnySkinTactileManager:
             except Exception as exc:
                 self.last_error = str(exc)
                 self.status = "read_error"
-                print(f"[WARN] Tactile read failed: {exc}")
+                self._warn(f"[WARN] Tactile read failed: {exc}")
                 return self.latest.copy()
 
     def total_norm(self):
@@ -713,6 +788,7 @@ class AnySkinTactileManager:
             stream = self.stream
             self.stream = None
         if stream is None:
+            self.status = "closed"
             return
         try:
             stream.pause_streaming()
@@ -723,7 +799,7 @@ class AnySkinTactileManager:
         except Exception:
             pass
         self.status = "closed"
-        if self.debug:
+        if self.debug and self.enabled:
             print("[Tactile] AnySkin stream stopped.")
 
 
@@ -3848,7 +3924,7 @@ def compute_pre_release_descend_target_mm(place_x, place_y, place_z, args):
 
     unclamped_z = place_z - descend_mm
     min_release_z = HOME_PLACE_MIN_Z_MM + PRE_RELEASE_MIN_Z_EPSILON_MM
-    workspace_z = getattr(args, "workspace_z", DEFAULT_WORKSPACE_MM["z"])
+    workspace_z = args.workspace_z
     workspace_z_low = float(workspace_z[0])
     workspace_z_high = float(workspace_z[1])
     guarded_low = max(min_release_z, workspace_z_low)
