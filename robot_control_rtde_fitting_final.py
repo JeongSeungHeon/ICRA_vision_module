@@ -1491,7 +1491,7 @@ class FollowSharedState:
     def is_pregrasp_pose_reached(
         self,
         eef_pose_base,
-        x_tol_mm=210.0,
+        x_tol_mm=190.0,
         y_tol_mm=30.0,
         z_tol_mm=30.0,
     ):
