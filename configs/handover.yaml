@@ -499,7 +499,7 @@ grasp:
   # object centroid 주변 grasp 후보 search radius입니다.
   candidate_search_radius_from_centroid_m: 0.11
   # 손 높이와 grasp 후보 사이 최소 clearance입니다.
-  min_hand_height_clearance_m: 0.04
+  min_hand_height_clearance_m: 0.07
   # 후보가 없을 때 이전 target을 hold할지 invalid로 둘지 정합니다.
   no_candidate_action: hold
   hand_relative_fallback:
@@ -508,7 +508,7 @@ grasp:
     # fallback을 사용하기 전 필요한 task 누적 valid frame 수입니다.
     lock_frames: 1
     # task 누적 샘플 평균에서 축별 median 대비 이 거리 이상 튄 값은 제외합니다.
-    anchor_outlier_threshold_m: 0.10
+    anchor_outlier_threshold_m: 0.08
     # 측정이 끊겨도 fallback을 유지할 최대 시간입니다.
     max_dropout_sec: 3.0
     # fallback lock에 hand approach 상태를 요구할지 정합니다.
@@ -535,8 +535,8 @@ grasp:
   z_stabilization:
     # true이면 grasp/object가 가까울 때 grasp point z만 max-step + EMA로 안정화합니다.
     enabled: true
-    # base frame XY에서 object center와 grasp target 사이 거리가 이 값 이하일 때만 적용합니다.
-    activation_dist_xy_m: 0.065
+    # base frame XY에서 EEF(wrist)와 grasp target 사이 거리가 이 값 이하일 때만 적용합니다.
+    activation_dist_xy_m: 0.25
     # frame당 z 변화량 제한입니다.
     max_step_z_m: 0.005
     # 이전 filtered z에 곱하는 EMA alpha입니다.
@@ -583,7 +583,7 @@ robot:
     # 고정 위치 release trigger 대기용 timeout입니다. tactile continuous descent에서는 min_z가 fallback 한계입니다.
     # release_timeout_s: 1.0
     # tactile release descent에서 허용할 최소 robot base Z입니다.
-    release_descent_min_z_mm: 90.0
+    release_descent_min_z_mm: 10.0
     # legacy step mode용 값입니다. 현재 single-target tactile release descent에서는 사용하지 않습니다.
     release_descent_step_mm: 2.0
     # tactile release descent 중 step 사이 tactile 확인 주기입니다.
@@ -623,7 +623,7 @@ robot:
     # moveL을 async로 실행할지 정합니다.
     move_asynchronous: true
     # moveL acceleration입니다.
-    move_acceleration: 0.35
+    move_acceleration: 0.75
     # servoL lookahead_time입니다.
     servo_lookahead_time: 0.10
     # servoL gain입니다.
