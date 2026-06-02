@@ -1,12 +1,14 @@
 """Dual-camera grasp-target follow script adapted for UR5 RTDE control."""
 
 import argparse
+import json
 import os
 import queue
 import sys
 import time
 import threading
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 from collections import deque
 
@@ -59,9 +61,8 @@ DEFAULT_CONFIG_PATH = Path("configs/handover.yaml")
 
 
 # object motion trigger
-REFERENCE_LOCK_COUNT = 8
-MOTION_TRIGGER_MM =50.0
-MOTION_TRIGGER_Z_MM = 50.0
+MOTION_TRIGGER_MM = 55.0
+MOTION_TRIGGER_Z_MM = 55.0
 
 # control loop
 DEFAULT_CONTROL_HZ = 30.0
@@ -69,19 +70,19 @@ MAX_XY_SPEED_MM_S = 250.0 # 80
 MAX_Z_SPEED_MM_S = 250.0  # 80
 
 # EEF target offset from detected object center (robot base frame)
-EEF_X_OFFSET_MM = -320.0
+EEF_X_OFFSET_MM = -320.0 # -320
 EEF_Y_OFFSET_MM = 0.0
 
 # grasp / place behavior
 HOVER_Z_OFFSET_MM = 0
 DESCEND_EXTRA_MM = 0.0
-BACKOFF_X_MM = 55.0
+BACKOFF_X_MM = 100.0
 DEFAULT_POST_RELEASE_Z_OFFSET_MM = 0.0
-HOME_PLACE_X_OFFSET_MM = 0.0
-HOME_PLACE_Y_OFFSET_MM = 0.0
+HOME_PLACE_X_OFFSET_MM = -20.0
+HOME_PLACE_Y_OFFSET_MM = -27.0
 HOME_PLACE_MIN_Z_MM = 10.0
 PRE_RELEASE_MIN_Z_EPSILON_MM = 1e-3
-GRASP_POINT_Y_OFFSET_MM = 0.0
+GRASP_POINT_Y_OFFSET_MM = -20.0
 GRASP_POINT_Z_OFFSET_MM = 10.0
 PLACE_Z_GRASP_BUFFER_FRAMES = 5
 PLACE_Z_MIN_VALID_SAMPLES = 3
@@ -115,6 +116,7 @@ DEFAULT_POST_BACKOFF_STOP_TIMEOUT_S = 1.0
 DEFAULT_POST_BACKOFF_STOP_POLL_DT_S = 0.01
 DEFAULT_POST_BACKOFF_STOP_REQUIRE_CONFIRMED = False
 HOME_JOINTS_DEG = [0.0, -135.0, 135.0, 0.0, 90.0, 0.0]
+# HOME_JOINTS_DEG = [0.0, -116.0, 128.0, -12.0, 90.0, 0.0]
 HOME_JOINT_TOLERANCE_DEG = 1.0
 HOME_JOINT_SPEED_RAD_S = 0.5
 HOME_JOINT_ACCELERATION_RAD_S2 = 0.5
@@ -369,6 +371,19 @@ def parse_args():
         default=5.0,
         help="Print a short runtime profiling summary every N seconds. Use 0 to disable.",
     )
+    parser.add_argument(
+        "--debug-tactile",
+        dest="tactile_debug",
+        action="store_true",
+        default=None,
+        help="Record gripper/tactile release diagnostics in memory and save them as JSON with the 's' key.",
+    )
+    parser.add_argument(
+        "--debug-tactile-dir",
+        type=str,
+        default="output/gripper_debug",
+        help="Directory where --debug-tactile JSON diagnostics are written.",
+    )
     return parser.parse_args()
 
 
@@ -546,7 +561,8 @@ def apply_config_defaults(args, config):
             )
         ),
     )
-    args.tactile_debug = bool(tactile_cfg.get("debug", True))
+    if args.tactile_debug is None:
+        args.tactile_debug = bool(tactile_cfg.get("debug", True))
 
     return args
 
@@ -803,6 +819,145 @@ class AnySkinTactileManager:
             print("[Tactile] AnySkin stream stopped.")
 
 
+def _debug_json_safe(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.ndarray):
+        return [_debug_json_safe(item) for item in value.tolist()]
+    if isinstance(value, np.generic):
+        return _debug_json_safe(value.item())
+    if isinstance(value, dict):
+        return {str(key): _debug_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_debug_json_safe(item) for item in value]
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            return None
+        return value
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    return str(value)
+
+
+class GripperDiagnosticRecorder:
+    """Thread-safe event recorder saved by --debug-tactile on the s key."""
+
+    def __init__(self, *, enabled=False, output_dir="output/gripper_debug"):
+        self.enabled = bool(enabled)
+        self.output_dir = Path(output_dir)
+        self.lock = threading.RLock()
+        self.events = []
+        self.session_started_unix_s = time.time()
+        self.session_started_perf_s = time.perf_counter()
+        self._event_seq = 0
+        self._save_seq = 0
+
+    def record(self, stage, **fields):
+        if not self.enabled:
+            return
+        event = {
+            "index": None,
+            "stage": str(stage),
+            "timestamp_unix_s": time.time(),
+            "timestamp_perf_s": time.perf_counter(),
+        }
+        event.update({str(key): _debug_json_safe(value) for key, value in fields.items()})
+        with self.lock:
+            self._event_seq += 1
+            event["index"] = int(self._event_seq)
+            self.events.append(event)
+
+    def snapshot(self):
+        with self.lock:
+            return [_debug_json_safe(event) for event in self.events]
+
+    def clear(self):
+        with self.lock:
+            self.events.clear()
+
+    def save(self, *, reason="manual"):
+        if not self.enabled:
+            return None
+        with self.lock:
+            events = [_debug_json_safe(event) for event in self.events]
+            self._save_seq += 1
+            save_seq = int(self._save_seq)
+            self.events.clear()
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%dT%H%M%S%f")
+        path = self.output_dir / f"gripper_debug_{timestamp}_save{save_seq:03d}.json"
+        payload = {
+            "reason": str(reason),
+            "session_started_unix_s": float(self.session_started_unix_s),
+            "session_started_perf_s": float(self.session_started_perf_s),
+            "saved_unix_s": time.time(),
+            "event_count": len(events),
+            "events": events,
+        }
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(_debug_json_safe(payload), handle, indent=2, sort_keys=True)
+        return path
+
+
+def read_gripper_diagnostic_state(controller):
+    if controller is None:
+        return None
+    try:
+        if hasattr(controller, "get_gripper_diagnostic_state"):
+            return controller.get_gripper_diagnostic_state()
+        if hasattr(controller, "get_gripper_close_state"):
+            return controller.get_gripper_close_state()
+    except Exception as exc:
+        return {"error": str(exc)}
+    return None
+
+
+def read_robot_diagnostic_state(controller):
+    if controller is None or not hasattr(controller, "read_robot_state"):
+        return None
+    try:
+        state = controller.read_robot_state(now_timestamp=time.time())
+    except Exception as exc:
+        return {"error": str(exc)}
+    if state is None:
+        return None
+    return {
+        "actual_tcp_pose_base": getattr(state, "actual_tcp_pose_base", None),
+        "actual_tcp_speed": getattr(state, "actual_tcp_speed", None),
+        "joint_positions": getattr(state, "joint_positions", None),
+        "tcp_force_norm_n": getattr(state, "tcp_force_norm_n", None),
+        "mean_joint_current_a": getattr(state, "mean_joint_current_a", None),
+        "gripper_state": getattr(state, "gripper_state", None),
+        "last_error": getattr(state, "last_error", None),
+    }
+
+
+def record_gripper_diagnostic(
+    recorder,
+    stage,
+    controller=None,
+    tactile_manager=None,
+    include_robot=False,
+    **fields,
+):
+    if recorder is None or not bool(getattr(recorder, "enabled", False)):
+        return
+    tactile_snapshot = None
+    if tactile_manager is not None and bool(getattr(tactile_manager, "enabled", False)):
+        try:
+            tactile_snapshot = tactile_manager.snapshot(refresh=False)
+        except Exception as exc:
+            tactile_snapshot = {"error": str(exc)}
+    recorder.record(
+        stage,
+        gripper=read_gripper_diagnostic_state(controller),
+        robot=read_robot_diagnostic_state(controller) if include_robot else None,
+        tactile=tactile_snapshot,
+        **fields,
+    )
+
+
 def clamp_value(v, low, high):
     return max(low, min(high, v))
 
@@ -852,7 +1007,7 @@ def get_close_range_step_mm(ref_err_xyz, max_step_mm, max_step_z_mm):
     """Use smaller servo steps near the object for gentler final alignment."""
     dist_xy = float(np.linalg.norm(np.asarray(ref_err_xyz, dtype=np.float32)[:2]))
     if dist_xy < 95.0:
-        return 5, 2.2, dist_xy
+        return 7, 2.2, dist_xy
     return float(max_step_mm), float(max_step_z_mm), dist_xy
 
 
@@ -999,11 +1154,7 @@ class FollowSharedState:
         self.control_target_xyz_mm = None # 실제로 로봇이 따라가도록 명령된 타겟 위치 (mm 단위)
         self.target_source = "none" # "measured", "predicted", or "hand_fallback" 중 하나로, control_target_xyz_mm의 출처를 나타냄
 
-        self.reference_object_xy_mm = None # 로봇이 따라갈 때 참조하는 object의 xy 위치 (mm 단위)
-        self.reference_object_xyz_mm = None # 로봇이 따라갈 때 참조하는 object의 xyz 위치 (mm 단위)
-        self.reference_locked = False # 참조 위치가 고정되어 있는지 여부. True이면 reference_object_xyz_mm이 로봇의 고정된 z와 orientation과 함께 follow 제약으로 사용됨.
         self.motion_triggered = False # follow 모드에서 로봇이 실제로 움직이기 시작했는지 여부
-        self.reference_streak = 0 # 연속적으로 참조 위치가 유효한 타겟으로 업데이트된 횟수
         self.initial_object_label = None # follow 모드가 시작ㅂ될 때 참조로 사용된 object의 라벨 (디버그용)
 
         # self.fixed_z_mm = None # follow 모드에서 로봇의 z 위치를 고정하는 경우의 고정된 z 값 (mm 단위)
@@ -1017,7 +1168,7 @@ class FollowSharedState:
 
         self.home_object_xyz_mm = None # 홈 위치에서의 object의 xyz 위치 (mm 단위)
         self.home_object_locked = False # 홈 위치에서 object 위치가 고정되어 있는지 여부. True이면 home_object_xyz_mm이 홈 위치에서의 object 위치로 간주되고, follow 모드에서 참조로 사용될 수 있음.
-        self.home_pose_buffer = deque(maxlen=4) # 홈 위치에서의 최근 로봇 pose 버퍼 (base 좌표계, x/y/z in mm + rotvec)
+        self.home_pose_buffer = deque(maxlen=4) # 홈 위치에서의 최근 object pose 버퍼 (base 좌표계, x/y/z in mm)
         self.home_object_pixel = None # 홈 위치에서 object의 pixel 위치 (u/v in pixels)
         self.home_pixel_buffer = deque(maxlen=15) #  홈 위치에서의 최근 object pixel 위치 버퍼 (u/v in pixels)
 
@@ -1095,7 +1246,6 @@ class FollowSharedState:
             self.latest_grasp_xyz_mm = None
             self.latest_measurement_source = "none"
             self.valid_detection_streak = 0
-            self.reference_streak = 0
             self.control_target_xyz_mm = None
             self.target_source = "none"
             if reset_prediction:
@@ -1199,11 +1349,7 @@ class FollowSharedState:
             self.last_measured_target_t = 0.0
             self.valid_detection_streak = 0
             self.prediction_armed = False
-            self.reference_object_xy_mm = None
-            self.reference_object_xyz_mm = None
-            self.reference_locked = False
             self.motion_triggered = False
-            self.reference_streak = 0
             self.initial_object_label = None
             # self.fixed_z_mm = None
             self.fixed_orientation_base = None
@@ -1297,14 +1443,7 @@ class FollowSharedState:
             self.latest_grasp_xyz_mm = None if grasp_xyz_mm is None else grasp_xyz_mm.copy()
             self.latest_measurement_source = measurement_source
 
-            if not self.reference_locked:
-                self.reference_streak += 1
-                if self.reference_streak >= REFERENCE_LOCK_COUNT:
-                    self.reference_object_xy_mm = object_xy_mm.copy()
-                    self.reference_object_xyz_mm = object_xyz_mm.copy()
-                    self.reference_locked = True
-                    self.motion_triggered = False
-                    print(f"[INFO] Reference object position locked: {self.reference_object_xyz_mm}")
+            if not self.home_object_locked or self.home_object_xyz_mm is None:
                 self.latest_target_xyz_mm = None
                 self.valid_detection_streak = 0
                 self._reset_prediction_locked(reset_arm=True)
@@ -1323,10 +1462,9 @@ class FollowSharedState:
                 )
 
             if not self.motion_triggered:
-                move_dist_mm = float(np.linalg.norm(object_xy_mm - self.reference_object_xy_mm))
-                move_dist_z_mm = 0.0
-                if self.reference_object_xyz_mm is not None:
-                    move_dist_z_mm = float(abs(object_xyz_mm[2] - self.reference_object_xyz_mm[2]))
+                home_object_xyz_mm = self.home_object_xyz_mm.copy()
+                move_dist_mm = float(np.linalg.norm(object_xy_mm - home_object_xyz_mm[:2]))
+                move_dist_z_mm = float(abs(object_xyz_mm[2] - home_object_xyz_mm[2]))
                 if move_dist_mm >= MOTION_TRIGGER_MM or move_dist_z_mm >= MOTION_TRIGGER_Z_MM:
                     self.motion_triggered = True
                     print(
@@ -1660,7 +1798,7 @@ def robot_control_loop(controller, shared_state, args):
 class RobotWorker:
     """Single thread that owns all RTDE and gripper commands."""
 
-    def __init__(self, args, shared_state, metadata_recorder=None, tactile_manager=None):
+    def __init__(self, args, shared_state, metadata_recorder=None, tactile_manager=None, gripper_diag_recorder=None):
         # 로봇 제어 주기, timeout, gripper/tactile 설정 등 실행 옵션을 보관한다.
         self.args = args
         # perception main loop와 target/follow 상태를 주고받는 공유 상태 객체다.
@@ -1669,6 +1807,8 @@ class RobotWorker:
         self.metadata_recorder = metadata_recorder
         # tactile grasp 판정 또는 tactile 로그 저장에 사용할 manager다.
         self.tactile_manager = tactile_manager
+        # --debug-tactile이 켜졌을 때 gripper/release 진단 이벤트를 저장할 recorder다.
+        self.gripper_diag_recorder = gripper_diag_recorder
         # RTDE controller 인스턴스이며, init 전이나 disconnect 후에는 None이다.
         self.controller = None
         # main thread가 submit한 RobotRequest를 worker thread가 순서대로 처리하는 큐다.
@@ -2044,6 +2184,7 @@ class RobotWorker:
             tactile_extra_grasp_pos=self.args.tactile_extra_grasp_pos,
             cancel_event=self._cancel_event,
             on_state_read=self._publish_robot_state,
+            gripper_diag_recorder=self.gripper_diag_recorder,
         )
         # grasp 판정 결과를 status에 기록한다.
         self._set_status(grasp_ok=bool(grasp_ok))
@@ -2078,6 +2219,7 @@ class RobotWorker:
             tactile_manager=self.tactile_manager,
             cancel_event=self._cancel_event,
             on_state_read=self._publish_robot_state,
+            gripper_diag_recorder=self.gripper_diag_recorder,
         )
         # place 중 취소되면 stop 후 idle로 돌아간다.
         if self._cancel_event.is_set():
@@ -2111,6 +2253,8 @@ class RobotWorker:
                     self.controller,
                     dwell_s=self.args.gripper_release_dwell_s,
                     cancel_event=self._cancel_event,
+                    tactile_manager=self.tactile_manager,
+                    gripper_diag_recorder=self.gripper_diag_recorder,
                 )
                 # HOME joint pose로 복귀한다.
                 home_ok = move_robot_to_home_pose(
@@ -3136,20 +3280,36 @@ def execute_gripper_close(
     controller,
     timeout_s=2.0,
     poll_dt=0.05,
-    verbose=True,
+    verbose=False,
     metadata_recorder=None,
     tactile_manager=None,
     tactile_contact_threshold=None,
     tactile_extra_grasp_pos=None,
     cancel_event=None,
     on_state_read=None,
+    gripper_diag_recorder=None,
 ):
     """Close the gripper and stop when force or position indicates contact."""
     if verbose:
         print("[INFO] GRIPPER CLOSE start")
 
+    record_gripper_diagnostic(
+        gripper_diag_recorder,
+        "close_before_command",
+        controller=controller,
+        tactile_manager=tactile_manager,
+        timeout_s=timeout_s,
+        poll_dt_s=poll_dt,
+    )
+
     if cancel_event is not None and cancel_event.is_set():
         stop_gripper_motion_safely(controller, "cancel before close")
+        record_gripper_diagnostic(
+            gripper_diag_recorder,
+            "close_cancel_before_command",
+            controller=controller,
+            tactile_manager=tactile_manager,
+        )
         return False
 
     baseline_state = controller.read_robot_state(now_timestamp=time.time())
@@ -3174,6 +3334,21 @@ def execute_gripper_close(
             gripper_action=GRIPPER_CLOSE,
             source_mode="gripper_close",
         )
+
+    record_gripper_diagnostic(
+        gripper_diag_recorder,
+        "close_command_sent",
+        controller=controller,
+        tactile_manager=tactile_manager,
+        close_started=close_started,
+        close_speed=getattr(controller, "gripper_close_speed", None),
+        close_force=getattr(controller, "gripper_close_force", None),
+        position_complete_threshold=getattr(
+            controller,
+            "gripper_position_complete_threshold",
+            DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD,
+        ),
+    )
 
     deadline = time.time() + timeout_s
     loop_start = time.time()
@@ -3203,6 +3378,12 @@ def execute_gripper_close(
             stop_gripper_motion_safely(controller, "cancel")
             if tactile_enabled:
                 tactile_manager.release_status = "close_cancelled"
+            record_gripper_diagnostic(
+                gripper_diag_recorder,
+                "close_cancelled",
+                controller=controller,
+                tactile_manager=tactile_manager,
+            )
             return False
         state = controller.read_robot_state(now_timestamp=time.time())
         if on_state_read is not None:
@@ -3276,6 +3457,14 @@ def execute_gripper_close(
                     stop_gripper_motion_safely(controller, "tactile trigger without gripper position")
                     note_robot_first_contact(metadata_recorder)
                     tactile_manager.release_status = "close_tactile_stop"
+                    record_gripper_diagnostic(
+                        gripper_diag_recorder,
+                        "close_done",
+                        controller=controller,
+                        tactile_manager=tactile_manager,
+                        reason="tactile_trigger_without_position",
+                        tactile_norm=tactile_norm,
+                    )
                     print(
                         "[INFO] Tactile contact detected during close "
                         f"(norm={tactile_norm:.3f} >= {tactile_contact_threshold:.3f}); "
@@ -3303,6 +3492,17 @@ def execute_gripper_close(
                     stop_gripper_motion_safely(controller, "tactile extra close")
                     note_robot_first_contact(metadata_recorder)
                     tactile_manager.release_status = "close_done"
+                    record_gripper_diagnostic(
+                        gripper_diag_recorder,
+                        "close_done",
+                        controller=controller,
+                        tactile_manager=tactile_manager,
+                        reason="tactile_extra_target",
+                        tactile_norm=tactile_norm,
+                        contact_position=tactile_contact_position,
+                        target_position=tactile_extra_target_position,
+                        position_value=position_value_int,
+                    )
                     print(
                         "[INFO] Tactile extra close target reached. "
                         f"position={position_value_int}, target={tactile_extra_target_position}. "
@@ -3320,22 +3520,46 @@ def execute_gripper_close(
                     f"tactile_triggered={tactile_triggered}, "
                     f"tactile_target={tactile_extra_target_position}"
                 )
-            print(
-                "[GRIPPER] "
-                f"force_norm={state.tcp_force_norm_n}, "
-                f"force_delta={force_delta}, "
-                f"mean_joint_current={state.mean_joint_current_a}, "
-                f"verified={state.grasp_verified_force_current}, "
-                f"force_triggered={force_triggered}, "
-                f"position_triggered={position_triggered}, "
-                f"position_stall_triggered={position_stall_triggered}, "
-                f"stable_position_reads={stable_position_reads}, "
-                f"gripper_state={gripper_close_state}"
-                f"{tactile_text}"
-            )
+            # print(
+            #     "[GRIPPER] "
+            #     f"force_norm={state.tcp_force_norm_n}, "
+            #     f"force_delta={force_delta}, "
+            #     f"mean_joint_current={state.mean_joint_current_a}, "
+            #     f"verified={state.grasp_verified_force_current}, "
+            #     f"force_triggered={force_triggered}, "
+            #     f"position_triggered={position_triggered}, "
+            #     f"position_stall_triggered={position_stall_triggered}, "
+            #     f"stable_position_reads={stable_position_reads}, "
+            #     f"gripper_state={gripper_close_state}"
+            #     f"{tactile_text}"
+            # )
+        record_gripper_diagnostic(
+            gripper_diag_recorder,
+            "close_poll",
+            controller=controller,
+            tactile_manager=tactile_manager,
+            elapsed_s=elapsed,
+            force_norm=force_norm,
+            force_delta=force_delta,
+            gripper_close_state=gripper_close_state,
+            tactile_norm=tactile_norm,
+            force_triggered=force_triggered,
+            position_triggered=position_triggered,
+            position_stall_triggered=position_stall_triggered,
+            stable_position_reads=stable_position_reads,
+        )
         if force_triggered:
             stop_gripper_motion_safely(controller, "force trigger")
             note_robot_first_contact(metadata_recorder)
+            record_gripper_diagnostic(
+                gripper_diag_recorder,
+                "close_done",
+                controller=controller,
+                tactile_manager=tactile_manager,
+                reason="force_trigger",
+                force_norm=force_norm,
+                force_delta=force_delta,
+            )
             delta_str = "n/a" if force_delta is None else f"{force_delta:.3f}"
             print(
                 f"[INFO] Force rise detected during close (abs={float(force_norm):.3f} N, delta={delta_str} N). "
@@ -3348,6 +3572,15 @@ def execute_gripper_close(
             position_threshold = int(
                 getattr(controller, "gripper_position_complete_threshold", DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD)
             )
+            record_gripper_diagnostic(
+                gripper_diag_recorder,
+                "close_done",
+                controller=controller,
+                tactile_manager=tactile_manager,
+                reason="position_trigger",
+                position_value=position_value_int,
+                position_threshold=position_threshold,
+            )
             print(
                 f"[INFO] Gripper position reached threshold >= {position_threshold}. Stopping gripper close and finishing grasp stage."
             )
@@ -3357,6 +3590,15 @@ def execute_gripper_close(
             note_robot_first_contact(metadata_recorder)
             if tactile_enabled and tactile_contact_detected:
                 tactile_manager.release_status = "close_stall_after_contact"
+            record_gripper_diagnostic(
+                gripper_diag_recorder,
+                "close_done",
+                controller=controller,
+                tactile_manager=tactile_manager,
+                reason="position_stall",
+                position_value=position_value_int,
+                stable_position_reads=stable_position_reads,
+            )
             print(
                 "[INFO] Gripper position stalled "
                 f"(position={position_value_int}, stable_reads={stable_position_reads}, "
@@ -3369,31 +3611,93 @@ def execute_gripper_close(
     stop_gripper_motion_safely(controller, "close timeout")
     if tactile_enabled:
         tactile_manager.release_status = "close_timeout"
+    record_gripper_diagnostic(
+        gripper_diag_recorder,
+        "close_failed",
+        controller=controller,
+        tactile_manager=tactile_manager,
+        reason="timeout",
+        timeout_s=timeout_s,
+    )
     print("[WARN] Grasp could not be verified from RTDE force/current.")
     return False
 
 
-def execute_gripper_open(controller, dwell_s=0.5, metadata_recorder=None, cancel_event=None):
+def execute_gripper_open(
+    controller,
+    dwell_s=0.5,
+    metadata_recorder=None,
+    cancel_event=None,
+    tactile_manager=None,
+    gripper_diag_recorder=None,
+):
     """Open the gripper and optionally record the last-contact timestamp."""
+    record_gripper_diagnostic(
+        gripper_diag_recorder,
+        "open_before_command",
+        controller=controller,
+        tactile_manager=tactile_manager,
+        dwell_s=dwell_s,
+    )
     if cancel_event is not None and cancel_event.is_set():
         stop_gripper_motion_safely(controller, "cancel before open")
+        record_gripper_diagnostic(
+            gripper_diag_recorder,
+            "open_cancel_before_command",
+            controller=controller,
+            tactile_manager=tactile_manager,
+        )
         return False
     if metadata_recorder is not None:
         last_contact_timestamp = metadata_recorder.note_robot_last_contact()
         if last_contact_timestamp is not None:
             print(f"[INFO] Robot last contact timestamp={last_contact_timestamp}")
-    send_robot_command(
+    open_state = send_robot_command(
         controller,
         ROBOT_CMD_HOLD,
         gripper_action=GRIPPER_OPEN,
         source_mode="gripper_open",
     )
+    last_debug = getattr(controller, "last_debug", None)
+    record_gripper_diagnostic(
+        gripper_diag_recorder,
+        "open_command_returned",
+        controller=controller,
+        tactile_manager=tactile_manager,
+        include_robot=True,
+        rtde_state=open_state,
+        rtde_debug=None if last_debug is None else getattr(last_debug, "__dict__", str(last_debug)),
+        open_speed=getattr(controller, "gripper_open_speed", None),
+        open_force=getattr(controller, "gripper_open_force", None),
+    )
     deadline = time.time() + max(dwell_s, 0.0)
     while time.time() < deadline:
         if cancel_event is not None and cancel_event.is_set():
             stop_gripper_motion_safely(controller, "cancel during open dwell")
+            record_gripper_diagnostic(
+                gripper_diag_recorder,
+                "open_cancel_during_dwell",
+                controller=controller,
+                tactile_manager=tactile_manager,
+                include_robot=True,
+            )
             return False
+        record_gripper_diagnostic(
+            gripper_diag_recorder,
+            "open_dwell_poll",
+            controller=controller,
+            tactile_manager=tactile_manager,
+            include_robot=True,
+            dwell_remaining_s=max(deadline - time.time(), 0.0),
+        )
         time.sleep(min(0.05, max(deadline - time.time(), 0.0)))
+    record_gripper_diagnostic(
+        gripper_diag_recorder,
+        "open_after_dwell",
+        controller=controller,
+        tactile_manager=tactile_manager,
+        include_robot=True,
+    )
     return True
 
 
@@ -3890,7 +4194,8 @@ def compute_place_target(shared_state):
         }
 
     if grasp_offset is not None:
-        home_xyz[0] -= grasp_offset[0]
+        #home_xyz[0] -= grasp_offset[0]
+        home_xyz[0] -= 210
     home_xyz[0] += HOME_PLACE_X_OFFSET_MM
     home_xyz[1] += HOME_PLACE_Y_OFFSET_MM
     debug = {
@@ -3952,11 +4257,19 @@ def execute_return_and_place(
     tactile_manager=None,
     cancel_event=None,
     on_state_read=None,
+    gripper_diag_recorder=None,
 ):
     """Run the post-grasp return, release, backoff, and HOME sequence."""
     # 함수 시작 시 이미 cancel 요청이 들어온 상태라면 로봇을 멈추고 실패로 종료한다.
     if cancel_event is not None and cancel_event.is_set():
         safe_stop_rtde(controller)
+        record_gripper_diagnostic(
+            gripper_diag_recorder,
+            "return_place_cancel_before_start",
+            controller=controller,
+            tactile_manager=tactile_manager,
+            include_robot=True,
+        )
         return False
     # shared_state에 저장된 grasp offset/place z 샘플을 이용해 최종 place 목표 EEF 위치[mm]를 계산한다.
     target_eef_xyz, place_target_debug = compute_place_target(shared_state)
@@ -4137,6 +4450,8 @@ def execute_return_and_place(
         dwell_s=args.gripper_release_dwell_s,
         metadata_recorder=metadata_recorder,
         cancel_event=cancel_event,
+        tactile_manager=tactile_manager,
+        gripper_diag_recorder=gripper_diag_recorder,
     )
     # gripper open 중 cancel이 들어왔으면 이후 후퇴/HOME 동작 없이 실패 처리한다.
     if cancel_event is not None and cancel_event.is_set():
@@ -4228,18 +4543,43 @@ def execute_return_and_place(
 
     # 정상 경로에서는 joint HOME pose로 복귀한다.
     try:
+        record_gripper_diagnostic(
+            gripper_diag_recorder,
+            "before_home_move",
+            controller=controller,
+            tactile_manager=tactile_manager,
+            include_robot=True,
+            backoff_target_mm=[backoff_x, backoff_y, backoff_z],
+            post_release_target_mm=[post_release_x, post_release_y, post_release_z],
+        )
         home_kwargs = {}
         if cancel_event is not None:
             home_kwargs["cancel_event"] = cancel_event
         if on_state_read is not None:
             home_kwargs["on_state_read"] = on_state_read
         home_ok = move_robot_to_home_pose(controller, args, **home_kwargs)
+        record_gripper_diagnostic(
+            gripper_diag_recorder,
+            "after_home_move",
+            controller=controller,
+            tactile_manager=tactile_manager,
+            include_robot=True,
+            home_ok=home_ok,
+        )
         # HOME 이동이 cancel로 False를 반환하면 실패 처리한다.
         if home_ok is False:
             return False
     # HOME joint 복귀가 예외로 실패하면 초기 TCP pose로 fallback 복귀를 시도한다.
     except Exception as exc:
         print(f"[WARN] Return to HOME joints failed: {exc}")
+        record_gripper_diagnostic(
+            gripper_diag_recorder,
+            "home_move_failed",
+            controller=controller,
+            tactile_manager=tactile_manager,
+            include_robot=True,
+            error=str(exc),
+        )
         # 초기 pose 기록이 없으면 fallback 이동도 불가능하다.
         if initial_pose_base is None:
             return False
@@ -4906,6 +5246,13 @@ def main():
     shared_state = FollowSharedState(args)
     # task ready, geometry, completion 같은 handover 메타데이터를 저장하는 recorder다.
     metadata_recorder = HandoverMetadataRecorder()
+    # --debug-tactile이면 gripper/raw register 진단 이벤트를 JSON으로 저장하기 위해 메모리에 쌓는다.
+    gripper_diag_recorder = GripperDiagnosticRecorder(
+        enabled=bool(args.tactile_debug),
+        output_dir=args.debug_tactile_dir,
+    )
+    if gripper_diag_recorder.enabled:
+        print(f"[INFO] Gripper/tactile diagnostics enabled. Press 's' to save JSON logs to {args.debug_tactile_dir}.")
     # 영상 녹화 서비스는 옵션이 켜졌을 때만 생성하므로 우선 None으로 둔다.
     video_recorder = None
     # 로봇 제어 worker 역시 follow 옵션이 켜졌을 때만 생성하므로 우선 None으로 둔다.
@@ -5008,6 +5355,8 @@ def main():
             metadata_recorder=metadata_recorder,
             # grasp/place 중 tactile 정보를 참조할 수 있게 전달한다.
             tactile_manager=tactile_manager,
+            # gripper raw register와 release sequence 진단 이벤트를 저장할 recorder다.
+            gripper_diag_recorder=gripper_diag_recorder,
         )
         # 로봇 worker thread를 시작한다.
         robot_worker.start()
@@ -5053,6 +5402,13 @@ def main():
                         pending_reset_reason = None
                     # reset 이후에는 이전 grasp 요청 상태를 무효화한다.
                     grasp_request_pending = False
+                    # reset 이후 새 trial 진단 로그가 이전 trial과 섞이지 않도록 현재 이벤트를 분리한다.
+                    if gripper_diag_recorder is not None and gripper_diag_recorder.enabled:
+                        gripper_diag_recorder.record(
+                            "main_reset_done",
+                            reset_done_epoch=int(robot_status.reset_done_epoch),
+                            pending_reset_reason=pending_reset_reason,
+                        )
                     # 메인 thread perception reset이 끝났음을 알린다.
                     print("[INFO] Main-thread perception reset complete after robot reset.")
                 # task ready epoch가 바뀌면 새 handover trial 기록을 시작한다.
@@ -5066,6 +5422,12 @@ def main():
                     task_record_start_perf = time.perf_counter()
                     # metadata 시작 timestamp를 콘솔에 남긴다.
                     print(f"[INFO] Metadata task start timestamp={task_ready_timestamp}")
+                    if gripper_diag_recorder is not None and gripper_diag_recorder.enabled:
+                        gripper_diag_recorder.record(
+                            "main_task_ready",
+                            task_ready_epoch=int(robot_status.task_ready_epoch),
+                            task_start_timestamp=task_ready_timestamp,
+                        )
                     # 영상 녹화가 켜져 있으면 task 시작 timestamp에 맞춰 녹화를 시작한다.
                     start_task_video_recording(video_recorder, task_ready_timestamp)
                 # task done epoch가 바뀌면 grasp 요청 pending 상태를 해제한다.
@@ -5582,6 +5944,13 @@ def main():
                         open_video_recorder_ui(video_recorder)
                 # s 키 저장 시 runtime profile을 디스크에 저장한다.
                 save_runtime_profile(runtime_profiler, reason="s_key")
+                # --debug-tactile 진단 로그가 있으면 JSON 파일로 저장한다.
+                if gripper_diag_recorder is not None and gripper_diag_recorder.enabled:
+                    diag_path = gripper_diag_recorder.save(reason="s_key")
+                    if diag_path is not None:
+                        print(f"[INFO] Gripper/tactile diagnostics saved: {diag_path}")
+                    else:
+                        print("[INFO] Gripper/tactile diagnostics had no events to save.")
 
     # loop 종료, 예외, KeyboardInterrupt 등 어떤 경우에도 리소스를 정리한다.
     finally:

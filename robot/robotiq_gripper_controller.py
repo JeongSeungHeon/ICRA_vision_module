@@ -93,14 +93,25 @@ class RobotiqGripperController:
         if not self._is_connected:
             raise RuntimeError("Gripper controller is not connected.")
         position = int(self.gripper.get_current_position())
+        open_position = int(self.gripper.get_open_position())
         closed_position = int(self.gripper.get_closed_position())
         object_status = self.gripper.get_object_status()
         return {
             "position": position,
+            "open_position": open_position,
             "closed_position": closed_position,
             "object_status": object_status.name,
             "fully_closed": position >= max(closed_position - 1, 0),
+            "fully_open": position <= open_position + 1,
         }
+
+    def get_diagnostic_state(self) -> dict[str, object]:
+        if not self._is_connected:
+            raise RuntimeError("Gripper controller is not connected.")
+        state = dict(self.gripper.get_diagnostic_state())
+        state["open_position"] = int(self.gripper.get_open_position())
+        state["closed_position"] = int(self.gripper.get_closed_position())
+        return state
 
     def open(self, *, speed: int = 255, force: int = 255, wait: bool = True) -> bool:
         return self.set_closed(False, speed=speed, force=force, wait=wait)

@@ -1,1 +1,1 @@
-python tools/visualize_handover_3d_debug_rerun.py output/debug_3d/handover_3d_debug_20260527_205558_421705_session010.npz
+python tools/visualize_handover_3d_debug_rerun.py output/debug_3d/before/cham_suc1.npz

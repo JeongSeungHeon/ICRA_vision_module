@@ -69,7 +69,8 @@ cameras:
         zfar: 100.0
   cam1:
     # DualSensorHub가 cam1 RealSense 장치를 열 때 사용할 serial입니다.
-    serial: "327122075999"
+    #serial: "327122075999"
+    serial: "335222076328"
     # cam1 color/depth stream 폭입니다. cam0와 같아야 하며 --width로 override됩니다.
     width: 640
     # cam1 color/depth stream 높이입니다. cam0와 같아야 하며 --height로 override됩니다.
@@ -308,11 +309,11 @@ perception:
     # object center에서 이 거리 안으로 들어온 hand 후보만 active hand로 신규 선택합니다.
     active_hand_distance_threshold_m: 0.15
     # 다른 hand로 전환하려면 현재 hand보다 이 거리 이상 더 가까워야 합니다.
-    switch_margin_m: 0.95
+    switch_margin_m: 0.05
     # 전환 조건을 만족한 challenger가 연속 유지되어야 하는 frame 수입니다.
-    switch_confirm_frames: 15
+    switch_confirm_frames: 4
     # 현재 active hand가 사라졌을 때 마지막 선택을 유지하는 시간입니다.
-    lost_timeout_s: 1000000000.5
+    lost_timeout_s: 100000.5
     # handover task 중 active hand를 보수적으로 유지합니다.
     lock_active_hand_during_task: true
     # true이면 active hand가 실제로 바뀌는 순간 교체 기준과 거리 정보를 콘솔에 출력합니다.
@@ -434,7 +435,7 @@ perception:
       # ICP 수렴 translation tolerance입니다.
       translation_tolerance_m: 1.0e-5
       # ICP 결과 centroid jump 허용값입니다.
-      max_centroid_jump_m: 0.25
+      max_centroid_jump_m: 1.1
       crop:
         # ICP 전에 target/source cloud 상단 일부를 crop할지 정합니다.
         enabled: true
@@ -516,7 +517,7 @@ grasp:
     # fallback lock에 motion trigger 상태를 요구할지 정합니다.
     require_motion_triggered: true
     # hand-relative fallback lock/active 여부를 콘솔에 출력합니다.
-    debug_log: true
+    debug_log: false
     # lock_frames progress가 바뀔 때만 출력합니다.
     log_lock_progress: false
     # fallback active 로그를 몇 frame마다 출력할지 정합니다. 1이면 매 fallback frame 출력입니다.
@@ -536,7 +537,7 @@ grasp:
     # true이면 grasp/object가 가까울 때 grasp point z만 max-step + EMA로 안정화합니다.
     enabled: true
     # base frame XY에서 EEF(wrist)와 grasp target 사이 거리가 이 값 이하일 때만 적용합니다.
-    activation_dist_xy_m: 0.25
+    activation_dist_xy_m: 0.35
     # frame당 z 변화량 제한입니다.
     max_step_z_m: 0.005
     # 이전 filtered z에 곱하는 EMA alpha입니다.
@@ -573,9 +574,9 @@ robot:
     # stream 시작 후 baseline reset 전 대기 시간입니다.
     startup_delay_s: 1.0
     # baseline-subtracted tactile total norm이 이 값 이상이면 contact로 봅니다.
-    contact_norm_threshold: 35.0
+    contact_norm_threshold: 65.0 #35
     # tactile contact position에서 gripper를 추가로 닫을 Robotiq position count입니다.
-    extra_grasp_pos: 20
+    extra_grasp_pos: 10 #20
     # place/release 위치에서 held reference 대비 이 delta 이상이면 release timing으로 봅니다.
     release_delta_threshold: 30
     # grasp 성공 후 held tactile reference를 잡기 전 대기 시간입니다.
@@ -623,7 +624,7 @@ robot:
     # moveL을 async로 실행할지 정합니다.
     move_asynchronous: true
     # moveL acceleration입니다.
-    move_acceleration: 0.75
+    move_acceleration: 0.65
     # servoL lookahead_time입니다.
     servo_lookahead_time: 0.10
     # servoL gain입니다.
@@ -664,11 +665,11 @@ robot:
       # true이면 close 중 gripper position이 충분히 오래 거의 변하지 않을 때 완료로 봅니다.
       enabled: true
       # position 변화가 tolerance 이하인 상태가 이 read 수만큼 이어지면 stall로 봅니다.
-      stable_reads_required: 3
+      stable_reads_required: 9
       # 같은 position으로 볼 Robotiq position 정수값 허용 오차입니다.
       tolerance: 1
       # close 시작 직후 순간적인 동일 read를 무시하기 위한 최소 경과 시간입니다.
-      min_elapsed_s: 0.12
+      min_elapsed_s: 0.15
     # grasp 직전 fitted template의 grasp z 단면 폭/지름으로 close 완료 position threshold를 계산합니다.
     position_threshold_geometry:
       # true이면 object label이 아니라 template 단면 geometry 기반 threshold를 사용합니다.
@@ -722,7 +723,7 @@ robot:
 safety:
   workspace_bounds_m:
     # robot base X clamp 범위입니다. 이 YAML 값으로만 조절합니다.
-    x: [-0.20, 1.10]
+    x: [-0.20, 1.05]
     # robot base Y clamp 범위입니다. 이 YAML 값으로만 조절합니다.
     y: [-0.80, 0.80]
     # robot base Z clamp 범위입니다. 이 YAML 값으로만 조절합니다.

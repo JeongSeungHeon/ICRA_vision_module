@@ -323,6 +323,40 @@ class RtdeController:
                 return dict(self._robotiq_gripper.get_motion_state())
             return None
 
+    def get_gripper_diagnostic_state(self) -> dict[str, object] | None:
+        with self._rtde_lock:
+            self.connect()
+            if self._using_mock:
+                return {
+                    "mode": "mock",
+                    "last_gripper_state": self._last_gripper_state,
+                }
+            if self.gripper_control_mode in {"socket", "robotiq", "robotiq_socket", "daemon"}:
+                if self._robotiq_gripper is None:
+                    return {
+                        "mode": self.gripper_control_mode,
+                        "connected": False,
+                        "error": "Robotiq socket controller is not connected",
+                    }
+                state = dict(self._robotiq_gripper.get_diagnostic_state())
+                state.update(
+                    {
+                        "mode": self.gripper_control_mode,
+                        "connected": bool(self._robotiq_gripper.is_connected),
+                        "last_gripper_state": self._last_gripper_state,
+                        "open_speed": int(self.gripper_open_speed),
+                        "open_force": int(self.gripper_open_force),
+                        "close_speed": int(self.gripper_close_speed),
+                        "close_force": int(self.gripper_close_force),
+                    }
+                )
+                return state
+            return {
+                "mode": self.gripper_control_mode,
+                "last_gripper_state": self._last_gripper_state,
+                "error": "Detailed diagnostics are only available for Robotiq socket mode",
+            }
+
     # ------------------------------------------------------------------
     # Home pose
     # ------------------------------------------------------------------

@@ -119,6 +119,25 @@ class RobotiqGripper:
     def get_object_status(self) -> "RobotiqGripper.ObjectStatus":
         return self.ObjectStatus(self._get_var(self.OBJ))
 
+    def get_diagnostic_state(self) -> dict[str, object]:
+        variables = (self.ACT, self.STA, self.GTO, self.OBJ, self.FLT, self.PRE, self.POS, self.SPE, self.FOR)
+        state = {}
+        for variable in variables:
+            try:
+                state[variable] = self._get_var(variable)
+            except Exception as exc:
+                state[variable] = None
+                state[f"{variable}_error"] = str(exc)
+        try:
+            state["STA_name"] = self.GripperStatus(state[self.STA]).name if state.get(self.STA) is not None else None
+        except Exception:
+            state["STA_name"] = None
+        try:
+            state["OBJ_name"] = self.ObjectStatus(state[self.OBJ]).name if state.get(self.OBJ) is not None else None
+        except Exception:
+            state["OBJ_name"] = None
+        return state
+
     def stop(self) -> bool:
         current_position = self.get_current_position()
         ok, _ = self.move(current_position, 0, 0)
