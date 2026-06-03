@@ -377,7 +377,7 @@ perception:
         scale_mode: axis_xyz
         z_rotation:
           # box-shaped snack에만 Z축 yaw 후보 탐색을 적용합니다.
-          enabled: true
+          enabled: false
           # yaw 후보 최소 각도입니다.
           min_deg: -90.0
           # yaw 후보 최대 각도입니다.
@@ -386,7 +386,7 @@ perception:
           step_deg: 5.0
           coarse_to_fine:
             # roll/pitch 후보별로 coarse yaw를 먼저 고르고 주변만 refine합니다.
-            enabled: true
+            enabled: false
             # coarse yaw 후보 간격입니다.
             coarse_step_deg: 15.0
             # coarse best yaw 주변 refine 반경입니다.
@@ -542,7 +542,7 @@ grasp:
     # true이면 grasp/object가 가까울 때 grasp point z만 max-step + EMA로 안정화합니다.
     enabled: true
     # base frame XY에서 EEF(wrist)와 grasp target 사이 거리가 이 값 이하일 때만 적용합니다.
-    activation_dist_xy_m: 0.35
+    activation_dist_xy_m: 0.30 #0.35
     # frame당 z 변화량 제한입니다.
     max_step_z_m: 0.005
     # 이전 filtered z에 곱하는 EMA alpha입니다.
@@ -553,7 +553,7 @@ robot:
     # true이면 PLACE 도착 후 gripper open 전에 아래 방향으로 한 번 더 이동합니다.
     pre_release_descend_enabled: true
     # gripper open 전 추가 하강 거리입니다. 기본 코드 상수 RELEASE_PARAMETER_MM와 같은 10 mm입니다.
-    pre_release_descend_m: 0.02
+    pre_release_descend_m: 0.00
     # gripper release 후 x backoff 전에 robot base +Z 방향으로 올릴 거리입니다.
     post_release_z_offset_m: -0.03
     # return_backoff moveL 이후 HOME moveJ로 넘어가기 전에 실제 정지를 확인합니다.
@@ -584,7 +584,7 @@ robot:
     extra_grasp_pos: 10 #20
     # place/release 위치에서 held reference 대비 이 delta 이상이면 release timing으로 봅니다.
     release_delta_threshold: 30
-    # grasp 성공 후 held tactile reference를 잡기 전 대기 시간입니다.
+    # legacy 고정 release reference 대기 시간입니다. 현재 servo release descent에서는 사용하지 않습니다.
     release_ref_delay_s: 0.3
     # 고정 위치 release trigger 대기용 timeout입니다. tactile continuous descent에서는 min_z가 fallback 한계입니다.
     # release_timeout_s: 1.0
@@ -592,8 +592,12 @@ robot:
     release_descent_min_z_mm: 0.0
     # legacy step mode용 값입니다. 현재 single-target tactile release descent에서는 사용하지 않습니다.
     release_descent_step_mm: 2.0
-    # tactile release descent 중 step 사이 tactile 확인 주기입니다.
+    # tactile release descent 중 tactile trigger 확인/로그 주기입니다. servo 명령 주기는 rtde control_hz를 따릅니다.
     release_descent_poll_dt_s: 0.03
+    # servo release descent에서 robot base -Z 방향으로 내려가는 속도입니다.
+    release_descent_speed_mps: 0.12
+    # servo release descent 시작 직전 held reference mean을 계산할 AnySkin sample 수입니다.
+    release_reference_sample_count: 2
     # gripper open 후 tactile baseline을 다시 잡기 전 대기 시간입니다. 0이면 비활성입니다.
     auto_baseline_reset_after_open_s: 0
     # true이면 tactile release trigger 이후 stop command/actual stop timing을 자세히 출력합니다.

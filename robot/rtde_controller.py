@@ -758,20 +758,58 @@ class RtdeController:
         triggers a protective stop.  We accept it from the caller (runner)
         which measures the real loop period each step.
         """
+        import time as _time
+
         servo_l = getattr(self._rtde_control, "servoL", None)
         if not callable(servo_l):
             self._move_to_pose(target_pose)
             return
+
+        stop_l = getattr(self._rtde_control, "stopL", None)
+        if self._move_in_progress and callable(stop_l):
+            try:
+                stop_l(self.stop_acceleration)
+                _time.sleep(0.02)
+            except Exception:
+                pass
+            self._move_in_progress = False
+            self._pending_move_target = None
+
         # Clamp dt to a reasonable range: UR requires 0.002 <= dt <= 0.2
         dt = float(np.clip(loop_dt, 0.002, 0.2))
-        servo_l(
-            list(target_pose),
-            self.servo_velocity,
-            self.servo_acceleration,
-            dt,
-            self.servo_lookahead_time,
-            self.servo_gain,
-        )
+
+        def _do_servo() -> None:
+            servo_l(
+                list(target_pose),
+                self.servo_velocity,
+                self.servo_acceleration,
+                dt,
+                self.servo_lookahead_time,
+                self.servo_gain,
+            )
+
+        try:
+            _do_servo()
+            self._last_error = None
+        except Exception as exc:
+            err_str = str(exc).lower()
+            if "another thread" not in err_str and "already controlling" not in err_str:
+                self._last_error = str(exc)
+                raise
+            if callable(stop_l):
+                try:
+                    stop_l(self.stop_acceleration)
+                except Exception:
+                    pass
+            self._move_in_progress = False
+            self._pending_move_target = None
+            _time.sleep(0.05)
+            try:
+                _do_servo()
+                self._last_error = None
+            except Exception as exc2:
+                self._last_error = str(exc2)
+                raise
 
     def _safe_stop_motion(self) -> None:
         if self._using_mock:

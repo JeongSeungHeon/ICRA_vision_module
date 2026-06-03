@@ -61,8 +61,8 @@ DEFAULT_CONFIG_PATH = Path("configs/handover.yaml")
 
 
 # object motion trigger
-MOTION_TRIGGER_MM = 55.0
-MOTION_TRIGGER_Z_MM = 55.0
+MOTION_TRIGGER_MM = 50.0
+MOTION_TRIGGER_Z_MM = 50.0
 
 # control loop
 DEFAULT_CONTROL_HZ = 30.0
@@ -78,11 +78,13 @@ HOVER_Z_OFFSET_MM = 0
 DESCEND_EXTRA_MM = 0.0
 BACKOFF_X_MM = 100.0
 DEFAULT_POST_RELEASE_Z_OFFSET_MM = 0.0
+HOME_PLACE_X_MM = 800.0
+HOME_PLACE_Y_MM = 0.0
 HOME_PLACE_X_OFFSET_MM = 0.0
 HOME_PLACE_Y_OFFSET_MM = 0.0
 HOME_PLACE_MIN_Z_MM = 0.0 # 10.0
 PRE_RELEASE_MIN_Z_EPSILON_MM = 1e-3
-GRASP_POINT_Y_OFFSET_MM = -20.0
+GRASP_POINT_Y_OFFSET_MM = 20.0 
 GRASP_POINT_Z_OFFSET_MM = 10.0
 PLACE_Z_GRASP_BUFFER_FRAMES = 5
 PLACE_Z_MIN_VALID_SAMPLES = 3
@@ -105,6 +107,8 @@ DEFAULT_TACTILE_RELEASE_REF_DELAY_S = 0.3
 DEFAULT_TACTILE_RELEASE_TIMEOUT_S = 1.0
 DEFAULT_TACTILE_RELEASE_DESCENT_STEP_MM = 2.0
 DEFAULT_TACTILE_RELEASE_DESCENT_POLL_DT_S = 0.03
+DEFAULT_TACTILE_RELEASE_DESCENT_SPEED_MPS = 0.03
+DEFAULT_TACTILE_RELEASE_REFERENCE_SAMPLE_COUNT = 2
 DEFAULT_TACTILE_AUTO_BASELINE_RESET_AFTER_OPEN_S = 1.5
 DEFAULT_TACTILE_RELEASE_STOP_TIMING_DEBUG = False
 DEFAULT_TACTILE_RELEASE_STOP_SPEED_THRESHOLD_MPS = 0.002
@@ -523,6 +527,14 @@ def apply_config_defaults(args, config):
     args.tactile_release_descent_poll_dt_s = max(
         0.0,
         float(tactile_cfg.get("release_descent_poll_dt_s", DEFAULT_TACTILE_RELEASE_DESCENT_POLL_DT_S)),
+    )
+    args.tactile_release_descent_speed_mps = max(
+        0.0,
+        float(tactile_cfg.get("release_descent_speed_mps", DEFAULT_TACTILE_RELEASE_DESCENT_SPEED_MPS)),
+    )
+    args.tactile_release_reference_sample_count = max(
+        1,
+        int(tactile_cfg.get("release_reference_sample_count", DEFAULT_TACTILE_RELEASE_REFERENCE_SAMPLE_COUNT)),
     )
     args.tactile_auto_baseline_reset_after_open_s = max(
         0.0,
@@ -1009,7 +1021,7 @@ def get_close_range_step_mm(ref_err_xyz, max_step_mm, max_step_z_mm):
     """Use smaller servo steps near the object for gentler final alignment."""
     dist_xy = float(np.linalg.norm(np.asarray(ref_err_xyz, dtype=np.float32)[:2]))
     if dist_xy < 95.0:
-        return 7, 5, dist_xy
+        return 5, 7, dist_xy
     return float(max_step_mm), float(max_step_z_mm), dist_xy
 
 
@@ -1170,7 +1182,7 @@ class FollowSharedState:
 
         self.home_object_xyz_mm = None # 홈 위치에서의 object의 xyz 위치 (mm 단위)
         self.home_object_locked = False # 홈 위치에서 object 위치가 고정되어 있는지 여부. True이면 home_object_xyz_mm이 홈 위치에서의 object 위치로 간주되고, follow 모드에서 참조로 사용될 수 있음.
-        self.home_pose_buffer = deque(maxlen=4) # 홈 위치에서의 최근 object pose 버퍼 (base 좌표계, x/y/z in mm)
+        self.home_pose_buffer = deque(maxlen=1) # 홈 위치에서의 최근 object pose 버퍼 (base 좌표계, x/y/z in mm)
         self.home_object_pixel = None # 홈 위치에서 object의 pixel 위치 (u/v in pixels)
         self.home_pixel_buffer = deque(maxlen=15) #  홈 위치에서의 최근 object pixel 위치 버퍼 (u/v in pixels)
 
@@ -3724,6 +3736,65 @@ def capture_tactile_release_reference(tactile_manager, delay_s=0.0, cancel_event
     return reference_norm
 
 
+def capture_tactile_release_reference_mean(
+    tactile_manager,
+    *,
+    sample_count=DEFAULT_TACTILE_RELEASE_REFERENCE_SAMPLE_COUNT,
+    timeout_s=0.08,
+):
+    """Capture release reference from a short mean of fresh AnySkin samples."""
+    if tactile_manager is None or not bool(getattr(tactile_manager, "enabled", False)):
+        return None
+
+    sample_count = max(1, int(sample_count))
+    timeout_s = max(0.0, float(timeout_s))
+    reference_norm = None
+    sample_norms = []
+    fallback_reason = None
+
+    try:
+        with tactile_manager.lock:
+            baseline = None if tactile_manager.baseline is None else np.asarray(tactile_manager.baseline, dtype=np.float32).copy()
+            raw_samples = tactile_manager._collect_samples(sample_count, timeout_s=timeout_s)
+        if baseline is None:
+            fallback_reason = "baseline_missing"
+        elif raw_samples.ndim != 2 or raw_samples.shape[0] < sample_count:
+            fallback_reason = f"insufficient_samples:{0 if raw_samples.ndim != 2 else raw_samples.shape[0]}/{sample_count}"
+        elif raw_samples.shape[1] < tactile_manager.num_mags * 3 + 1:
+            fallback_reason = f"unexpected_shape:{raw_samples.shape}"
+        else:
+            values = np.asarray(raw_samples[:sample_count, 1 : 1 + tactile_manager.num_mags * 3], dtype=np.float32)
+            adjusted = values - baseline.reshape(1, -1)
+            sample_norms = [float(v) for v in np.linalg.norm(adjusted, axis=1)]
+            reference_norm = float(np.mean(sample_norms))
+            with tactile_manager.lock:
+                tactile_manager.latest = adjusted[-1].astype(np.float32).copy()
+                tactile_manager.latest_norm = float(sample_norms[-1])
+                tactile_manager.last_sample_perf_s = time.perf_counter()
+                tactile_manager.last_sample_unix_s = time.time()
+                tactile_manager.last_error = None
+    except Exception as exc:
+        fallback_reason = repr(exc)
+
+    if reference_norm is None:
+        with tactile_manager.lock:
+            reference_norm = float(tactile_manager.latest_norm)
+        print(
+            "[Tactile] Release reference sample mean fallback: "
+            f"reason={fallback_reason or 'unknown'}, latest_norm={reference_norm:.3f}"
+        )
+    else:
+        print(
+            "[Tactile] Release reference captured from sample mean: "
+            f"norm={reference_norm:.3f}, samples={len(sample_norms)}, "
+            f"sample_norms={[round(v, 3) for v in sample_norms]}"
+        )
+
+    tactile_manager.set_release_reference(reference_norm)
+    print_tactile_frame_log(tactile_manager, stage="release_reference", stage_time_s=0.0)
+    return reference_norm
+
+
 def execute_tactile_release_descent(
     controller,
     tactile_manager,
@@ -3747,6 +3818,15 @@ def execute_tactile_release_descent(
         0.0,
         float(getattr(args, "tactile_release_descent_poll_dt_s", DEFAULT_TACTILE_RELEASE_DESCENT_POLL_DT_S)),
     )
+    descent_speed_mps = max(
+        1e-6,
+        float(getattr(args, "tactile_release_descent_speed_mps", DEFAULT_TACTILE_RELEASE_DESCENT_SPEED_MPS)),
+    )
+    servo_hz = max(
+        1.0,
+        float(getattr(controller, "control_hz", getattr(args, "control_hz", DEFAULT_CONTROL_HZ))),
+    )
+    servo_interval_s = 1.0 / servo_hz
     # release reference 대비 tactile norm 변화량이 이 값보다 커지면 release trigger로 판단한다.
     delta_threshold = max(
         0.0,
@@ -3812,18 +3892,19 @@ def execute_tactile_release_descent(
         "[Tactile] Release descent start: "
         f"start=({start_x:.1f}, {start_y:.1f}, {start_z:.1f}), "
         f"target_z={min_z_mm:.1f}, "
+        f"speed={descent_speed_mps:.3f} m/s, servo_hz={servo_hz:.1f}, "
         f"delta_threshold={delta_threshold:.3f}."
     )
 
-    # 로봇에게 현재 x/y와 고정 orientation을 유지한 채 min_z까지 내려가라고 명령한다.
-    # 아래 while loop는 이 이동이 진행되는 동안 tactile trigger를 계속 감시한다.
-    send_robot_command(
-        controller,
-        ROBOT_CMD_MOVE_TO_POSITION,
-        target_position_base=mm_to_m_tuple([start_x, start_y, min_z_mm]),
-        fixed_orientation_base=fixed_orientation_base,
-        gripper_action=GRIPPER_HOLD,
-        source_mode="tactile_release_descent",
+    # servoL stream을 굶기지 않기 위해 긴 ref delay 대신 짧은 sample mean으로 기준값을 잡는다.
+    capture_tactile_release_reference_mean(
+        tactile_manager,
+        sample_count=getattr(
+            args,
+            "tactile_release_reference_sample_count",
+            DEFAULT_TACTILE_RELEASE_REFERENCE_SAMPLE_COUNT,
+        ),
+        timeout_s=0.08,
     )
 
     def fmt_debug_value(value, precision=6, suffix=""):
@@ -3964,19 +4045,6 @@ def execute_tactile_release_descent(
         )
         monitor_release_stop(trigger_info, stop_issue_perf, stop_return_perf)
 
-    def read_current_pose_mm():
-        # RTDE에서 현재 TCP pose를 읽는다.
-        state = controller.read_robot_state(now_timestamp=time.time())
-        if on_state_read is not None:
-            on_state_read(state)
-        pose = state.actual_tcp_pose_base
-        # pose를 못 읽으면 None을 반환해 바깥 loop에서 안전 정지한다.
-        if pose is None:
-            return None
-        # controller pose는 meter 단위이므로 mm 단위 tuple로 변환한다.
-        pose_mm = meters_to_mm(pose[:3])
-        return tuple(float(v) for v in pose_mm[:3])
-
     def check_trigger(pose_mm):
         # tactile sensor 전체 norm을 읽는다.
         current_norm = tactile_manager.total_norm()
@@ -4037,7 +4105,11 @@ def execute_tactile_release_descent(
         # 아직 release trigger 조건을 만족하지 못했다.
         return None
 
-    # move_to_position이 진행되는 동안 cancel, pose read, tactile trigger, min_z, timeout을 반복 확인한다.
+    planned_z_mm = float(current_pose_mm[2])
+    last_servo_perf = time.perf_counter() - servo_interval_s
+    next_tactile_check_perf = time.perf_counter()
+
+    # servoL을 control_hz에 맞춰 연속 전송하면서 tactile trigger, min_z, timeout을 확인한다.
     while True:
         # 외부 reset/shutdown 등이 들어오면 즉시 하강을 멈추고 실패 결과를 반환한다.
         if cancel_event is not None and cancel_event.is_set():
@@ -4049,10 +4121,32 @@ def execute_tactile_release_descent(
                 "reached_min_z": False,
                 "release_pose_mm": current_pose_mm,
             }
-        # 현재 로봇 TCP 위치[mm]를 읽는다.
-        pose_mm = read_current_pose_mm()
+
+        loop_start_perf = time.perf_counter()
+        loop_start_unix = time.time()
+        raw_dt = max(loop_start_perf - last_servo_perf, 1e-6)
+        profile_dt = float(np.clip(raw_dt, 0.002, 0.05))
+        last_servo_perf = loop_start_perf
+        planned_z_mm = max(min_z_mm, planned_z_mm - descent_speed_mps * 1000.0 * profile_dt)
+
+        command = make_robot_command(
+            ROBOT_CMD_SERVO_TO_POSITION,
+            target_position_base=mm_to_m_tuple([start_x, start_y, planned_z_mm]),
+            fixed_orientation_base=fixed_orientation_base,
+            gripper_action=GRIPPER_HOLD,
+            source_mode="tactile_release_descent",
+        )
+        try:
+            state = controller.step(command, now_timestamp=loop_start_unix, loop_dt=raw_dt)
+            if on_state_read is not None:
+                on_state_read(state)
+            pose = state.actual_tcp_pose_base
+        except Exception as exc:
+            pose = None
+            print(f"[WARN] Tactile release descent servo command failed: {exc}")
+
         # pose를 읽지 못하면 더 내려가는 것이 위험하므로 멈추고 현재 후보 pose에서 open하도록 반환한다.
-        if pose_mm is None:
+        if pose is None:
             tactile_manager.release_status = "release_descent_pose_missing"
             safe_stop_rtde(controller)
             print(
@@ -4066,19 +4160,28 @@ def execute_tactile_release_descent(
                 "release_pose_mm": current_pose_mm,
             }
         # 마지막으로 읽은 실제 TCP pose를 release 후보 pose로 갱신한다.
+        pose_mm = tuple(float(v) for v in meters_to_mm(pose[:3])[:3])
         current_pose_mm = pose_mm
 
-        # tactile 변화량이 threshold를 넘었는지 확인한다.
-        trigger_info = check_trigger(current_pose_mm)
-        if trigger_info is not None:
-            # trigger가 잡히면 하강 이동을 멈추고 현재 위치를 gripper open 위치로 반환한다.
-            stop_for_release_trigger(trigger_info)
-            return {
-                "triggered": True,
-                "timed_out": False,
-                "reached_min_z": False,
-                "release_pose_mm": current_pose_mm,
-            }
+        now_perf = time.perf_counter()
+        should_check_tactile = poll_dt <= 0.0 or now_perf >= next_tactile_check_perf
+        if should_check_tactile:
+            # tactile 변화량이 threshold를 넘었는지 확인한다.
+            trigger_info = check_trigger(current_pose_mm)
+            if poll_dt > 0.0:
+                while next_tactile_check_perf <= now_perf:
+                    next_tactile_check_perf += poll_dt
+            else:
+                next_tactile_check_perf = now_perf
+            if trigger_info is not None:
+                # trigger가 잡히면 하강 이동을 멈추고 현재 위치를 gripper open 위치로 반환한다.
+                stop_for_release_trigger(trigger_info)
+                return {
+                    "triggered": True,
+                    "timed_out": False,
+                    "reached_min_z": False,
+                    "release_pose_mm": current_pose_mm,
+                }
 
         # tactile trigger가 없어도 최저 z에 도달하면 더 내려가지 않고 현재 위치에서 open한다.
         if current_pose_mm[2] <= min_z_mm + tolerance_mm:
@@ -4109,9 +4212,11 @@ def execute_tactile_release_descent(
                 "reached_min_z": False,
                 "release_pose_mm": current_pose_mm,
             }
-        # 설정된 polling 주기만큼 쉬었다가 다시 tactile/pose 상태를 확인한다.
-        if poll_dt > 0.0:
-            time.sleep(poll_dt)
+        # servoL 명령이 control_hz에 맞춰 부드럽게 이어지도록 남은 tick 시간을 기다린다.
+        elapsed_s = time.perf_counter() - loop_start_perf
+        sleep_s = servo_interval_s - elapsed_s
+        if sleep_s > 0.0:
+            time.sleep(sleep_s)
 
 
 def reset_tactile_baseline_after_open(tactile_manager, delay_s, cancel_event=None):
@@ -4197,7 +4302,9 @@ def compute_place_target(shared_state):
 
     if grasp_offset is not None:
         #home_xyz[0] -= grasp_offset[0]
-        home_xyz[0] -= 210
+        home_xyz[0] = HOME_PLACE_X_MM
+        #home_xyz[0] -= 210
+    home_xyz[1] = HOME_PLACE_Y_MM
     home_xyz[0] += HOME_PLACE_X_OFFSET_MM
     home_xyz[1] += HOME_PLACE_Y_OFFSET_MM
     debug = {
@@ -4404,17 +4511,8 @@ def execute_return_and_place(
             print(f"[WARN] Move timed out during {source_mode}.")
             return False
 
-    # tactile release 모드에서는 놓기 전 현재 tactile 값을 기준값으로 캡처한다.
+    # tactile release 모드에서는 servo release descent 시작 직전에 짧은 sample mean으로 reference를 잡는다.
     if tactile_enabled:
-        capture_tactile_release_reference(
-            tactile_manager,
-            delay_s=getattr(args, "tactile_release_ref_delay_s", DEFAULT_TACTILE_RELEASE_REF_DELAY_S),
-            cancel_event=cancel_event,
-        )
-        # tactile reference 캡처 중 cancel되었으면 로봇을 멈추고 종료한다.
-        if cancel_event is not None and cancel_event.is_set():
-            safe_stop_rtde(controller)
-            return False
         # tactile 기반 하강 함수에 cancel_event를 선택적으로 넘기기 위한 kwargs다.
         descent_kwargs = {}
         if cancel_event is not None:
