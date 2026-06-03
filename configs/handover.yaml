@@ -411,7 +411,7 @@ perception:
       # 기본 template scale 방식입니다. uniform 또는 axis_xyz를 사용할 수 있습니다.
       mode: uniform
       # scale 초기화에 필요한 안정 frame 수입니다.
-      stable_frames: 8
+      stable_frames: 2 # 8
       # object extent 계산 lower percentile입니다.
       percentile_low: 5.0
       # object extent 계산 upper percentile입니다.
@@ -425,7 +425,7 @@ perception:
       min_cluster_extent_m: 1.0e-5
     icp:
       # ICP 입력에 사용할 최대 point 수입니다.
-      max_points: 3500
+      max_points: 3000 # 3500
       # ICP 최대 iteration 수입니다.
       max_iterations: 10
       # ICP correspondence 최대 거리입니다.
