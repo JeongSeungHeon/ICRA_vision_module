@@ -428,6 +428,7 @@ def run_replay(input_path: str | Path, args: argparse.Namespace) -> OfflineRepla
                 fitted_merged_object,
                 selected_hand,
                 fusion_state,
+                fallback_object=merged_object,
             )
 
             measured_object_point_base = live.choose_point(

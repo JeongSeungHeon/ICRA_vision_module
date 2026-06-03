@@ -78,9 +78,9 @@ HOVER_Z_OFFSET_MM = 0
 DESCEND_EXTRA_MM = 0.0
 BACKOFF_X_MM = 100.0
 DEFAULT_POST_RELEASE_Z_OFFSET_MM = 0.0
-HOME_PLACE_X_OFFSET_MM = -20.0
-HOME_PLACE_Y_OFFSET_MM = -27.0
-HOME_PLACE_MIN_Z_MM = 10.0
+HOME_PLACE_X_OFFSET_MM = 0.0
+HOME_PLACE_Y_OFFSET_MM = 0.0
+HOME_PLACE_MIN_Z_MM = 0.0 # 10.0
 PRE_RELEASE_MIN_Z_EPSILON_MM = 1e-3
 GRASP_POINT_Y_OFFSET_MM = -20.0
 GRASP_POINT_Z_OFFSET_MM = 10.0
@@ -93,7 +93,7 @@ DEFAULT_GRIPPER_POSITION_STALL_ENABLED = True
 DEFAULT_GRIPPER_POSITION_STALL_STABLE_READS = 3
 DEFAULT_GRIPPER_POSITION_STALL_TOLERANCE = 1
 DEFAULT_GRIPPER_POSITION_STALL_MIN_ELAPSED_S = 0.12
-RELEASE_PARAMETER_MM = 80.0
+RELEASE_PARAMETER_MM = 30.0
 DEFAULT_TACTILE_PORT = "/dev/ttyACM0"
 DEFAULT_TACTILE_NUM_MAGS = 5
 DEFAULT_TACTILE_BASELINE_SAMPLES = 5
@@ -115,8 +115,10 @@ DEFAULT_POST_BACKOFF_STOP_SPEED_THRESHOLD_MPS = 0.002
 DEFAULT_POST_BACKOFF_STOP_TIMEOUT_S = 1.0
 DEFAULT_POST_BACKOFF_STOP_POLL_DT_S = 0.01
 DEFAULT_POST_BACKOFF_STOP_REQUIRE_CONFIRMED = False
-HOME_JOINTS_DEG = [0.0, -135.0, 135.0, 0.0, 90.0, 0.0]
+# HOME_JOINTS_DEG = [0.0, -135.0, 135.0, 0.0, 90.0, 0.0]
 # HOME_JOINTS_DEG = [0.0, -116.0, 128.0, -12.0, 90.0, 0.0]
+# HOME_JOINTS_DEG = [0.0, -78.0, 135.0, -56.81, 90.0, 0.0]
+HOME_JOINTS_DEG = [-26.21, -81.29, 139.5, -58, 63.79, 0.0]
 HOME_JOINT_TOLERANCE_DEG = 1.0
 HOME_JOINT_SPEED_RAD_S = 0.5
 HOME_JOINT_ACCELERATION_RAD_S2 = 0.5
@@ -1007,7 +1009,7 @@ def get_close_range_step_mm(ref_err_xyz, max_step_mm, max_step_z_mm):
     """Use smaller servo steps near the object for gentler final alignment."""
     dist_xy = float(np.linalg.norm(np.asarray(ref_err_xyz, dtype=np.float32)[:2]))
     if dist_xy < 95.0:
-        return 7, 2.2, dist_xy
+        return 7, 5, dist_xy
     return float(max_step_mm), float(max_step_z_mm), dist_xy
 
 
@@ -5544,6 +5546,7 @@ def main():
                     fitted_merged_object,
                     selected_hand,
                     fusion_state,
+                    fallback_object=merged_object,
                 )
                 # previous_hand_approach = bool(
                 #     fusion_state.hand_approach_detected or fusion_state.hand_approach_latched

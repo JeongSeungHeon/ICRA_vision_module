@@ -175,8 +175,8 @@ class DataInferenceTests(unittest.TestCase):
                 )
 
         class GraspPlanner:
-            def process_states(self, fitted_merged_object, selected_hand, fusion_state):
-                del fitted_merged_object, selected_hand, fusion_state
+            def process_states(self, fitted_merged_object, selected_hand, fusion_state, *, fallback_object=None):
+                del fitted_merged_object, selected_hand, fusion_state, fallback_object
                 return SimpleNamespace(valid=False, target_position_base=None)
 
         class Fallback:
