@@ -28,12 +28,12 @@ cameras:
   cam0:
     # DualSensorHub가 cam0 RealSense 장치를 열 때 사용할 serial입니다.
     serial: "148522072369"
-    # # cam0 color/depth stream 폭입니다. 실행 인자 --width가 있으면 런타임에 override됩니다.
-    # width: 640
-    # # cam0 color/depth stream 높이입니다. 실행 인자 --height가 있으면 런타임에 override됩니다.
-    # height: 480
-    # # cam0 stream FPS입니다. 실행 인자 --fps가 있으면 런타임에 override됩니다.
-    # fps: 30
+    # cam0 color/depth stream 폭입니다.
+    width: 640
+    # cam0 color/depth stream 높이입니다.
+    height: 480
+    # cam0 stream FPS입니다.
+    fps: 30
     depth_filters:
       spatial:
         # RealSense spatial depth filter 사용 여부입니다.
@@ -71,11 +71,11 @@ cameras:
     # DualSensorHub가 cam1 RealSense 장치를 열 때 사용할 serial입니다.
     #serial: "327122075999"
     serial: "335222076328"
-    # cam1 color/depth stream 폭입니다. cam0와 같아야 하며 --width로 override됩니다.
+    # cam1 color/depth stream 폭입니다. cam0와 같아야 합니다.
     width: 640
-    # cam1 color/depth stream 높이입니다. cam0와 같아야 하며 --height로 override됩니다.
+    # cam1 color/depth stream 높이입니다. cam0와 같아야 합니다.
     height: 480
-    # cam1 stream FPS입니다. cam0와 같아야 하며 --fps로 override됩니다.
+    # cam1 stream FPS입니다. cam0와 같아야 합니다.
     fps: 30
     depth_filters:
       spatial:
@@ -129,62 +129,23 @@ perception:
     # fusion 단계에서 object/hand state가 오래됐는지 판단하는 timeout입니다.
     stale_timeout_sec: 0.30
 
-  depth_completion:
-    fdct:
-      # 실행 인자로 지정하지 않았을 때 FDCT depth completion을 사용할지 정합니다.
-      enabled: false
-      # FDCT를 적용할 카메라 선택입니다. cam0, cam1, both, none 중 하나입니다.
-      cameras: both
-      # FDCT checkpoint 경로입니다.
-      checkpoint: FDCT/TransCG.tar
-      # FDCT 실행 device입니다. auto, cpu, cuda 등을 사용할 수 있습니다.
-      device: auto
-      # FDCT 네트워크 입력 폭입니다.
-      net_width: 320
-      # FDCT 네트워크 입력 높이입니다.
-      net_height: 240
-      # FDCT 전처리에서 유효 depth 최소값입니다.
-      depth_min: 0.30
-      # FDCT 전처리에서 유효 depth 최대값입니다.
-      depth_max: 1.70
-      # FDCT 입력 depth normalize scale입니다.
-      depth_norm: 1.0
-      # FDCT 입력 depth coefficient입니다.
-      depth_coeff: 10.0
-      # invalid depth 영역을 inpaint해서 FDCT에 넣을지 정합니다.
-      inpaint: true
-      # FDCT 출력 depth에 bilateral filter를 후처리로 적용할지 정합니다.
-      bilateral_enabled: true
-      # bilateral filter radius입니다.
-      bilateral_radius: 2
-      # bilateral filter 공간 sigma입니다.
-      bilateral_sigma_space: 2.0
-      # bilateral filter에서 far depth cutoff로 쓰는 값입니다.
-      bilateral_zfar: 100.0
-      # FDCT 실패 시 원본 RealSense depth로 계속 진행할지 정합니다.
-      fallback_to_raw: true
-      # FDCT raw/completed depth 통계를 출력할지 정합니다.
-      debug_stats: false
-      # FDCT 경고/통계를 몇 번마다 출력할지 정합니다.
-      debug_every: 30
-
   object:
     # segmentation label이 없을 때 ObjectState에 넣을 fallback label입니다.
     target_label: cup
     # 선택된 segmentation confidence가 이 값 미만이면 object를 invalid 처리합니다.
     confidence_threshold: 0.15
     segmentation:
-      # YOLOE segmentation weights/model 이름입니다. 실행 인자 --model이 있으면 override됩니다.
+      # YOLOE segmentation weights/model 이름입니다.
       model_name: yoloe-26l-seg.pt
-      # YOLOE text prompt class 목록입니다. 실행 인자 --prompt가 있으면 override됩니다.
+      # YOLOE text prompt class 목록입니다.
       prompt_classes: ["cup", "wine glass", "box-shaped snack", "bottle"]
-      # segmentation inference image size입니다. 실행 인자 --imgsz가 있으면 override됩니다.
+      # segmentation inference image size입니다.
       imgsz: 640
-      # YOLOE inference confidence threshold입니다. 실행 인자 --conf가 있으면 override됩니다.
-      # conf: 0.15
-      # NMS IoU threshold입니다. 실행 인자 --iou가 있으면 override됩니다.
+      # YOLOE inference confidence threshold입니다.
+      conf: 0.25
+      # NMS IoU threshold입니다.
       iou: 0.45
-      # frame당 최대 detection 수입니다. 실행 인자 --max-det가 있으면 override됩니다.
+      # frame당 최대 detection 수입니다.
       max_det: 100
       # Ultralytics device 문자열입니다. null이면 자동 선택입니다.
       device: null
@@ -196,6 +157,8 @@ perception:
       retina_masks: true
       # cup과 wine glass가 동시에 잡히면 confidence와 무관하게 wine glass mask를 선택합니다.
       prefer_wine_glass_over_cup: true
+      # downstream instance 선택 정책입니다: all_instances, highest_score, class_filter.
+      selection_mode: highest_score
       # 특정 class를 우선 선택해야 할 때 사용할 class 이름 목록입니다.
       selection_class_names: ["wine glass", "box-shaped snack", "cup", "bottle"]
       preprocess:
@@ -239,28 +202,6 @@ perception:
       min_points_per_camera: 300
     # cam0/cam1 병합 후 downsample voxel size입니다.
     merged_voxel_size_m: 0.006
-
-  fill_level_estimation:
-    # 내용물이 비어 있다고 강제할지 정합니다.
-    fillings_empty: true
-    # container mask ROI의 좌우 shrink 비율입니다.
-    roi_shrink_x: 0.18
-    # ROI 상단 shrink 비율입니다.
-    roi_shrink_top: 0.08
-    # ROI 하단 shrink 비율입니다.
-    roi_shrink_bottom: 0.05
-    # vertical profile smoothing/neighbor 크기입니다.
-    profile_k: 3
-    # 내용물 상단 위치 추정 보정 pixel입니다.
-    rice_top_bias_px: 5
-    # 바닥 중심 pixel 추정 보정값입니다.
-    bottom_center_offset_px: 5
-    # fill 계산에 사용할 최소 depth입니다.
-    min_depth_m: 0.05
-    # fill 계산에 사용할 최대 depth입니다.
-    max_valid_depth_m: 1.8
-    # 특정 pixel depth를 읽을 때 주변 patch 반경의 절반 크기입니다.
-    depth_patch_half: 4
 
   hand:
     detector:
@@ -552,7 +493,7 @@ robot:
   return_sequence:
     # true이면 PLACE 도착 후 gripper open 전에 아래 방향으로 한 번 더 이동합니다.
     pre_release_descend_enabled: true
-    # gripper open 전 추가 하강 거리입니다. 기본 코드 상수 RELEASE_PARAMETER_MM와 같은 10 mm입니다.
+    # gripper open 전 추가 하강 거리입니다.
     pre_release_descend_m: 0.00
     # gripper release 후 x backoff 전에 robot base +Z 방향으로 올릴 거리입니다.
     post_release_z_offset_m: -0.03
@@ -584,14 +525,8 @@ robot:
     extra_grasp_pos: 10 #20
     # place/release 위치에서 held reference 대비 이 delta 이상이면 release timing으로 봅니다.
     release_delta_threshold: 30
-    # legacy 고정 release reference 대기 시간입니다. 현재 servo release descent에서는 사용하지 않습니다.
-    release_ref_delay_s: 0.3
-    # 고정 위치 release trigger 대기용 timeout입니다. tactile continuous descent에서는 min_z가 fallback 한계입니다.
-    # release_timeout_s: 1.0
     # tactile release descent에서 허용할 최소 robot base Z입니다.
     release_descent_min_z_mm: 0.0
-    # legacy step mode용 값입니다. 현재 single-target tactile release descent에서는 사용하지 않습니다.
-    release_descent_step_mm: 2.0
     # tactile release descent 중 tactile trigger 확인/로그 주기입니다. servo 명령 주기는 rtde control_hz를 따릅니다.
     release_descent_poll_dt_s: 0.03
     # servo release descent에서 robot base -Z 방향으로 내려가는 속도입니다.
@@ -609,17 +544,17 @@ robot:
     # 실제 정지 관찰 중 RTDE state/isSteady polling 주기입니다.
     release_stop_monitor_poll_dt_s: 0.005
     # tactile debug log 출력 여부입니다.
-    debug: false
+    debug: true
 
   live_follow:
-    # robot_control_loop servo 주기입니다. 실행 인자 --control-hz가 있으면 override됩니다.
+    # RobotWorker follow servo 주기입니다.
     control_hz: 30.0
-    # z축까지 follow할지 정합니다. 실행 인자 --follow-z/--no-follow-z가 있으면 override됩니다.
+    # z축까지 follow할지 정합니다.
     follow_z: true
 
   rtde:
-    # UR robot IP입니다. 실행 인자 --robot-ip가 있으면 override됩니다.
-    # robot_ip: 192.168.56.101
+    # UR robot IP입니다.
+    robot_ip: 192.168.56.101
     # UR dashboard port입니다.
     dashboard_port: 29999
     # RTDE controller 내부 control 주기입니다.

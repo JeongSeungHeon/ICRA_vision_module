@@ -6,7 +6,7 @@ This repository is currently organized around one active handover pipeline:
 bash run_fitting_final.sh
 ```
 
-The main script runs dual RealSense perception, object segmentation, hand pose lifting, point-cloud fusion, template shape fitting, fill-level estimation, grasp target generation, UR RTDE control, Robotiq gripper control, metadata logging, and web-assisted video recording.
+The main script runs dual RealSense perception, object segmentation, hand pose lifting, point-cloud fusion, template shape fitting, grasp target generation, UR RTDE control, Robotiq gripper control, metadata logging, and web-assisted video recording.
 
 ## Main Entry Point
 
@@ -18,8 +18,7 @@ The launcher currently runs:
 
 ```bash
 python robot_control_rtde_fitting_final.py \
-  --select-mode highest_score \
-  --enable-follow --follow-z
+  --enable-follow
 ```
 
 ## Active Layout
@@ -30,14 +29,13 @@ These paths are part of the current runtime path:
 - `configs/handover.yaml`: active dual-camera, perception, grasp, RTDE, and workspace config
 - `calibration/`, `camera_parameters/`: camera-to-robot calibration chain
 - `system/`: dual RealSense frame hub and shared state dataclasses
-- `perception/`: object, hand, fusion, grasp, shape fitting, fill-level, and FDCT helpers
+- `perception/`: object, hand, fusion, grasp, and shape-fitting helpers
 - `object_pt_extraction/`: segmentation and point-cloud utilities
 - `robot/`: RTDE and Robotiq gripper controller code
 - `utils/`: RealSense, metadata, preprocessing, and depth helpers
 - `handpose3d/`: hand pose lifting support
 - `shape_fitting/`: template point clouds used by `ShapeFittingTracker`
 - `video_record.py`: local web UI and recording service for handover videos
-- `FDCT/`: optional depth-completion model assets
 - `benchmarks/`: benchmark and metadata helper scripts
 
 Legacy runners and older visualization scripts have been moved under:
@@ -61,7 +59,6 @@ Expected hardware/runtime pieces:
 - Robotiq gripper daemon/socket access if gripper control is enabled
 - Local YOLOE weights, for example `yoloe-26l-seg.pt`
 - Open3D for shape fitting
-- Optional FDCT checkpoint at `FDCT/TransCG.tar` if FDCT depth completion is enabled
 
 ## Configuration
 
@@ -71,12 +68,10 @@ Important sections:
 
 - `cameras`: RealSense serials, resolution, fps, and depth filters
 - `calibration`: cam0-to-base and cam1-to-cam0 transform files
-- `perception.depth_completion.fdct`: optional FDCT depth completion
 - `perception.object`: YOLOE segmentation and object point-cloud parameters
 - `perception.hand`: MediaPipe hand detection and depth lifting parameters
 - `perception.fusion`: temporal filtering and hand-approach activation
 - `perception.shape_fitting`: template library, clustering, scale init, ICP, and output downsampling
-- `perception.fill_level_estimation`: cup/glass fill-level estimator parameters
 - `grasp`: grasp target selection and hand-relative dropout fallback
 - `home_pose`: startup and post-task home pose
 - `robot`: RTDE, gripper, grasp verification, and frame mapping
@@ -109,23 +104,15 @@ Or call the script directly:
 ```bash
 python robot_control_rtde_fitting_final.py \
   --config configs/handover.yaml \
-  --select-mode highest_score \
-  --enable-follow \
-  --follow-z
+  --enable-follow
 ```
 
 Useful options:
 
 - `--config`: alternate YAML config path
-- `--model`: YOLOE model or local weights path
-- `--prompt`: segmentation prompt classes
-- `--select-mode`: instance selection policy
-- `--robot-ip`: override `robot.rtde.robot_ip`
 - `--enable-follow`: enable RTDE follow thread
-- `--follow-z` / `--no-follow-z`: toggle Z-axis following
 - `--open-gripper`: open gripper during startup
 - `--show-depth`: show a cam0 depth preview window
-- `--enable-fdct-depth` / `--disable-fdct-depth`: override FDCT setting from config
 - `--profile-runtime`: collect CPU/RAM/GPU/VRAM and stage timing logs for hardware sizing
 
 For the full CLI:
@@ -139,9 +126,7 @@ Runtime profiling example:
 ```bash
 python robot_control_rtde_fitting_final.py \
   --config configs/handover.yaml \
-  --select-mode highest_score \
   --enable-follow \
-  --follow-z \
   --profile-runtime
 ```
 
@@ -156,12 +141,11 @@ At a high level, the final script does this:
 3. Builds per-camera object point clouds and merges them in robot base frame.
 4. Runs hand pose detection and selects the active hand.
 5. Fits the configured object template with `perception.shape_fitting_tracker_v2`.
-6. Estimates fill level and updates handover metadata.
-7. Computes a grasp target from fitted object geometry and hand state.
-8. Follows the target with UR RTDE until the direct grasp trigger fires.
-9. Closes the gripper, verifies grasp, records contact timing, and saves grasp offset.
-10. Returns to the home/object placement area, opens the gripper, and records delivery metadata.
-11. Keeps a local video recorder UI available for saving/discarding task videos.
+6. Computes a grasp target from fitted object geometry and hand state.
+7. Follows the target with UR RTDE until the direct grasp trigger fires.
+8. Closes the gripper, verifies grasp, records contact timing, and saves grasp offset.
+9. Returns to the home/object placement area, opens the gripper, and records delivery metadata.
+10. Keeps a local video recorder UI available for saving/discarding task videos.
 
 ## Keyboard Controls
 

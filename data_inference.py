@@ -52,23 +52,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefix", default="offline_inference", help="Output filename prefix.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Runtime YAML config.")
 
-    parser.add_argument("--model", default="yoloe-26l-seg.pt", help="Model name or local weights path.")
-    parser.add_argument("--prompt", nargs="*", default=None, help="YOLOE text prompt classes.")
-    parser.add_argument("--imgsz", type=int, default=640, help="YOLO inference image size.")
-    parser.add_argument("--conf", type=float, default=0.25, help="YOLO confidence threshold.")
-    parser.add_argument("--iou", type=float, default=0.45, help="YOLO NMS IoU threshold.")
-    parser.add_argument("--max-det", type=int, default=100, help="Maximum detections per frame.")
-    parser.add_argument("--device", default=None, help="Ultralytics device string, e.g. cpu, 0, cuda:0.")
-    parser.add_argument("--classes", nargs="*", type=int, default=None, help="Optional class id filter.")
-    parser.add_argument(
-        "--select-mode",
-        choices=["all_instances", "highest_score", "class_filter"],
-        default="all_instances",
-        help="Instance selection policy for object point cloud generation.",
-    )
-    parser.add_argument("--select-class", nargs="*", default=None, help="Optional class-name filter.")
-    parser.add_argument("--half", action="store_true", help="Enable FP16 inference when supported.")
-
     parser.add_argument("--fps", type=int, default=30, help="Timestamp fallback FPS for recordings missing timestamps.")
     parser.add_argument("--start-frame", type=int, default=0, help="First source frame index to process.")
     parser.add_argument("--end-frame", type=int, default=None, help="Exclusive source frame index stop.")
@@ -251,14 +234,6 @@ def build_offline_snapshot(data: dict[str, Any], source_index: int, replay_index
     )
 
 
-def infer_input_size(data: dict[str, Any]) -> tuple[int, int]:
-    first_color = np.asarray(data["cam0_color_image"][0])
-    if first_color.ndim < 2:
-        raise ValueError(f"cam0_color_image has invalid shape: {first_color.shape}")
-    height, width = first_color.shape[:2]
-    return int(width), int(height)
-
-
 def _ensure_repo_root_on_path() -> None:
     repo_root = Path(__file__).resolve().parent
     if str(repo_root) not in sys.path:
@@ -272,51 +247,9 @@ def _load_live_module():
     return live
 
 
-def prepare_runtime_args(args: argparse.Namespace, data: dict[str, Any]) -> argparse.Namespace:
-    runtime_args = copy.copy(args)
-    width, height = infer_input_size(data)
-    runtime_args.width = width
-    runtime_args.height = height
-
-    # Robot/control fields are not used for offline inference, but the live
-    # config-default helper expects them to exist.
-    runtime_args.serial = None
-    runtime_args.robot_ip = None
-    runtime_args.control_hz = None
-    runtime_args.follow_z = None
-    runtime_args.workspace_x = None
-    runtime_args.workspace_y = None
-    runtime_args.workspace_z = None
-    runtime_args.enable_follow = False
-    runtime_args.move_to_base = False
-    runtime_args.open_gripper = False
-    runtime_args.verbose_robot = False
-    runtime_args.min_valid_count = 3
-    runtime_args.target_timeout_s = 0.5
-    runtime_args.position_tolerance_m = 0.01
-    runtime_args.move_timeout_s = 10.0
-    runtime_args.gripper_close_timeout_s = 2.0
-    runtime_args.gripper_release_dwell_s = 0.5
-    runtime_args.pre_release_descend_before_open = None
-    runtime_args.pre_release_descend_m = None
-    runtime_args.follow_handoff_timeout_s = 5.0
-    runtime_args.enable_target_prediction = True
-    runtime_args.prediction_max_horizon_s = 0.25
-    runtime_args.prediction_process_noise_mm_s2 = 800.0
-    runtime_args.prediction_measurement_noise_mm = 25.0
-    runtime_args.prediction_max_xy_speed_mm_s = 200.0
-    runtime_args.prediction_reinit_jump_mm = 120.0
-    runtime_args.show_depth = False
-    runtime_args.depth_max_m = 1.5
-    runtime_args.debug_3d = True
-    runtime_args.debug_3d_dir = str(args.output_dir)
-    runtime_args.disable_debug_3d_recording = False
-    runtime_args.record_video = False
-    runtime_args.profile_runtime = False
-    runtime_args.profile_dir = "output/runtime_profile"
-    runtime_args.profile_sample_interval_s = 1.0
-    runtime_args.profile_print_every_s = 0.0
-    return runtime_args
+def prepare_runtime_args(args: argparse.Namespace) -> argparse.Namespace:
+    """Copy offline-only arguments before YAML runtime settings are attached."""
+    return copy.copy(args)
 
 
 def close_pipeline(pipeline: dict[str, Any]) -> None:
@@ -350,7 +283,7 @@ def run_replay(input_path: str | Path, args: argparse.Namespace) -> OfflineRepla
         raise ValueError(f"No frames selected from {input_path}")
 
     live = _load_live_module()
-    runtime_args = prepare_runtime_args(args, data)
+    runtime_args = prepare_runtime_args(args)
     config = live.load_yaml_config(runtime_args.config)
     runtime_args = live.apply_config_defaults(runtime_args, config)
     pipeline = live.build_dual_perception_pipeline(runtime_args)

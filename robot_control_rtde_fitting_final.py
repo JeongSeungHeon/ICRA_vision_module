@@ -20,12 +20,7 @@ import numpy as np
 import yaml
 
 from calibration.extrinsics import load_transform_chain
-from object_pt_extraction.segmentation_engine import (
-    SegmentationEngine,
-    parse_prompt_classes,
-)
 from perception.fusion import PerceptionFusion
-#from perception.fill_level_estimator import FillLevelEstimator
 from perception.grasp_target import GraspTargetPlanner
 from perception.grasp_z_stabilizer import GraspPointZStabilizer
 from perception.hand_relative_fallback import HandRelativeFallbackTracker
@@ -65,7 +60,6 @@ MOTION_TRIGGER_MM = 50.0
 MOTION_TRIGGER_Z_MM = 50.0
 
 # control loop
-DEFAULT_CONTROL_HZ = 30.0
 MAX_XY_SPEED_MM_S = 250.0 # 80
 MAX_Z_SPEED_MM_S = 250.0  # 80
 
@@ -77,7 +71,6 @@ EEF_Y_OFFSET_MM = 0.0
 HOVER_Z_OFFSET_MM = 0
 DESCEND_EXTRA_MM = 0.0
 BACKOFF_X_MM = 100.0
-DEFAULT_POST_RELEASE_Z_OFFSET_MM = 0.0
 HOME_PLACE_X_MM = 800.0
 HOME_PLACE_Y_MM = 0.0
 HOME_PLACE_X_OFFSET_MM = 0.0
@@ -90,35 +83,7 @@ PLACE_Z_GRASP_BUFFER_FRAMES = 5
 PLACE_Z_MIN_VALID_SAMPLES = 3
 GRIPPER_FORCE_STOP_DELTA_N = 100000
 GRIPPER_FORCE_STOP_MIN_ELAPSED_S = 0.12
-DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD = 200
-DEFAULT_GRIPPER_POSITION_STALL_ENABLED = True
-DEFAULT_GRIPPER_POSITION_STALL_STABLE_READS = 3
-DEFAULT_GRIPPER_POSITION_STALL_TOLERANCE = 1
-DEFAULT_GRIPPER_POSITION_STALL_MIN_ELAPSED_S = 0.12
 RELEASE_PARAMETER_MM = 30.0
-DEFAULT_TACTILE_PORT = "/dev/ttyACM0"
-DEFAULT_TACTILE_NUM_MAGS = 5
-DEFAULT_TACTILE_BASELINE_SAMPLES = 5
-DEFAULT_TACTILE_STARTUP_DELAY_S = 1.0
-DEFAULT_TACTILE_CONTACT_NORM_THRESHOLD = 30.0
-DEFAULT_TACTILE_EXTRA_GRASP_POS = 10
-DEFAULT_TACTILE_RELEASE_DELTA_THRESHOLD = 50.0
-DEFAULT_TACTILE_RELEASE_REF_DELAY_S = 0.3
-DEFAULT_TACTILE_RELEASE_TIMEOUT_S = 1.0
-DEFAULT_TACTILE_RELEASE_DESCENT_STEP_MM = 2.0
-DEFAULT_TACTILE_RELEASE_DESCENT_POLL_DT_S = 0.03
-DEFAULT_TACTILE_RELEASE_DESCENT_SPEED_MPS = 0.03
-DEFAULT_TACTILE_RELEASE_REFERENCE_SAMPLE_COUNT = 2
-DEFAULT_TACTILE_AUTO_BASELINE_RESET_AFTER_OPEN_S = 1.5
-DEFAULT_TACTILE_RELEASE_STOP_TIMING_DEBUG = False
-DEFAULT_TACTILE_RELEASE_STOP_SPEED_THRESHOLD_MPS = 0.002
-DEFAULT_TACTILE_RELEASE_STOP_MONITOR_TIMEOUT_S = 1.0
-DEFAULT_TACTILE_RELEASE_STOP_MONITOR_POLL_DT_S = 0.005
-DEFAULT_POST_BACKOFF_STOP_CHECK_ENABLED = True
-DEFAULT_POST_BACKOFF_STOP_SPEED_THRESHOLD_MPS = 0.002
-DEFAULT_POST_BACKOFF_STOP_TIMEOUT_S = 1.0
-DEFAULT_POST_BACKOFF_STOP_POLL_DT_S = 0.01
-DEFAULT_POST_BACKOFF_STOP_REQUIRE_CONFIRMED = False
 # HOME_JOINTS_DEG = [0.0, -135.0, 135.0, 0.0, 90.0, 0.0]
 # HOME_JOINTS_DEG = [0.0, -116.0, 128.0, -12.0, 90.0, 0.0]
 # HOME_JOINTS_DEG = [0.0, -78.0, 135.0, -56.81, 90.0, 0.0]
@@ -129,6 +94,7 @@ HOME_JOINT_ACCELERATION_RAD_S2 = 0.5
 VIDEO_RECORDER_SERIAL = "335522072904"
 VIDEO_RECORDER_PORT = 5000
 
+# 로봇에게 보내는 명령
 ROBOT_REQ_INIT_ROBOT = "INIT_ROBOT"
 ROBOT_REQ_START_FOLLOW = "START_FOLLOW"
 ROBOT_REQ_STOP_FOLLOW = "STOP_FOLLOW"
@@ -145,6 +111,7 @@ ROBOT_URGENT_REQUESTS = {
     ROBOT_REQ_SHUTDOWN,
 }
 
+# 로봇의 현재 진행 상태
 ROBOT_STATE_IDLE = "IDLE"
 ROBOT_STATE_INITIALIZING = "INITIALIZING"
 ROBOT_STATE_FOLLOWING = "FOLLOWING"
@@ -190,51 +157,20 @@ class RobotStatus:
 
 
 def parse_args():
-    """Parse CLI switches for perception, robot follow, debugging, and profiling."""
+    """Parse runtime-only CLI switches; persistent settings live in YAML."""
     parser = argparse.ArgumentParser(
         description="Run dual-camera perception, build a grasp target from hand pose + merged object cloud, and follow it with UR5 RTDE."
     )
-    parser.add_argument("--model", default="yoloe-26l-seg.pt", help="Model name or local weights path.")
-    parser.add_argument(
-        "--prompt",
-        nargs="*",
-        default=None,
-        help="Text prompt classes for YOLOE, e.g. --prompt person bus or --prompt person,bus",
-    )
-    parser.add_argument("--serial", default=None, help="Legacy single-camera option. Ignored in dual-camera grasp-target mode.")
-    parser.add_argument("--width", type=int, default=640, help="Color/depth stream width.")
-    parser.add_argument("--height", type=int, default=480, help="Color/depth stream height.")
-    parser.add_argument("--fps", type=int, default=30, help="RealSense stream FPS.")
-    parser.add_argument("--imgsz", type=int, default=640, help="Inference image size.")
-    parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold.")
-    parser.add_argument("--iou", type=float, default=0.45, help="NMS IoU threshold.")
-    parser.add_argument("--max-det", type=int, default=100, help="Maximum detections per frame.")
-    parser.add_argument("--device", default=None, help="Ultralytics device string, e.g. cpu, 0, 0,1.")
-    parser.add_argument("--classes", nargs="*", type=int, default=None, help="Optional class id filter.")
-    parser.add_argument(
-        "--select-mode",
-        choices=["all_instances", "highest_score", "class_filter"],
-        default="all_instances",
-        help="Instance selection policy for downstream processing.",
-    )
-    parser.add_argument(
-        "--select-class",
-        nargs="*",
-        default=None,
-        help="Optional class-name filter used with selection.",
-    )
-    parser.add_argument("--half", action="store_true", help="Enable FP16 inference on supported devices.")
     #parser.add_argument("--show-depth", action="store_true", help="Show a second depth preview window.")
     parser.add_argument("--depth-max-m", type=float, default=1.5, help="Upper bound for depth visualization.")
     parser.add_argument(
         "--config",
         default=str(DEFAULT_CONFIG_PATH),
-        help="YAML config used by the existing UR5 RTDE controller.",
+        help="YAML config used by cameras, perception, and robot control.",
     )
 
     # UR5 RTDE follow options
     parser.add_argument("--enable-follow", action="store_true", help="Enable UR5 RTDE follow mode.")
-    parser.add_argument("--robot-ip", type=str, default="192.168.56.101", help="Optional UR5 IP override.")
     parser.add_argument("--min-valid-count", type=int, default=3, help="Min consecutive valid detections before follow.")
     parser.add_argument("--target-timeout-s", type=float, default=0.5, help="Stop following if target is stale.")
     # parser.add_argument("--workspace-x", nargs=2, type=float, default=None, help="Workspace X limits in mm.")
@@ -243,27 +179,10 @@ def parse_args():
     parser.add_argument("--move-to-base", action="store_true", help="Reserved for compatibility; HOME now uses joint targets.")
     parser.add_argument("--open-gripper", action="store_true", help="Open gripper during init.")
     parser.add_argument("--verbose-robot", action="store_true", help="Print detailed robot command logs.")
-    parser.add_argument("--follow-z", dest="follow_z", action="store_true", help="Enable z-axis follow.")
-    parser.add_argument("--no-follow-z", dest="follow_z", action="store_false", help="Disable z-axis follow.")
-    parser.set_defaults(follow_z=None)
-    parser.add_argument("--control-hz", type=float, default=None, help="Servo loop rate. Defaults to config or 30 Hz.")
     parser.add_argument("--position-tolerance-m", type=float, default=0.01, help="Move completion tolerance in meters.")
     parser.add_argument("--move-timeout-s", type=float, default=10.0, help="Timeout for blocking move steps.")
     parser.add_argument("--gripper-close-timeout-s", type=float, default=2.0, help="Timeout for force/current grasp verification.")
     parser.add_argument("--gripper-release-dwell-s", type=float, default=0.5, help="Dwell after opening gripper.")
-    parser.add_argument(
-        "--enable-pre-release-descend-before-open",
-        dest="pre_release_descend_before_open",
-        action="store_true",
-        help="Descend in Z before opening the gripper at PLACE. Defaults to config.",
-    )
-    parser.add_argument(
-        "--pre-release-descend-m",
-        type=float,
-        default=None,
-        help="Optional pre-release descend distance in meters. Defaults to RELEASE_PARAMETER_MM.",
-    )
-    parser.set_defaults(pre_release_descend_before_open=None)
     parser.add_argument("--follow-handoff-timeout-s", type=float, default=5.0, help="Timeout to wait for the follow thread to release robot control before pregrasp.")
     parser.add_argument(
         "--enable-target-prediction",
@@ -378,17 +297,10 @@ def parse_args():
         help="Print a short runtime profiling summary every N seconds. Use 0 to disable.",
     )
     parser.add_argument(
-        "--debug-tactile",
-        dest="tactile_debug",
-        action="store_true",
-        default=None,
-        help="Record gripper/tactile release diagnostics in memory and save them as JSON with the 's' key.",
-    )
-    parser.add_argument(
         "--debug-tactile-dir",
         type=str,
         default="output/gripper_debug",
-        help="Directory where --debug-tactile JSON diagnostics are written.",
+        help="Directory for tactile diagnostic JSON when robot.tactile.debug is enabled in YAML.",
     )
     return parser.parse_args()
 
@@ -419,58 +331,38 @@ def get_video_recorder_tactile_logging_config(config):
 
 
 def apply_config_defaults(args, config):
-    """Fill CLI defaults from config while keeping explicit command-line values."""
+    """Load YAML-owned robot, safety, and tactile settings onto runtime args."""
     robot_cfg = config.get("robot", {})
     live_cfg = robot_cfg.get("live_follow", {})
     return_sequence_cfg = robot_cfg.get("return_sequence", {})
     tactile_cfg = robot_cfg.get("tactile", {})
-    rtde_cfg = robot_cfg.get("rtde", {})
     safety_cfg = config.get("safety", {})
     workspace_cfg = safety_cfg.get("workspace_bounds_m", {})
 
-    if args.robot_ip is None:
-        args.robot_ip = rtde_cfg.get("robot_ip")
-    if args.control_hz is None:
-        args.control_hz = float(live_cfg.get("control_hz", DEFAULT_CONTROL_HZ))
-    if args.follow_z is None:
-        args.follow_z = bool(live_cfg.get("follow_z", False))
+    args.control_hz = float(live_cfg["control_hz"])
+    args.follow_z = bool(live_cfg["follow_z"])
     args.post_release_z_offset_mm = (
-        float(return_sequence_cfg.get("post_release_z_offset_m", DEFAULT_POST_RELEASE_Z_OFFSET_MM / 1000.0)) * 1000.0
+        float(return_sequence_cfg["post_release_z_offset_m"]) * 1000.0
     )
-    if args.pre_release_descend_before_open is None:
-        args.pre_release_descend_before_open = bool(return_sequence_cfg.get("pre_release_descend_enabled", False))
-    pre_release_descend_m = (
-        args.pre_release_descend_m
-        if args.pre_release_descend_m is not None
-        else return_sequence_cfg.get("pre_release_descend_m", RELEASE_PARAMETER_MM / 1000.0)
-    )
+    args.pre_release_descend_before_open = bool(return_sequence_cfg["pre_release_descend_enabled"])
+    pre_release_descend_m = return_sequence_cfg["pre_release_descend_m"]
     args.pre_release_descend_mm = max(0.0, float(pre_release_descend_m) * 1000.0)
     args.post_backoff_stop_check_enabled = bool(
-        return_sequence_cfg.get("post_backoff_stop_check_enabled", DEFAULT_POST_BACKOFF_STOP_CHECK_ENABLED)
+        return_sequence_cfg["post_backoff_stop_check_enabled"]
     )
     args.post_backoff_stop_speed_threshold_mps = max(
         0.0,
-        float(
-            return_sequence_cfg.get(
-                "post_backoff_stop_speed_threshold_mps",
-                DEFAULT_POST_BACKOFF_STOP_SPEED_THRESHOLD_MPS,
-            )
-        ),
+        float(return_sequence_cfg["post_backoff_stop_speed_threshold_mps"]),
     )
     args.post_backoff_stop_timeout_s = max(
         0.0,
-        float(return_sequence_cfg.get("post_backoff_stop_timeout_s", DEFAULT_POST_BACKOFF_STOP_TIMEOUT_S)),
+        float(return_sequence_cfg["post_backoff_stop_timeout_s"]),
     )
     args.post_backoff_stop_poll_dt_s = max(
         0.0,
-        float(return_sequence_cfg.get("post_backoff_stop_poll_dt_s", DEFAULT_POST_BACKOFF_STOP_POLL_DT_S)),
+        float(return_sequence_cfg["post_backoff_stop_poll_dt_s"]),
     )
-    args.post_backoff_stop_require_confirmed = bool(
-        return_sequence_cfg.get(
-            "post_backoff_stop_require_confirmed",
-            DEFAULT_POST_BACKOFF_STOP_REQUIRE_CONFIRMED,
-        )
-    )
+    args.post_backoff_stop_require_confirmed = bool(return_sequence_cfg["post_backoff_stop_require_confirmed"])
 
     # Workspace bounds are controlled only by configs/handover.yaml.
     # CLI override args (--workspace-x/y/z) are intentionally disabled.
@@ -485,98 +377,63 @@ def apply_config_defaults(args, config):
         mm_bounds = [float(config_bounds[0]) * 1000.0, float(config_bounds[1]) * 1000.0]
         setattr(args, arg_name, mm_bounds)
 
-    args.tactile_enabled = bool(tactile_cfg.get("enabled", False))
-    args.tactile_port = str(tactile_cfg.get("port", DEFAULT_TACTILE_PORT))
-    args.tactile_num_mags = max(1, int(tactile_cfg.get("num_mags", DEFAULT_TACTILE_NUM_MAGS)))
+    args.tactile_enabled = bool(tactile_cfg["enabled"])
+    args.tactile_port = str(tactile_cfg["port"])
+    args.tactile_num_mags = max(1, int(tactile_cfg["num_mags"]))
     args.tactile_baseline_samples = max(
         1,
-        int(tactile_cfg.get("baseline_samples", DEFAULT_TACTILE_BASELINE_SAMPLES)),
+        int(tactile_cfg["baseline_samples"]),
     )
     args.tactile_startup_delay_s = max(
         0.0,
-        float(tactile_cfg.get("startup_delay_s", DEFAULT_TACTILE_STARTUP_DELAY_S)),
+        float(tactile_cfg["startup_delay_s"]),
     )
     args.tactile_contact_norm_threshold = max(
         0.0,
-        float(tactile_cfg.get("contact_norm_threshold", DEFAULT_TACTILE_CONTACT_NORM_THRESHOLD)),
+        float(tactile_cfg["contact_norm_threshold"]),
     )
     args.tactile_extra_grasp_pos = max(
         0,
-        int(tactile_cfg.get("extra_grasp_pos", DEFAULT_TACTILE_EXTRA_GRASP_POS)),
+        int(tactile_cfg["extra_grasp_pos"]),
     )
     args.tactile_release_delta_threshold = max(
         0.0,
-        float(tactile_cfg.get("release_delta_threshold", DEFAULT_TACTILE_RELEASE_DELTA_THRESHOLD)),
+        float(tactile_cfg["release_delta_threshold"]),
     )
-    args.tactile_release_ref_delay_s = max(
-        0.0,
-        float(tactile_cfg.get("release_ref_delay_s", DEFAULT_TACTILE_RELEASE_REF_DELAY_S)),
-    )
-    # args.tactile_release_timeout_s = max(
-    #     0.0,
-    #     float(tactile_cfg.get("release_timeout_s", DEFAULT_TACTILE_RELEASE_TIMEOUT_S)),
-    # )
     args.tactile_release_descent_min_z_mm = max(
         HOME_PLACE_MIN_Z_MM,
-        float(tactile_cfg.get("release_descent_min_z_mm", HOME_PLACE_MIN_Z_MM)),
-    )
-    args.tactile_release_descent_step_mm = max(
-        0.1,
-        float(tactile_cfg.get("release_descent_step_mm", DEFAULT_TACTILE_RELEASE_DESCENT_STEP_MM)),
+        float(tactile_cfg["release_descent_min_z_mm"]),
     )
     args.tactile_release_descent_poll_dt_s = max(
         0.0,
-        float(tactile_cfg.get("release_descent_poll_dt_s", DEFAULT_TACTILE_RELEASE_DESCENT_POLL_DT_S)),
+        float(tactile_cfg["release_descent_poll_dt_s"]),
     )
     args.tactile_release_descent_speed_mps = max(
         0.0,
-        float(tactile_cfg.get("release_descent_speed_mps", DEFAULT_TACTILE_RELEASE_DESCENT_SPEED_MPS)),
+        float(tactile_cfg["release_descent_speed_mps"]),
     )
     args.tactile_release_reference_sample_count = max(
         1,
-        int(tactile_cfg.get("release_reference_sample_count", DEFAULT_TACTILE_RELEASE_REFERENCE_SAMPLE_COUNT)),
+        int(tactile_cfg["release_reference_sample_count"]),
     )
     args.tactile_auto_baseline_reset_after_open_s = max(
         0.0,
-        float(
-            tactile_cfg.get(
-                "auto_baseline_reset_after_open_s",
-                DEFAULT_TACTILE_AUTO_BASELINE_RESET_AFTER_OPEN_S,
-            )
-        ),
+        float(tactile_cfg["auto_baseline_reset_after_open_s"]),
     )
-    args.tactile_release_stop_timing_debug = bool(
-        tactile_cfg.get("release_stop_timing_debug", DEFAULT_TACTILE_RELEASE_STOP_TIMING_DEBUG)
-    )
+    args.tactile_release_stop_timing_debug = bool(tactile_cfg["release_stop_timing_debug"])
     args.tactile_release_stop_speed_threshold_mps = max(
         0.0,
-        float(
-            tactile_cfg.get(
-                "release_stop_speed_threshold_mps",
-                DEFAULT_TACTILE_RELEASE_STOP_SPEED_THRESHOLD_MPS,
-            )
-        ),
+        float(tactile_cfg["release_stop_speed_threshold_mps"]),
     )
     args.tactile_release_stop_monitor_timeout_s = max(
         0.0,
-        float(
-            tactile_cfg.get(
-                "release_stop_monitor_timeout_s",
-                DEFAULT_TACTILE_RELEASE_STOP_MONITOR_TIMEOUT_S,
-            )
-        ),
+        float(tactile_cfg["release_stop_monitor_timeout_s"]),
     )
     args.tactile_release_stop_monitor_poll_dt_s = max(
         0.0,
-        float(
-            tactile_cfg.get(
-                "release_stop_monitor_poll_dt_s",
-                DEFAULT_TACTILE_RELEASE_STOP_MONITOR_POLL_DT_S,
-            )
-        ),
+        float(tactile_cfg["release_stop_monitor_poll_dt_s"]),
     )
-    if args.tactile_debug is None:
-        args.tactile_debug = bool(tactile_cfg.get("debug", True))
+    args.tactile_debug = bool(tactile_cfg["debug"])
 
     return args
 
@@ -592,16 +449,16 @@ class AnySkinTactileManager:
     """Small AnySkin reader used only when robot.tactile.enabled is true."""
 
     def __init__(self, args):
-        self.enabled = bool(getattr(args, "tactile_enabled", False))
-        self.port = str(getattr(args, "tactile_port", DEFAULT_TACTILE_PORT))
-        self.num_mags = max(1, int(getattr(args, "tactile_num_mags", DEFAULT_TACTILE_NUM_MAGS)))
-        self.baseline_samples = max(1, int(getattr(args, "tactile_baseline_samples", DEFAULT_TACTILE_BASELINE_SAMPLES)))
-        self.startup_delay_s = max(0.0, float(getattr(args, "tactile_startup_delay_s", DEFAULT_TACTILE_STARTUP_DELAY_S)))
+        self.enabled = bool(args.tactile_enabled)
+        self.port = str(args.tactile_port)
+        self.num_mags = max(1, int(args.tactile_num_mags))
+        self.baseline_samples = max(1, int(args.tactile_baseline_samples))
+        self.startup_delay_s = max(0.0, float(args.tactile_startup_delay_s))
         self.contact_norm_threshold = max(
             0.0,
-            float(getattr(args, "tactile_contact_norm_threshold", DEFAULT_TACTILE_CONTACT_NORM_THRESHOLD)),
+            float(args.tactile_contact_norm_threshold),
         )
-        self.debug = bool(getattr(args, "tactile_debug", True))
+        self.debug = bool(args.tactile_debug)
         self.lock = threading.RLock()
         self.stream = None
         self.baseline = None
@@ -854,7 +711,7 @@ def _debug_json_safe(value):
 
 
 class GripperDiagnosticRecorder:
-    """Thread-safe event recorder saved by --debug-tactile on the s key."""
+    """Thread-safe tactile event recorder saved on the s key when YAML enables it."""
 
     def __init__(self, *, enabled=False, output_dir="output/gripper_debug"):
         self.enabled = bool(enabled)
@@ -1081,8 +938,6 @@ def init_rtde(args):
     """Connect RTDE, validate robot state, and open the gripper for task startup."""
     print(f"[INFO] Connecting to UR5 RTDE using config {args.config} ...")
     controller = RtdeController.from_config(args.config)
-    if args.robot_ip:
-        controller.robot_ip = args.robot_ip
 
     # This standalone script keeps orientation from the live robot pose, which is returned as rotvec.
     controller.fixed_orientation_format = "rotvec"
@@ -1821,7 +1676,7 @@ class RobotWorker:
         self.metadata_recorder = metadata_recorder
         # tactile grasp 판정 또는 tactile 로그 저장에 사용할 manager다.
         self.tactile_manager = tactile_manager
-        # --debug-tactile이 켜졌을 때 gripper/release 진단 이벤트를 저장할 recorder다.
+        # YAML에서 tactile debug가 켜졌을 때 gripper/release 진단 이벤트를 저장할 recorder다.
         self.gripper_diag_recorder = gripper_diag_recorder
         # RTDE controller 인스턴스이며, init 전이나 disconnect 후에는 None이다.
         self.controller = None
@@ -2509,8 +2364,8 @@ def wait_until_robot_stopped(
     controller,
     *,
     timeout_s,
-    speed_threshold_mps=DEFAULT_POST_BACKOFF_STOP_SPEED_THRESHOLD_MPS,
-    poll_dt=DEFAULT_POST_BACKOFF_STOP_POLL_DT_S,
+    speed_threshold_mps,
+    poll_dt,
     cancel_event=None,
     on_state_read=None,
     source_mode="robot_stop_wait",
@@ -2707,11 +2562,9 @@ def move_robot_to_home_pose(controller, args, cancel_event=None, on_state_read=N
 
 
 def resolve_default_gripper_position_threshold(gripper_cfg):
-    """Resolve the fallback gripper close completion threshold."""
+    """Resolve the YAML-configured gripper close completion threshold."""
     gripper_cfg = dict(gripper_cfg or {})
-    return int(
-        gripper_cfg.get("position_complete_threshold", DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD)
-    )
+    return int(gripper_cfg["position_complete_threshold"])
 
 
 def resolve_gripper_position_stall_detection_config(controller):
@@ -2720,18 +2573,18 @@ def resolve_gripper_position_stall_detection_config(controller):
     gripper_cfg = dict(config.get("robot", {}).get("gripper", {}) or {})
     stall_cfg = dict(gripper_cfg.get("position_stall_detection", {}) or {})
     return {
-        "enabled": bool(stall_cfg.get("enabled", DEFAULT_GRIPPER_POSITION_STALL_ENABLED)),
+        "enabled": bool(stall_cfg["enabled"]),
         "stable_reads_required": max(
             1,
-            int(stall_cfg.get("stable_reads_required", DEFAULT_GRIPPER_POSITION_STALL_STABLE_READS)),
+            int(stall_cfg["stable_reads_required"]),
         ),
         "tolerance": max(
             0,
-            int(stall_cfg.get("tolerance", DEFAULT_GRIPPER_POSITION_STALL_TOLERANCE)),
+            int(stall_cfg["tolerance"]),
         ),
         "min_elapsed_s": max(
             0.0,
-            float(stall_cfg.get("min_elapsed_s", DEFAULT_GRIPPER_POSITION_STALL_MIN_ELAPSED_S)),
+            float(stall_cfg["min_elapsed_s"]),
         ),
     }
 
@@ -3055,12 +2908,7 @@ def reset_gripper_position_threshold_to_config_default(controller):
         .get("robot", {})
         .get("gripper", {})
     )
-    position_threshold = int(
-        gripper_cfg.get(
-            "position_complete_threshold",
-            DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD,
-        )
-    )
+    position_threshold = int(gripper_cfg["position_complete_threshold"])
     controller.gripper_position_complete_threshold = int(position_threshold)
     print(
         "[INFO] Tactile mode enabled; skipping vision/template gripper threshold geometry. "
@@ -3120,7 +2968,7 @@ def reset_tactile_state_for_system_reset(tactile_manager):
     if hasattr(tactile_manager, "clear_runtime_state"):
         tactile_manager.clear_runtime_state(release_status="reset_cleared")
     else:
-        num_mags = max(1, int(getattr(tactile_manager, "num_mags", DEFAULT_TACTILE_NUM_MAGS)))
+        num_mags = max(1, int(tactile_manager.num_mags))
         tactile_manager.release_reference_norm = None
         tactile_manager.release_delta_norm = None
         tactile_manager.release_status = "reset_cleared"
@@ -3257,7 +3105,7 @@ def print_tactile_frame_log(tactile_manager, *, stage, stage_time_s=None, **fiel
     if tactile_manager is None or not bool(getattr(tactile_manager, "enabled", False)):
         return
 
-    num_mags = max(1, int(getattr(tactile_manager, "num_mags", DEFAULT_TACTILE_NUM_MAGS)))
+    num_mags = max(1, int(tactile_manager.num_mags))
     tactile_snapshot = None
     if hasattr(tactile_manager, "snapshot"):
         tactile_snapshot = tactile_manager.snapshot(refresh=False)
@@ -3357,11 +3205,7 @@ def execute_gripper_close(
         close_started=close_started,
         close_speed=getattr(controller, "gripper_close_speed", None),
         close_force=getattr(controller, "gripper_close_force", None),
-        position_complete_threshold=getattr(
-            controller,
-            "gripper_position_complete_threshold",
-            DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD,
-        ),
+        position_complete_threshold=controller.gripper_position_complete_threshold,
     )
 
     deadline = time.time() + timeout_s
@@ -3371,16 +3215,10 @@ def execute_gripper_close(
     last_position_value = None
     stable_position_reads = 0
     tactile_enabled = tactile_manager is not None and bool(getattr(tactile_manager, "enabled", False))
-    tactile_contact_threshold = (
-        DEFAULT_TACTILE_CONTACT_NORM_THRESHOLD
-        if tactile_contact_threshold is None
-        else float(tactile_contact_threshold)
-    )
-    tactile_extra_grasp_pos = (
-        DEFAULT_TACTILE_EXTRA_GRASP_POS
-        if tactile_extra_grasp_pos is None
-        else max(0, int(tactile_extra_grasp_pos))
-    )
+    if tactile_enabled and (tactile_contact_threshold is None or tactile_extra_grasp_pos is None):
+        raise ValueError("Tactile close thresholds must be loaded from robot.tactile in YAML.")
+    tactile_contact_threshold = None if tactile_contact_threshold is None else float(tactile_contact_threshold)
+    tactile_extra_grasp_pos = None if tactile_extra_grasp_pos is None else max(0, int(tactile_extra_grasp_pos))
     tactile_contact_detected = False
     tactile_contact_position = None
     tactile_extra_target_position = None
@@ -3434,7 +3272,7 @@ def execute_gripper_close(
                         closed_position_int = int(closed_position)
                     if position_value is not None:
                         position_value_int = int(position_value)
-                        position_threshold = int(getattr(controller, "gripper_position_complete_threshold", DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD))
+                        position_threshold = int(controller.gripper_position_complete_threshold)
                         position_triggered = position_value_int >= position_threshold
                         if last_position_value is None:
                             stable_position_reads = 1
@@ -3583,9 +3421,7 @@ def execute_gripper_close(
         if position_triggered:
             stop_gripper_motion_safely(controller, "position trigger")
             note_robot_first_contact(metadata_recorder)
-            position_threshold = int(
-                getattr(controller, "gripper_position_complete_threshold", DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD)
-            )
+            position_threshold = int(controller.gripper_position_complete_threshold)
             record_gripper_diagnostic(
                 gripper_diag_recorder,
                 "close_done",
@@ -3739,7 +3575,7 @@ def capture_tactile_release_reference(tactile_manager, delay_s=0.0, cancel_event
 def capture_tactile_release_reference_mean(
     tactile_manager,
     *,
-    sample_count=DEFAULT_TACTILE_RELEASE_REFERENCE_SAMPLE_COUNT,
+    sample_count,
     timeout_s=0.08,
 ):
     """Capture release reference from a short mean of fresh AnySkin samples."""
@@ -3814,56 +3650,33 @@ def execute_tactile_release_descent(
         float(getattr(args, "tactile_release_descent_min_z_mm", HOME_PLACE_MIN_Z_MM)),
     )
     # tactile 값과 로봇 pose를 확인하는 polling 주기[sec]다.
-    poll_dt = max(
-        0.0,
-        float(getattr(args, "tactile_release_descent_poll_dt_s", DEFAULT_TACTILE_RELEASE_DESCENT_POLL_DT_S)),
-    )
+    poll_dt = max(0.0, float(args.tactile_release_descent_poll_dt_s))
     descent_speed_mps = max(
         1e-6,
-        float(getattr(args, "tactile_release_descent_speed_mps", DEFAULT_TACTILE_RELEASE_DESCENT_SPEED_MPS)),
+        float(args.tactile_release_descent_speed_mps),
     )
     servo_hz = max(
         1.0,
-        float(getattr(controller, "control_hz", getattr(args, "control_hz", DEFAULT_CONTROL_HZ))),
+        float(getattr(controller, "control_hz", args.control_hz)),
     )
     servo_interval_s = 1.0 / servo_hz
     # release reference 대비 tactile norm 변화량이 이 값보다 커지면 release trigger로 판단한다.
     delta_threshold = max(
         0.0,
-        float(getattr(args, "tactile_release_delta_threshold", DEFAULT_TACTILE_RELEASE_DELTA_THRESHOLD)),
+        float(args.tactile_release_delta_threshold),
     )
-    release_stop_timing_debug = bool(
-        getattr(args, "tactile_release_stop_timing_debug", DEFAULT_TACTILE_RELEASE_STOP_TIMING_DEBUG)
-    )
+    release_stop_timing_debug = bool(args.tactile_release_stop_timing_debug)
     release_stop_speed_threshold_mps = max(
         0.0,
-        float(
-            getattr(
-                args,
-                "tactile_release_stop_speed_threshold_mps",
-                DEFAULT_TACTILE_RELEASE_STOP_SPEED_THRESHOLD_MPS,
-            )
-        ),
+        float(args.tactile_release_stop_speed_threshold_mps),
     )
     release_stop_monitor_timeout_s = max(
         0.0,
-        float(
-            getattr(
-                args,
-                "tactile_release_stop_monitor_timeout_s",
-                DEFAULT_TACTILE_RELEASE_STOP_MONITOR_TIMEOUT_S,
-            )
-        ),
+        float(args.tactile_release_stop_monitor_timeout_s),
     )
     release_stop_monitor_poll_dt_s = max(
         0.0,
-        float(
-            getattr(
-                args,
-                "tactile_release_stop_monitor_poll_dt_s",
-                DEFAULT_TACTILE_RELEASE_STOP_MONITOR_POLL_DT_S,
-            )
-        ),
+        float(args.tactile_release_stop_monitor_poll_dt_s),
     )
     # 로봇 위치 도달 판정 tolerance를 meter에서 millimeter로 변환한다.
     tolerance_mm = max(0.0, float(getattr(args, "position_tolerance_m", 0.0)) * 1000.0)
@@ -3899,11 +3712,7 @@ def execute_tactile_release_descent(
     # servoL stream을 굶기지 않기 위해 긴 ref delay 대신 짧은 sample mean으로 기준값을 잡는다.
     capture_tactile_release_reference_mean(
         tactile_manager,
-        sample_count=getattr(
-            args,
-            "tactile_release_reference_sample_count",
-            DEFAULT_TACTILE_RELEASE_REFERENCE_SAMPLE_COUNT,
-        ),
+        sample_count=args.tactile_release_reference_sample_count,
         timeout_s=0.08,
     )
 
@@ -4323,7 +4132,7 @@ def compute_place_target(shared_state):
 def compute_pre_release_descend_target_mm(place_x, place_y, place_z, args):
     """Resolve the optional descend target used immediately before gripper open."""
     enabled = bool(getattr(args, "pre_release_descend_before_open", False))
-    descend_mm = max(0.0, float(getattr(args, "pre_release_descend_mm", RELEASE_PARAMETER_MM)))
+    descend_mm = max(0.0, float(args.pre_release_descend_mm))
     place_x = float(place_x)
     place_y = float(place_y)
     place_z = float(place_z)
@@ -4560,11 +4369,7 @@ def execute_return_and_place(
     if tactile_enabled:
         reset_tactile_baseline_after_open(
             tactile_manager,
-            getattr(
-                args,
-                "tactile_auto_baseline_reset_after_open_s",
-                DEFAULT_TACTILE_AUTO_BASELINE_RESET_AFTER_OPEN_S,
-            ),
+            args.tactile_auto_baseline_reset_after_open_s,
             cancel_event=cancel_event,
         )
 
@@ -4610,16 +4415,12 @@ def execute_return_and_place(
         return False
 
     # backoff moveL이 위치 tolerance만 만족한 상태에서 바로 moveJ로 전환되지 않도록 실제 정지를 확인한다.
-    if bool(getattr(args, "post_backoff_stop_check_enabled", DEFAULT_POST_BACKOFF_STOP_CHECK_ENABLED)):
+    if bool(args.post_backoff_stop_check_enabled):
         stop_confirmed = wait_until_robot_stopped(
             controller,
-            timeout_s=getattr(args, "post_backoff_stop_timeout_s", DEFAULT_POST_BACKOFF_STOP_TIMEOUT_S),
-            speed_threshold_mps=getattr(
-                args,
-                "post_backoff_stop_speed_threshold_mps",
-                DEFAULT_POST_BACKOFF_STOP_SPEED_THRESHOLD_MPS,
-            ),
-            poll_dt=getattr(args, "post_backoff_stop_poll_dt_s", DEFAULT_POST_BACKOFF_STOP_POLL_DT_S),
+            timeout_s=args.post_backoff_stop_timeout_s,
+            speed_threshold_mps=args.post_backoff_stop_speed_threshold_mps,
+            poll_dt=args.post_backoff_stop_poll_dt_s,
             cancel_event=cancel_event,
             on_state_read=on_state_read,
             source_mode="post_backoff_stop_check",
@@ -4630,13 +4431,7 @@ def execute_return_and_place(
             print("[INFO] POST-backoff stop confirmed before HOME moveJ.")
         else:
             message = "[WARN] POST-backoff stop was not confirmed before HOME moveJ."
-            if bool(
-                getattr(
-                    args,
-                    "post_backoff_stop_require_confirmed",
-                    DEFAULT_POST_BACKOFF_STOP_REQUIRE_CONFIRMED,
-                )
-            ):
+            if bool(args.post_backoff_stop_require_confirmed):
                 print(message + " Aborting return sequence because confirmation is required.")
                 return False
             print(message + " Continuing with HOME moveJ.")
@@ -4712,40 +4507,13 @@ def execute_return_and_place(
     return True
 
 
-def configure_object_worker_from_args(worker, args, prompt_classes):
-    """Apply CLI model/prompt/selection settings to an object worker."""
-    effective_prompt_classes = prompt_classes if prompt_classes else list(getattr(worker.segmentation_engine, "prompt_classes", []))
-    preprocess_config = dict(getattr(worker.segmentation_engine, "preprocess_config", {}) or {})
-    worker.segmentation_engine = SegmentationEngine(
-        model_name=args.model,
-        prompt_classes=effective_prompt_classes,
-        imgsz=args.imgsz,
-        conf=args.conf,
-        iou=args.iou,
-        max_det=args.max_det,
-        device=args.device,
-        classes=args.classes,
-        half=args.half,
-        retina_masks=True,
-        preprocess_config=preprocess_config,
-    )
-    worker.selection_mode = args.select_mode
-    if args.select_class is not None:
-        worker.selection_class_names = list(args.select_class)
-
-
 def build_dual_perception_pipeline(args):
-    """Construct all camera, perception, fusion, fitting, and debug pipeline objects."""
+    """Construct the YAML-configured camera and perception pipeline."""
     sensor_hub = DualSensorHub.from_config(args.config)
-    sensor_hub.width = int(args.width)
-    sensor_hub.height = int(args.height)
-    sensor_hub.fps = int(args.fps)
 
     object_worker_cam0 = ObjectWorkerCam0.from_config(args.config)
     object_worker_cam1 = ObjectWorkerCam1.from_config(args.config)
-    prompt_classes = parse_prompt_classes(args.prompt)
-    configure_object_worker_from_args(object_worker_cam0, args, prompt_classes)
-    configure_object_worker_from_args(object_worker_cam1, args, prompt_classes)
+    prompt_classes = list(getattr(object_worker_cam0.segmentation_engine, "prompt_classes", []))
 
     hand_worker_cam0 = HandWorkerCam0.from_config(args.config)
     hand_worker_cam1 = HandWorkerCam1.from_config(args.config)
@@ -4757,7 +4525,6 @@ def build_dual_perception_pipeline(args):
     grasp_planner = GraspTargetPlanner.from_config(args.config)
     grasp_z_stabilizer = GraspPointZStabilizer.from_config(args.config)
     hand_relative_fallback = HandRelativeFallbackTracker.from_config(args.config)
-    # fill_level_estimator = FillLevelEstimator.from_config(args.config)
     transform_chain = load_transform_chain(args.config)
     t_cam0_base = np.linalg.inv(transform_chain.t_base_cam0).astype(np.float32)
     t_cam1_base = np.linalg.inv(transform_chain.t_base_cam1).astype(np.float32)
@@ -4776,7 +4543,6 @@ def build_dual_perception_pipeline(args):
         "grasp_planner": grasp_planner,
         "grasp_z_stabilizer": grasp_z_stabilizer,
         "hand_relative_fallback": hand_relative_fallback,
-        #"fill_level_estimator": fill_level_estimator,
         "transform_chain": transform_chain,
         "t_cam0_base": t_cam0_base,
         "t_cam1_base": t_cam1_base,
@@ -5027,18 +4793,21 @@ def append_debug_3d_frame(
 
 def build_runtime_profile_context(args, yolo_model, pipeline):
     """Capture static run settings that should be written with profiler output."""
+    sensor_hub = pipeline["sensor_hub"]
+    object_worker = pipeline["object_worker_cam0"]
+    segmentation_engine = object_worker.segmentation_engine
     return {
         "config_path": str(Path(args.config).resolve()),
         "yolo_model": yolo_model,
-        "model": args.model,
-        "device": args.device,
-        "half": bool(args.half),
-        "imgsz": int(args.imgsz),
-        "width": int(args.width),
-        "height": int(args.height),
-        "fps": int(args.fps),
-        "select_mode": args.select_mode,
-        "select_class": list(args.select_class or []),
+        "model": segmentation_engine.model_name,
+        "device": segmentation_engine.device,
+        "half": bool(segmentation_engine.half),
+        "imgsz": int(segmentation_engine.imgsz),
+        "width": int(sensor_hub.width),
+        "height": int(sensor_hub.height),
+        "fps": int(sensor_hub.fps),
+        "select_mode": object_worker.selection_mode,
+        "select_class": list(object_worker.selection_class_names),
         "enable_follow": bool(args.enable_follow),
         "control_hz": float(args.control_hz),
         "prompt_classes": list(pipeline.get("prompt_classes", [])),
@@ -5293,10 +5062,6 @@ def main():
     # YAML에 들어 있는 기본값을 커맨드라인 인자에 반영한다.
     args = apply_config_defaults(args, config)
 
-    # 듀얼 카메라 모드에서는 개별 시리얼 인자를 사용하지 않으므로 경고만 출력한다.
-    if args.serial is not None:
-        print("[WARN] --serial is ignored in the dual-camera grasp-target mode. Camera selection comes from configs/handover.yaml")
-
     # 카메라, 검출기, 융합기, 로봇 좌표 변환 등 전체 perception 파이프라인을 구성한다.
     pipeline = build_dual_perception_pipeline(args)
     # 두 카메라 프레임을 동기화해서 공급하는 센서 허브를 가져온다.
@@ -5309,8 +5074,9 @@ def main():
     # 듀얼 카메라 스트리밍을 시작한다.
     sensor_hub.start()
 
-    # 런타임 로그에 남길 YOLO 모델 이름을 prompt class 정보까지 포함해 만든다.
-    yolo_model = args.model if not pipeline["prompt_classes"] else f"{args.model} ({','.join(pipeline['prompt_classes'])})"
+    # 런타임 로그에 남길 YAML 기반 YOLO 모델 이름을 prompt class 정보까지 포함해 만든다.
+    model_name = str(pipeline["object_worker_cam0"].segmentation_engine.model_name)
+    yolo_model = model_name if not pipeline["prompt_classes"] else f"{model_name} ({','.join(pipeline['prompt_classes'])})"
     # gpu, cpu 리소스 속도 파악
     # 프레임별 처리 시간과 시스템 리소스 사용량을 기록할 profiler를 준비한다.
     runtime_profiler = RuntimeProfiler(
@@ -5346,7 +5112,7 @@ def main():
     shared_state = FollowSharedState(args)
     # task ready, geometry, completion 같은 handover 메타데이터를 저장하는 recorder다.
     metadata_recorder = HandoverMetadataRecorder()
-    # --debug-tactile이면 gripper/raw register 진단 이벤트를 JSON으로 저장하기 위해 메모리에 쌓는다.
+    # YAML tactile debug가 켜지면 gripper/raw register 진단 이벤트를 JSON으로 저장하기 위해 메모리에 쌓는다.
     gripper_diag_recorder = GripperDiagnosticRecorder(
         enabled=bool(args.tactile_debug),
         output_dir=args.debug_tactile_dir,
@@ -5611,24 +5377,6 @@ def main():
                     object_worker_cam0=pipeline["object_worker_cam0"],
                     object_worker_cam1=pipeline["object_worker_cam1"],
                 )
-            # cam0 object worker가 남긴 debug 정보를 가져온다.
-            object_debug_cam0 = getattr(pipeline["object_worker_cam0"], "last_debug", None)
-            # fill-level 추정 등에 사용할 수 있는 cam0 object mask를 꺼낸다.
-            cam0_mask = None if object_debug_cam0 is None else getattr(object_debug_cam0, "combined_mask", None)
-            # with runtime_profiler.stage("fill_level"):
-            #     fill_estimate = pipeline["fill_level_estimator"].estimate_fill_level_from_cam0(
-            #         color_image_bgr=snapshot.cam0.color_image,
-            #         depth_image_m=snapshot.cam0.depth_image_m,
-            #         intrinsics=snapshot.cam0.intrinsics,
-            #         container_mask=cam0_mask,
-            #         camera_to_base=pipeline["transform_chain"].t_base_cam0,
-            #         label=object_cam0.label,
-            #     )
-            #     metadata_recorder.update_fill_and_mass(
-            #         fill_estimate,
-            #         shape_fitting_state=shape_fitting_state,
-            #         now_perf=loop_perf,
-            #     )
             # object-hand fusion과 grasp target 계산을 같은 profiler stage로 묶는다.
             with runtime_profiler.stage("fusion_grasp"):
                 # shape fitting 결과가 있으면 merged object에 fitted geometry를 반영한다.
@@ -6045,7 +5793,7 @@ def main():
                         open_video_recorder_ui(video_recorder)
                 # s 키 저장 시 runtime profile을 디스크에 저장한다.
                 save_runtime_profile(runtime_profiler, reason="s_key")
-                # --debug-tactile 진단 로그가 있으면 JSON 파일로 저장한다.
+                # YAML에서 활성화한 tactile 진단 로그가 있으면 JSON 파일로 저장한다.
                 if gripper_diag_recorder is not None and gripper_diag_recorder.enabled:
                     diag_path = gripper_diag_recorder.save(reason="s_key")
                     if diag_path is not None:

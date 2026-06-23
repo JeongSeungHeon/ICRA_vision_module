@@ -12,9 +12,6 @@ import numpy as np
 
 DEFAULT_METADATA_CSV_PATH = Path("output/handover_metadata.csv")
 DEFAULT_GEOMETRY_BAND_RATIO = 0.08
-DEFAULT_RICE_DENSITY_G_PER_ML = 0.87
-DEFAULT_EMPTY_CUP_MASS_G = 15.0
-DEFAULT_EMPTY_WINE_GLASS_MASS_G = 156.0
 METADATA_COLUMNS = [
     "config_id",
     "robot_initial_pose_x",
@@ -29,10 +26,6 @@ METADATA_COLUMNS = [
     "width_bottom_est_mm_vision",
     "height_est_mm_vision",
     "geometry_est_timepoint",
-    "mass_full_est_g_vision",
-    "mass_full_est_vision_timepoint",
-    "fill_level_est_percent_vision",
-    "fill_level_vision_timepoint",
     "spill_observed_during_human_maneuvering",
     "robot_mass_est_available",
     "robot_mass_est_g",
@@ -140,129 +133,6 @@ def estimate_geometry_from_fitted_points_mm(fitted_points_base, band_ratio=DEFAU
     }
 
 
-def estimate_container_volume_ml_from_geometry(width_top_mm, width_bottom_mm, height_mm):
-    width_top_mm = max(float(width_top_mm), 0.0)
-    width_bottom_mm = max(float(width_bottom_mm), 0.0)
-    height_mm = max(float(height_mm), 0.0)
-    if height_mm <= 0.0:
-        return 0.0
-
-    radius_top_mm = 0.5 * width_top_mm
-    radius_bottom_mm = 0.5 * width_bottom_mm
-    volume_mm3 = (
-        np.pi
-        * height_mm
-        * (radius_bottom_mm ** 2 + radius_bottom_mm * radius_top_mm + radius_top_mm ** 2)
-        / 3.0
-    )
-    return float(max(volume_mm3, 0.0) / 1000.0)
-
-
-def estimate_filled_volume_ml_from_geometry_and_fill_height(width_top_mm, width_bottom_mm, height_mm, fill_height_mm):
-    width_top_mm = max(float(width_top_mm), 0.0)
-    width_bottom_mm = max(float(width_bottom_mm), 0.0)
-    height_mm = max(float(height_mm), 0.0)
-    if height_mm <= 0.0:
-        return 0.0
-
-    fill_height_mm = float(np.clip(float(fill_height_mm), 0.0, height_mm))
-    radius_top_mm = 0.5 * width_top_mm
-    radius_bottom_mm = 0.5 * width_bottom_mm
-    fill_ratio = fill_height_mm / height_mm
-    radius_fill_mm = radius_bottom_mm + (radius_top_mm - radius_bottom_mm) * fill_ratio
-    volume_mm3 = (
-        np.pi
-        * fill_height_mm
-        * (radius_bottom_mm ** 2 + radius_bottom_mm * radius_fill_mm + radius_fill_mm ** 2)
-        / 3.0
-    )
-    return float(max(volume_mm3, 0.0) / 1000.0)
-
-
-def estimate_wine_glass_bowl_volume_ml(width_top_mm, height_mm, bowl_height_fraction):
-    width_top_mm = max(float(width_top_mm), 0.0)
-    height_mm = max(float(height_mm), 0.0)
-    bowl_height_fraction = float(np.clip(float(bowl_height_fraction), 0.0, 1.0))
-    if height_mm <= 0.0 or bowl_height_fraction <= 0.0:
-        return 0.0
-
-    radius_mm = 0.5 * width_top_mm
-    bowl_height_mm = height_mm * bowl_height_fraction
-    volume_mm3 = np.pi * radius_mm * radius_mm * bowl_height_mm
-    return float(max(volume_mm3, 0.0) / 1000.0)
-
-
-def estimate_wine_glass_bowl_filled_volume_ml(width_top_mm, bowl_height_mm, fill_height_mm):
-    width_top_mm = max(float(width_top_mm), 0.0)
-    bowl_height_mm = max(float(bowl_height_mm), 0.0)
-    if bowl_height_mm <= 0.0:
-        return 0.0
-
-    fill_height_mm = float(np.clip(float(fill_height_mm), 0.0, bowl_height_mm))
-    radius_mm = 0.5 * width_top_mm
-    volume_mm3 = np.pi * radius_mm * radius_mm * fill_height_mm
-    return float(max(volume_mm3, 0.0) / 1000.0)
-
-
-def estimate_container_and_filled_volume_ml(geometry_fields, fill_height_mm, *, label=None, bowl_height_fraction=None):
-    geometry = {} if geometry_fields is None else dict(geometry_fields)
-    width_top_mm = geometry.get("width_top_est_mm_vision")
-    width_bottom_mm = geometry.get("width_bottom_est_mm_vision")
-    height_mm = geometry.get("height_est_mm_vision")
-    if width_top_mm is None or width_bottom_mm is None or height_mm is None:
-        return None, None
-
-    normalized_label = "" if label is None else str(label).strip().lower()
-    if normalized_label == "wine glass" and bowl_height_fraction is not None and np.isfinite(float(bowl_height_fraction)):
-        bowl_height_fraction = float(np.clip(float(bowl_height_fraction), 0.0, 1.0))
-        if bowl_height_fraction > 0.0:
-            bowl_height_mm = float(height_mm) * bowl_height_fraction
-            total_volume_ml = estimate_wine_glass_bowl_volume_ml(width_top_mm, height_mm, bowl_height_fraction)
-            filled_volume_ml = estimate_wine_glass_bowl_filled_volume_ml(width_top_mm, bowl_height_mm, fill_height_mm)
-            return total_volume_ml, filled_volume_ml
-
-    total_volume_ml = estimate_container_volume_ml_from_geometry(width_top_mm, width_bottom_mm, height_mm)
-    filled_volume_ml = estimate_filled_volume_ml_from_geometry_and_fill_height(
-        width_top_mm,
-        width_bottom_mm,
-        height_mm,
-        fill_height_mm,
-    )
-    return total_volume_ml, filled_volume_ml
-
-
-def estimate_fill_level_percent(filled_volume_ml, total_volume_ml):
-    total_volume_ml = max(float(total_volume_ml), 0.0)
-    if total_volume_ml <= 1e-9:
-        return 0.0
-    filled_volume_ml = max(float(filled_volume_ml), 0.0)
-    fill_level_percent = 100.0 * filled_volume_ml / total_volume_ml
-    return float(np.clip(fill_level_percent, 0.0, 100.0))
-
-
-def estimate_mass_full_g_vision(filled_volume_ml, density_g_per_ml=DEFAULT_RICE_DENSITY_G_PER_ML, empty_cup_mass_g=DEFAULT_EMPTY_CUP_MASS_G):
-    filled_volume_ml = max(float(filled_volume_ml), 0.0)
-    density_g_per_ml = max(float(density_g_per_ml), 0.0)
-    empty_cup_mass_g = max(float(empty_cup_mass_g), 0.0)
-    return float(empty_cup_mass_g + density_g_per_ml * filled_volume_ml)
-
-
-def estimate_empty_container_mass_g(label=None, height_mm=None):
-    normalized_label = "" if label is None else str(label).strip().lower()
-    if normalized_label == "wine glass":
-        return float(DEFAULT_EMPTY_WINE_GLASS_MASS_G)
-    if normalized_label == "cup":
-        if height_mm is None or not np.isfinite(float(height_mm)):
-            return float(DEFAULT_EMPTY_CUP_MASS_G)
-        height_mm = float(height_mm)
-        if height_mm <= 110.0:
-            return 15.0
-        if height_mm < 135.0:
-            return 9.0
-        return 10.0
-    return float(DEFAULT_EMPTY_CUP_MASS_G)
-
-
 def _format_metadata_float(value):
     if value is None:
         return ""
@@ -290,10 +160,6 @@ class HandoverMetadataRecorder:
         self._geometry_fields = {}
         self._geometry_timepoint_ms = None
         self._geometry_timestamp_iso = None
-        self._fill_mass_fields = {}
-        self._fill_mass_timepoint_ms = None
-        self._fill_mass_timestamp_iso = None
-        self._fill_mass_latched = False
         self._delivery_location_mm = {}
         self._robot_first_contact_ms = None
         self._robot_first_contact_timestamp_iso = None
@@ -310,10 +176,6 @@ class HandoverMetadataRecorder:
             self._geometry_fields = {}
             self._geometry_timepoint_ms = None
             self._geometry_timestamp_iso = None
-            self._fill_mass_fields = {}
-            self._fill_mass_timepoint_ms = None
-            self._fill_mass_timestamp_iso = None
-            self._fill_mass_latched = False
             self._delivery_location_mm = {}
             self._robot_first_contact_ms = None
             self._robot_first_contact_timestamp_iso = None
@@ -380,66 +242,6 @@ class HandoverMetadataRecorder:
             self._geometry_timestamp_iso = sample_timestamp_iso
         return True
 
-    def update_fill_and_mass(
-        self,
-        fill_metrics,
-        geometry_fields=None,
-        shape_fitting_state=None,
-        *,
-        now_perf=None,
-        now_timestamp_iso=None,
-    ):
-        if fill_metrics is None or not getattr(fill_metrics, "valid", False):
-            return False
-
-        fill_height_mm = getattr(fill_metrics, "fill_height_mm", None)
-        if fill_height_mm is None or not np.isfinite(float(fill_height_mm)):
-            return False
-
-        sample_perf = time.perf_counter() if now_perf is None else float(now_perf)
-        sample_timestamp_iso = utc_now_iso_ms() if now_timestamp_iso is None else str(now_timestamp_iso)
-        with self._lock:
-            if self._fill_mass_latched:
-                return False
-
-            geometry = dict(self._geometry_fields if geometry_fields is None else geometry_fields)
-            width_top_mm = geometry.get("width_top_est_mm_vision")
-            width_bottom_mm = geometry.get("width_bottom_est_mm_vision")
-            height_mm = geometry.get("height_est_mm_vision")
-            if width_top_mm is None or width_bottom_mm is None or height_mm is None:
-                return False
-
-            total_volume_ml, filled_volume_ml = estimate_container_and_filled_volume_ml(
-                geometry,
-                fill_height_mm,
-                label=getattr(shape_fitting_state, "label", None),
-                bowl_height_fraction=getattr(shape_fitting_state, "bowl_height_fraction", None),
-            )
-            if total_volume_ml is None or filled_volume_ml is None:
-                return False
-            fill_level_percent = estimate_fill_level_percent(filled_volume_ml, total_volume_ml)
-            empty_container_mass_g = estimate_empty_container_mass_g(
-                getattr(shape_fitting_state, "label", None),
-                height_mm=height_mm,
-            )
-            mass_full_g = estimate_mass_full_g_vision(
-                filled_volume_ml,
-                empty_cup_mass_g=empty_container_mass_g,
-            )
-
-            elapsed_ms = self._elapsed_ms_locked(sample_perf, sample_timestamp_iso)
-            if elapsed_ms is None:
-                return False
-
-            self._fill_mass_fields = {
-                "mass_full_est_g_vision": float(mass_full_g),
-                "fill_level_est_percent_vision": float(fill_level_percent),
-            }
-            self._fill_mass_timepoint_ms = elapsed_ms
-            self._fill_mass_timestamp_iso = sample_timestamp_iso
-            self._fill_mass_latched = True
-        return True
-
     def note_robot_first_contact(self, *, now_perf=None, now_timestamp_iso=None):
         sample_perf = time.perf_counter() if now_perf is None else float(now_perf)
         sample_timestamp_iso = utc_now_iso_ms() if now_timestamp_iso is None else str(now_timestamp_iso)
@@ -504,13 +306,6 @@ class HandoverMetadataRecorder:
                 row[key] = _format_metadata_float(value)
             if self._geometry_timepoint_ms is not None:
                 row["geometry_est_timepoint"] = f"single_ms:{int(self._geometry_timepoint_ms)}"
-            for key, value in self._fill_mass_fields.items():
-                row[key] = _format_metadata_float(value)
-            if self._fill_mass_timepoint_ms is not None:
-                timepoint_text = f"single_ms:{int(self._fill_mass_timepoint_ms)}"
-                row["mass_full_est_vision_timepoint"] = timepoint_text
-                row["fill_level_vision_timepoint"] = timepoint_text
-
             row["robot_mass_est_available"] = "0"
             row["robot_mass_est_g"] = "-1"
 

@@ -31,19 +31,14 @@ from object_pt_extraction.segmentation_engine import (  # noqa: E402
     format_instance_summary,
     select_instances,
 )
-from perception.fdct_depth_completion import (  # noqa: E402
-    FDCTDepthCompleter,
-    FDCTDepthCompletionConfig,
-    bilateral_filter_depth,
-)
 from system.dual_sensor_hub import DualSensorHub  # noqa: E402
+from utils.depth_filters import bilateral_filter_depth  # noqa: E402
 
 
 WIDTH = 640
 HEIGHT = 480
 FPS = 30
 YOLO_MODEL_PATH = REPO_ROOT / "yoloe-26l-seg.pt"
-FDCT_CHECKPOINT_PATH = REPO_ROOT / "FDCT" / "TransCG.tar"
 CONFIG_PATH = REPO_ROOT / "configs" / "handover.yaml"
 TEMPLATE_PATH = SCRIPT_DIR / "template.npy"
 TARGET_CLASSES = ["wine glass", "cup"]
@@ -144,7 +139,7 @@ def combine_instance_masks(instances: list, image_shape: tuple[int, ...]) -> np.
     return mask
 
 
-def build_fdct_demo_style_point_cloud(
+def build_masked_point_cloud(
     color_bgr: np.ndarray,
     depth_m: np.ndarray,
     object_mask: np.ndarray,
@@ -608,22 +603,6 @@ def transform_points_display_to_base(points_display: np.ndarray) -> np.ndarray:
     return (points_display @ rotation.T + translation).astype(np.float32)
 
 
-def create_fdct_depth_completer() -> FDCTDepthCompleter:
-    config = FDCTDepthCompletionConfig(
-        checkpoint_path=FDCT_CHECKPOINT_PATH,
-        width=WIDTH,
-        height=HEIGHT,
-        net_width=320,
-        net_height=240,
-        depth_min=DEPTH_MIN_M,
-        depth_max=DEPTH_MAX_M,
-        depth_norm=1.0,
-        depth_coeff=10.0,
-        inpaint=True,
-    )
-    return FDCTDepthCompleter(config, device_arg="auto")
-
-
 def create_segmentation_engine() -> SegmentationEngine:
     return SegmentationEngine(
         model_name=str(YOLO_MODEL_PATH),
@@ -643,25 +622,10 @@ def process_camera_frame(
     frame_bundle,
     camera_id: int,
     segmentation_engine: SegmentationEngine,
-    depth_completer: FDCTDepthCompleter,
     transform_chain,
 ) -> ProcessedCameraFrame:
-    fdct_result = depth_completer.complete(frame_bundle.color_image, frame_bundle.depth_image_m)
-    if fdct_result is None:
-        preview = overlay_status(
-            frame_bundle.color_image,
-            [f"cam{camera_id}", "FDCT: no valid depth", "status: skipped"],
-        )
-        return ProcessedCameraFrame(
-            camera_id=camera_id,
-            valid=False,
-            points_base=np.empty((0, 3), dtype=np.float32),
-            colors_rgb=np.empty((0, 3), dtype=np.uint8),
-            preview_bgr=preview,
-            status="fdct_failed",
-        )
-
-    filtered_depth_m = fdct_result.completed_depth_m.astype(np.float32, copy=False)
+    raw_depth_m = np.asarray(frame_bundle.depth_image_m, dtype=np.float32)
+    filtered_depth_m = raw_depth_m
     bilateral_status = "off"
     if BILATERAL_ENABLED:
         try:
@@ -673,8 +637,8 @@ def process_camera_frame(
             )
             bilateral_status = "on"
         except Exception as exc:
-            print(f"[WARN] cam{camera_id} bilateral filter failed; using FDCT output: {exc}")
-            filtered_depth_m = fdct_result.completed_depth_m.astype(np.float32, copy=False)
+            print(f"[WARN] cam{camera_id} bilateral filter failed; using raw depth: {exc}")
+            filtered_depth_m = raw_depth_m
             bilateral_status = "fallback"
 
     segmentation_result = segmentation_engine.predict(frame_bundle.color_image)
@@ -684,7 +648,7 @@ def process_camera_frame(
         class_names=TARGET_CLASSES,
     )
     combined_mask = combine_instance_masks(selected_instances, frame_bundle.color_image.shape)
-    points_camera, colors_rgb = build_fdct_demo_style_point_cloud(
+    points_camera, colors_rgb = build_masked_point_cloud(
         color_bgr=frame_bundle.color_image,
         depth_m=filtered_depth_m,
         object_mask=combined_mask,
@@ -709,7 +673,7 @@ def process_camera_frame(
         [
             f"cam{camera_id} serial: {frame_bundle.serial}",
             format_instance_summary(selected_instances),
-            f"seg: {segmentation_result.infer_ms:.1f} ms | fdct: {fdct_result.elapsed_ms:.1f} ms | bilateral: {bilateral_status}",
+            f"seg: {segmentation_result.infer_ms:.1f} ms | depth: raw | bilateral: {bilateral_status}",
             f"points_base: {len(points_base)} | {'ok' if valid else 'no_object_points'}",
         ],
     )
@@ -810,7 +774,6 @@ def main() -> None:
         sensor_hub.fps = FPS
         sensor_hub.start()
 
-        depth_completer = create_fdct_depth_completer()
         segmentation_engine = create_segmentation_engine()
         transform_chain = load_transform_chain(CONFIG_PATH)
 
@@ -860,8 +823,8 @@ def main() -> None:
             start = time.time()
             pair = sensor_hub.read_next_pair()
             processed_frames = [
-                process_camera_frame(pair.cam0, 0, segmentation_engine, depth_completer, transform_chain),
-                process_camera_frame(pair.cam1, 1, segmentation_engine, depth_completer, transform_chain),
+                process_camera_frame(pair.cam0, 0, segmentation_engine, transform_chain),
+                process_camera_frame(pair.cam1, 1, segmentation_engine, transform_chain),
             ]
 
             point_clouds = [frame.points_base for frame in processed_frames if frame.valid and len(frame.points_base) > 0]
@@ -1045,7 +1008,7 @@ def main() -> None:
                     "q / ESC: quit",
                 ],
             )
-            cv2.imshow("Dual YOLOE + FDCT Shape Fitting v2", preview)
+            cv2.imshow("Dual YOLOE Shape Fitting v2", preview)
 
             if not vis.poll_events():
                 break
