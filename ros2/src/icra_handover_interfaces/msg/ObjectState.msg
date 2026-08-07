@@ -1,0 +1,9 @@
+std_msgs/Header header
+int32 camera_id
+int64 frame_id
+bool valid
+bool object_detected
+string label
+float32 confidence
+geometry_msgs/Point centroid_base
+uint32 point_count

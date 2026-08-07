@@ -1,0 +1,5 @@
+bool restart_follow
+---
+bool accepted
+string state
+string error

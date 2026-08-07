@@ -1,0 +1,6 @@
+std_msgs/Header header
+int64 pair_index
+float32 timestamp_delta_ms
+bool within_sync_tolerance
+string cam0_serial
+string cam1_serial

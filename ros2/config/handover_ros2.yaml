@@ -1,0 +1,42 @@
+/**:
+  ros__parameters:
+    repo_root: ""
+    config_path: "configs/handover.yaml"
+
+dual_camera_node:
+  ros__parameters:
+    width: 640
+    height: 480
+    fps: 30
+    publish_rate_hz: 30.0
+    start_on_init: true
+    frame_prefix: ""
+
+perception_node:
+  ros__parameters:
+    use_local_sensor_hub: false
+    process_rate_hz: 10.0
+    base_frame: "robot_base"
+    depth_scale: 0.001
+    model: "yoloe-26l-seg.pt"
+    select_mode: "highest_score"
+    device: ""
+    enable_follow_args: false
+
+robot_node:
+  ros__parameters:
+    enable_follow: true
+    auto_init: false
+    auto_start_follow: false
+    robot_ip: ""
+    status_rate_hz: 20.0
+
+handover_coordinator_node:
+  ros__parameters:
+    state_rate_hz: 10.0
+    auto_request_follow: false
+
+visualization_node:
+  ros__parameters:
+    marker_rate_hz: 10.0
+    frame_id: "robot_base"

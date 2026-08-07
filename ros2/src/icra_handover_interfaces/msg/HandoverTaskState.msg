@@ -1,0 +1,12 @@
+std_msgs/Header header
+string state
+string reason
+int64 task_epoch
+bool follow_enabled
+bool motion_triggered
+bool home_object_locked
+bool grasp_request_pending
+bool perception_target_valid
+bool robot_ready
+geometry_msgs/Point latest_object_base
+geometry_msgs/Point latest_grasp_base

@@ -1,0 +1,13 @@
+std_msgs/Header header
+bool valid
+bool object_fresh
+bool hand_fresh
+bool hand_approach_detected
+bool hand_approach_latched
+bool object_lifted
+bool robot_activation_ready
+float32 hand_object_distance_m
+float32 lift_height_delta_m
+geometry_msgs/Point filtered_object_centroid_base
+geometry_msgs/Point filtered_hand_center_base
+geometry_msgs/Vector3 filtered_hand_normal_base

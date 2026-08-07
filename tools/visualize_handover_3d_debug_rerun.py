@@ -50,14 +50,18 @@ MARKERS = (
 
 EMPTY_POINTS = np.empty((0, 3), dtype=np.float32)
 EMPTY_LINE_STRIPS: list[np.ndarray] = []
-TEMPLATE_AXIS_COLORS = [(255, 0, 0), (0, 220, 0), (0, 120, 255)]
+# SELECTED_HAND_COLOR = (255, 242, 26) # Yellow
+# SELECTED_HAND_COLOR = (37, 150, 190) # Cyan-blue
+SELECTED_HAND_COLOR = (56, 42, 116)  # purple
+UNSELECTED_HAND_COLOR = (64, 64, 64)
+DEFAULT_POINT_RADIUS_SCALE = 0.5
+DEFAULT_HAND_LINE_RADIUS_SCALE = 0.5
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Visualize a saved handover 3D debug .npz recording in Rerun.")
     parser.add_argument("recording", help="Path to output/debug_3d/*.npz")
     parser.add_argument("--normal-length", type=float, default=0.08, help="Palm normal line length in meters.")
-    parser.add_argument("--template-axis-length", type=float, default=0.06, help="Template local x/y/z axis line length in meters.")
     parser.add_argument("--depth-max-m", type=float, default=1.7, help="Maximum depth range shown in Rerun depth views.")
     parser.add_argument("--dry-run", action="store_true", help="Load and validate Rerun frame conversion without importing Rerun.")
     parser.add_argument("--connect", action="store_true", help="Connect to an already running Rerun viewer instead of spawning one.")
@@ -79,6 +83,18 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Decimal places used for per-point base-frame xyz labels.",
     )
+    parser.add_argument(
+        "--point-radius-scale",
+        type=float,
+        default=DEFAULT_POINT_RADIUS_SCALE,
+        help="Scale factor applied to all 3D point radii. Use 1.0 for the previous larger sizes.",
+    )
+    parser.add_argument(
+        "--hand-line-radius-scale",
+        type=float,
+        default=DEFAULT_HAND_LINE_RADIUS_SCALE,
+        help="Scale factor applied to hand skeleton and palm-normal line radii. Use 1.0 for the previous larger sizes.",
+    )
     return parser.parse_args()
 
 
@@ -93,24 +109,6 @@ def _as_points(value: object) -> np.ndarray:
 def _is_valid_vec(value: object, length: int = 3) -> bool:
     vec = np.asarray(value, dtype=np.float32).reshape(-1)
     return len(vec) >= int(length) and bool(np.isfinite(vec[:length]).all())
-
-
-def _valid_template_axes(data: dict[str, Any], idx: int) -> bool:
-    if "template_axes_base" not in data or "template_centroid_base" not in data:
-        return False
-    if not _is_valid_vec(data["template_centroid_base"][idx], 3):
-        return False
-    axes = np.asarray(data["template_axes_base"][idx], dtype=np.float32)
-    return axes.shape == (3, 3) and bool(np.isfinite(axes).all())
-
-
-def _first_valid_template_axes_index(data: dict[str, Any]) -> int | None:
-    if "template_axes_base" not in data:
-        return None
-    for idx in range(int(data["frame_count"])):
-        if _valid_template_axes(data, idx):
-            return idx
-    return None
 
 
 def _string_at(data: dict[str, Any], key: str, index: int) -> str:
@@ -342,9 +340,6 @@ def recording_summary_text(data: dict[str, Any]) -> str:
         f"cam1_hand_valid_frames={int((cam1_hand_counts > 0).sum())}/{frame_count} first={_first_positive_index(cam1_hand_counts)} max_landmarks={int(cam1_hand_counts.max()) if len(cam1_hand_counts) else 0}",
         f"selected_hand_valid_frames={int(selected_hand.sum())}/{frame_count}",
     ]
-    axes_first = _first_valid_template_axes_index(data)
-    axes_key_status = "present" if "template_axes_base" in data else "missing"
-    lines.append(f"template_local_axes={axes_key_status} first_valid={axes_first}")
     if "hand_selector_cam0_reject_reason" in data:
         lines.append(f"frame0_hand_reject_cam0={_string_at(data, 'hand_selector_cam0_reject_reason', 0) or '-'}")
         lines.append(f"frame0_hand_reject_cam1={_string_at(data, 'hand_selector_cam1_reject_reason', 0) or '-'}")
@@ -423,8 +418,9 @@ def build_hand_payload(
     points = np.asarray(points_base, dtype=np.float32).reshape((-1, 3))
     mask = np.asarray(valid_mask, dtype=bool).reshape(-1)
     valid_indices = [idx for idx in range(min(len(points), len(mask))) if mask[idx] and np.isfinite(points[idx]).all()]
+    color = SELECTED_HAND_COLOR if selected else UNSELECTED_HAND_COLOR
     if not valid_indices:
-        return EMPTY_POINTS, [], (255, 242, 26) if selected else (255, 255, 255)
+        return EMPTY_POINTS, [], color
 
     valid_points = points[valid_indices]
     index_map = {original_index: new_index for new_index, original_index in enumerate(valid_indices)}
@@ -433,7 +429,7 @@ def build_hand_payload(
         if start_index in index_map and end_index in index_map:
             strips.append(valid_points[[index_map[start_index], index_map[end_index]]])
 
-    return valid_points, strips, (255, 242, 26) if selected else (255, 255, 255)
+    return valid_points, strips, color
 
 
 def count_frame_entities(data: dict[str, Any], frame_index: int, *, selected_hand_only: bool = False) -> int:
@@ -459,7 +455,6 @@ def count_frame_entities(data: dict[str, Any], frame_index: int, *, selected_han
         count += int(len(strips) > 0)
     count += int(_valid_palm_normal(data, idx))
     count += int(_is_valid_vec(data["eef_pose_base"][idx], 6))
-    count += int(_valid_template_axes(data, idx))
     if has_tactile_stream(data):
         count += 1  # tactile status text
         if _tactile_enabled_at(data, idx):
@@ -547,7 +542,11 @@ def _build_blueprint(rrb: Any, data: dict[str, Any], *, include_images: bool) ->
     include_tactile = has_tactile_stream(data)
     max_tactile_mags = _max_tactile_mags(data) if include_tactile else 0
 
-    world_view = rrb.Spatial3DView(origin="/world", name="Handover 3D Debug")
+    world_view = rrb.Spatial3DView(
+        origin="/world",
+        name="Handover 3D Debug",
+        background=[255, 255, 255],
+    )
     camera_views: list[Any] = []
     if include_images and hasattr(rrb, "Spatial2DView"):
         camera_views = [
@@ -654,6 +653,7 @@ def log_points(
     color: tuple[int, int, int] | tuple[float, float, float],
     *,
     radius: float | None = None,
+    radius_scale: float = 1.0,
     labels: list[str] | None = None,
     show_labels: bool | None = None,
 ) -> None:
@@ -663,7 +663,7 @@ def log_points(
         return
     kwargs: dict[str, Any] = {"colors": _color_array(len(points), color)}
     if radius is not None:
-        kwargs["radii"] = np.full((len(points),), float(radius), dtype=np.float32)
+        kwargs["radii"] = np.full((len(points),), float(radius) * float(radius_scale), dtype=np.float32)
     if labels is not None:
         labels = list(labels)
         if len(labels) != len(points):
@@ -681,6 +681,7 @@ def log_line_strips(
     color: tuple[int, int, int] | tuple[float, float, float],
     *,
     radius: float | None = None,
+    radius_scale: float = 1.0,
 ) -> None:
     normalized = [np.asarray(strip, dtype=np.float32).reshape((-1, 3)) for strip in strips if len(strip) > 0]
     if not normalized:
@@ -688,7 +689,7 @@ def log_line_strips(
         return
     kwargs: dict[str, Any] = {"colors": _rgb(color)}
     if radius is not None:
-        kwargs["radii"] = float(radius)
+        kwargs["radii"] = float(radius) * float(radius_scale)
     rr.log(entity, rr.LineStrips3D(normalized, **kwargs))
 
 
@@ -756,22 +757,31 @@ def log_hand(
     *,
     include_coordinate_labels: bool,
     point_coordinate_precision: int,
+    point_radius_scale: float,
+    hand_line_radius_scale: float,
 ) -> None:
     selected = int(data["selected_hand_camera"][idx]) == int(camera_id)
-    default_color = (64, 115, 255) if camera_id == 0 else (255, 77, 191)
-    points, strips, selected_color = build_hand_payload(
+    points, strips, color = build_hand_payload(
         data[f"cam{camera_id}_hand_points_base"][idx],
         data[f"cam{camera_id}_hand_valid_mask"][idx],
         selected=selected,
     )
-    color = selected_color if selected else default_color
     prefix = f"/world/hands/cam{camera_id}"
     labels = point_coordinate_labels(points, f"cam{camera_id}_hand", point_coordinate_precision) if include_coordinate_labels else None
-    log_points(rr, f"{prefix}/keypoints", points, color, radius=0.006, labels=labels, show_labels=False)
-    log_line_strips(rr, f"{prefix}/skeleton", strips, color, radius=0.003)
+    log_points(rr, f"{prefix}/keypoints", points, color, radius=0.006, radius_scale=point_radius_scale, labels=labels, show_labels=False)
+    log_line_strips(rr, f"{prefix}/skeleton", strips, color, radius=0.003, radius_scale=hand_line_radius_scale)
 
 
-def log_selected_hand(rr: Any, data: dict[str, Any], idx: int, *, include_coordinate_labels: bool, point_coordinate_precision: int) -> None:
+def log_selected_hand(
+    rr: Any,
+    data: dict[str, Any],
+    idx: int,
+    *,
+    include_coordinate_labels: bool,
+    point_coordinate_precision: int,
+    point_radius_scale: float,
+    hand_line_radius_scale: float,
+) -> None:
     selected_camera = int(data["selected_hand_camera"][idx]) if "selected_hand_camera" in data else -1
     selected_hand_valid = bool(data["selected_hand_valid"][idx]) if "selected_hand_valid" in data else selected_camera in (0, 1)
     for camera_id in (0, 1):
@@ -783,6 +793,8 @@ def log_selected_hand(rr: Any, data: dict[str, Any], idx: int, *, include_coordi
                 camera_id,
                 include_coordinate_labels=include_coordinate_labels,
                 point_coordinate_precision=point_coordinate_precision,
+                point_radius_scale=point_radius_scale,
+                hand_line_radius_scale=hand_line_radius_scale,
             )
         else:
             prefix = f"/world/hands/cam{camera_id}"
@@ -798,22 +810,23 @@ def log_marker(
     entity: str,
     radius: float,
     color: tuple[int, int, int],
+    point_radius_scale: float,
 ) -> None:
     if key in data and _is_valid_vec(data[key][idx], 3):
         point = np.asarray(data[key][idx], dtype=np.float32).reshape(-1)[:3].reshape(1, 3)
     else:
         point = EMPTY_POINTS
-    log_points(rr, entity, point, color, radius=radius)
+    log_points(rr, entity, point, color, radius=radius, radius_scale=point_radius_scale)
 
 
-def log_palm_normal(rr: Any, data: dict[str, Any], idx: int, normal_length_m: float) -> None:
+def log_palm_normal(rr: Any, data: dict[str, Any], idx: int, normal_length_m: float, hand_line_radius_scale: float) -> None:
     strips: list[np.ndarray] = []
     if _valid_palm_normal(data, idx):
         center = np.asarray(data["selected_palm_center_base"][idx], dtype=np.float32).reshape(-1)[:3]
         normal = np.asarray(data["selected_palm_normal_base"][idx], dtype=np.float32).reshape(-1)[:3]
         normal = normal / float(np.linalg.norm(normal))
         strips = [np.stack([center, center + normal * float(normal_length_m)], axis=0)]
-    log_line_strips(rr, "/world/selected/palm_normal", strips, (255, 242, 26), radius=0.004)
+    log_line_strips(rr, "/world/selected/palm_normal", strips, (255, 242, 26), radius=0.004, radius_scale=hand_line_radius_scale)
 
 
 def log_eef_axes(rr: Any, pose_xyz_rotvec: np.ndarray) -> None:
@@ -830,30 +843,6 @@ def log_eef_axes(rr: Any, pose_xyz_rotvec: np.ndarray) -> None:
         rr.log("/world/eef/axes", rr.LineStrips3D(strips, colors=colors, radii=0.004))
     except TypeError:
         log_line_strips(rr, "/world/eef/axes", strips, (255, 255, 255), radius=0.004)
-
-
-def log_template_axes(rr: Any, data: dict[str, Any], idx: int, axis_length_m: float) -> None:
-    entity = "/world/template/local_axes"
-    if not _valid_template_axes(data, idx):
-        log_line_strips(rr, entity, EMPTY_LINE_STRIPS, (255, 255, 255), radius=0.004)
-        return
-
-    origin = np.asarray(data["template_centroid_base"][idx], dtype=np.float32).reshape(-1)[:3]
-    axes = np.asarray(data["template_axes_base"][idx], dtype=np.float32).reshape((3, 3))
-    strips: list[np.ndarray] = []
-    length = max(float(axis_length_m), 0.0)
-    for axis_index in range(3):
-        axis = axes[axis_index]
-        norm = float(np.linalg.norm(axis))
-        if not np.isfinite(norm) or norm <= 1e-9:
-            log_line_strips(rr, entity, EMPTY_LINE_STRIPS, (255, 255, 255), radius=0.004)
-            return
-        axis = axis / norm
-        strips.append(np.stack([origin, origin + axis * length], axis=0))
-    try:
-        rr.log(entity, rr.LineStrips3D(strips, colors=TEMPLATE_AXIS_COLORS, radii=0.004))
-    except TypeError:
-        log_line_strips(rr, entity, strips, (255, 255, 255), radius=0.004)
 
 
 def log_text(rr: Any, entity: str, text: str) -> None:
@@ -926,22 +915,41 @@ def log_frame(
     idx: int,
     *,
     normal_length_m: float,
-    template_axis_length_m: float,
     depth_max_m: float,
     include_coordinate_labels: bool,
     point_coordinate_precision: int,
     selected_hand_only: bool,
+    point_radius_scale: float,
+    hand_line_radius_scale: float,
 ) -> None:
     set_frame_time(rr, data, idx)
 
     object_points = _as_points(data["object_points_base"][idx])
     object_color = (199, 199, 199) if bool(data["object_valid"][idx]) else (217, 64, 56)
     object_labels = point_coordinate_labels(object_points, "object", point_coordinate_precision) if include_coordinate_labels else None
-    log_points(rr, "/world/object/cloud", object_points, object_color, radius=0.0025, labels=object_labels, show_labels=False)
+    log_points(
+        rr,
+        "/world/object/cloud",
+        object_points,
+        object_color,
+        radius=0.0025,
+        radius_scale=point_radius_scale,
+        labels=object_labels,
+        show_labels=False,
+    )
 
     template_points = _as_points(data["template_points_base"][idx])
     template_labels = point_coordinate_labels(template_points, "template", point_coordinate_precision) if include_coordinate_labels else None
-    log_points(rr, "/world/template/cloud", template_points, (26, 204, 242), radius=0.0025, labels=template_labels, show_labels=False)
+    log_points(
+        rr,
+        "/world/template/cloud",
+        template_points,
+        (26, 204, 242),
+        radius=0.0025,
+        radius_scale=point_radius_scale,
+        labels=template_labels,
+        show_labels=False,
+    )
 
     if selected_hand_only:
         log_selected_hand(
@@ -950,6 +958,8 @@ def log_frame(
             idx,
             include_coordinate_labels=include_coordinate_labels,
             point_coordinate_precision=point_coordinate_precision,
+            point_radius_scale=point_radius_scale,
+            hand_line_radius_scale=hand_line_radius_scale,
         )
     else:
         for camera_id in (0, 1):
@@ -960,14 +970,15 @@ def log_frame(
                 camera_id,
                 include_coordinate_labels=include_coordinate_labels,
                 point_coordinate_precision=point_coordinate_precision,
+                point_radius_scale=point_radius_scale,
+                hand_line_radius_scale=hand_line_radius_scale,
             )
 
     for key, entity, radius, color in MARKERS:
-        log_marker(rr, data, idx, key, entity, radius, color)
+        log_marker(rr, data, idx, key, entity, radius, color, point_radius_scale)
     log_source_flags(rr, data, idx)
-    log_palm_normal(rr, data, idx, normal_length_m)
+    #log_palm_normal(rr, data, idx, normal_length_m, hand_line_radius_scale)
     log_eef_axes(rr, data["eef_pose_base"][idx])
-    log_template_axes(rr, data, idx, template_axis_length_m)
     log_tactile(rr, data, idx)
     log_status(rr, frame_status_text(data, idx) + "\n\n" + recording_summary_text(data))
     if has_image_streams(data):
@@ -982,7 +993,6 @@ def dry_run(
     data: dict[str, Any],
     *,
     normal_length_m: float,
-    template_axis_length_m: float,
     depth_max_m: float,
     selected_hand_only: bool,
 ) -> None:
@@ -1003,11 +1013,6 @@ def dry_run(
     if _valid_palm_normal(data, 0):
         print(f"[INFO] Palm normal line length: {float(normal_length_m):.3f} m.")
     print(f"[INFO] Hand visualization mode: {'selected hand only' if selected_hand_only else 'both camera hands'}.")
-    axes_first = _first_valid_template_axes_index(data)
-    if axes_first is None:
-        print("[INFO] Template local axes: not recorded or no valid axes.")
-    else:
-        print(f"[INFO] Template local axes first valid frame: {axes_first}; axis length: {float(template_axis_length_m):.3f} m.")
     if has_tactile_stream(data):
         print("[INFO] Tactile stream detected.")
         print(tactile_status_text(data, 0))
@@ -1029,6 +1034,12 @@ def main() -> int:
     args = parse_args()
     if args.connect and args.save_rrd:
         raise RuntimeError("--connect and --save-rrd are mutually exclusive.")
+    point_radius_scale = float(args.point_radius_scale)
+    if point_radius_scale <= 0.0:
+        raise RuntimeError("--point-radius-scale must be greater than 0.")
+    hand_line_radius_scale = float(args.hand_line_radius_scale)
+    if hand_line_radius_scale <= 0.0:
+        raise RuntimeError("--hand-line-radius-scale must be greater than 0.")
 
     data = load_debug_3d_npz(args.recording)
     frame_count = int(data["frame_count"])
@@ -1039,7 +1050,6 @@ def main() -> int:
         dry_run(
             data,
             normal_length_m=args.normal_length,
-            template_axis_length_m=args.template_axis_length,
             depth_max_m=args.depth_max_m,
             selected_hand_only=bool(args.selected_hand_only),
         )
@@ -1055,11 +1065,12 @@ def main() -> int:
             data,
             idx,
             normal_length_m=args.normal_length,
-            template_axis_length_m=args.template_axis_length,
             depth_max_m=args.depth_max_m,
             include_coordinate_labels=not args.no_point_coordinate_labels,
             point_coordinate_precision=args.point_coordinate_precision,
             selected_hand_only=bool(args.selected_hand_only),
+            point_radius_scale=point_radius_scale,
+            hand_line_radius_scale=hand_line_radius_scale,
         )
         print(frame_status_text(data, idx), flush=True)
 

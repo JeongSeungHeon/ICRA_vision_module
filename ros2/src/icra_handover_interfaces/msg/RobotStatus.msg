@@ -1,0 +1,13 @@
+std_msgs/Header header
+string state
+string last_error
+bool is_connected
+bool using_mock
+string active_request
+int64 active_request_id
+geometry_msgs/Pose tcp_pose_base
+string last_command_type
+bool grasp_ok
+int64 task_ready_epoch
+int64 reset_done_epoch
+int64 task_done_epoch

@@ -1,0 +1,12 @@
+std_msgs/Header header
+int32 camera_id
+int64 frame_id
+bool valid
+bool hand_detected
+string handedness
+float32 confidence
+geometry_msgs/Point palm_center_base
+geometry_msgs/Vector3 palm_normal_base
+geometry_msgs/Point wrist_base
+geometry_msgs/Vector3 hand_velocity_base
+uint32 candidate_count

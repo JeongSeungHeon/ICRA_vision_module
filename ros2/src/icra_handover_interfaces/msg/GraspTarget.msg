@@ -1,0 +1,11 @@
+std_msgs/Header header
+bool valid
+string measurement_source
+geometry_msgs/Point object_point_base
+geometry_msgs/Point grasp_point_base
+geometry_msgs/Pose target_pose_base
+float32 hand_height_clearance_m
+float32 distance_to_centroid_m
+uint32 source_point_count
+bool used_temporal_hold
+bool dropout_hold_active

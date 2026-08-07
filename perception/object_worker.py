@@ -247,13 +247,19 @@ class ObjectWorker:
 
     @classmethod
     def from_config(cls, camera_id: int, config_path: str | Path = DEFAULT_CONFIG_PATH) -> "ObjectWorker":
+        config_path = Path(config_path)
         with open(config_path, "r", encoding="utf-8") as handle:
             config = yaml.safe_load(handle) or {}
 
         object_cfg = config.get("perception", {}).get("object", {})
         segmentation_cfg = object_cfg.get("segmentation", {})
+        model_name = segmentation_cfg.get("model_name", "yoloe-26l-seg.pt")
+        model_path = Path(str(model_name))
+        repo_relative_model_path = config_path.parent.parent / model_path
+        if not model_path.is_absolute() and repo_relative_model_path.exists():
+            model_name = str(repo_relative_model_path)
         segmentation_engine = SegmentationEngine(
-            model_name=segmentation_cfg.get("model_name", "yoloe-26l-seg.pt"),
+            model_name=model_name,
             prompt_classes=segmentation_cfg.get("prompt_classes", ["cup"]),
             imgsz=int(segmentation_cfg.get("imgsz", 640)),
             conf=float(segmentation_cfg.get("conf", 0.25)),

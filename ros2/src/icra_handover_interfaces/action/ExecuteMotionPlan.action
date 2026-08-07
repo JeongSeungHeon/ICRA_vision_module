@@ -1,0 +1,17 @@
+bool use_latest_target
+geometry_msgs/Pose target_pose
+geometry_msgs/Point object_point_base
+bool plan_only
+bool reset_before_start
+bool execute_grasp_place
+float32 timeout_s
+---
+bool success
+bool executed
+string final_state
+string error
+float32 min_cartesian_fraction
+---
+string phase
+float32 target_age_s
+float32 cartesian_fraction

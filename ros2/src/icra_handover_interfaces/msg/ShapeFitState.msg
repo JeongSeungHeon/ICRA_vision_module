@@ -1,0 +1,10 @@
+std_msgs/Header header
+bool valid
+bool initialized
+string label
+string template_id
+string reason
+float32 confidence
+geometry_msgs/Point centroid_base
+geometry_msgs/Pose pose_base
+uint32 fitted_point_count

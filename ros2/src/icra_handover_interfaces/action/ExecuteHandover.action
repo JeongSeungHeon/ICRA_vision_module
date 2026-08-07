@@ -1,0 +1,13 @@
+bool init_robot
+bool start_follow
+bool start_grasp_place
+bool reset_before_start
+float32 timeout_s
+---
+bool success
+string final_state
+string error
+---
+string state
+string active_request
+int64 active_request_id

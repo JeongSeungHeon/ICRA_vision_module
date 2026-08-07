@@ -434,7 +434,7 @@ perception:
       # ICP 수렴 translation tolerance입니다.
       translation_tolerance_m: 1.0e-5
       # ICP 결과 centroid jump 허용값입니다.
-      max_centroid_jump_m: 0.25
+      max_centroid_jump_m: 3
       crop:
         # ICP 전에 target/source cloud 상단 일부를 crop할지 정합니다.
         enabled: true
@@ -583,7 +583,7 @@ robot:
     # 고정 위치 release trigger 대기용 timeout입니다. tactile continuous descent에서는 min_z가 fallback 한계입니다.
     # release_timeout_s: 1.0
     # tactile release descent에서 허용할 최소 robot base Z입니다.
-    release_descent_min_z_mm: 10.0
+    release_descent_min_z_mm: 40.0
     # legacy step mode용 값입니다. 현재 single-target tactile release descent에서는 사용하지 않습니다.
     release_descent_step_mm: 2.0
     # tactile release descent 중 step 사이 tactile 확인 주기입니다.

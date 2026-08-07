@@ -7,8 +7,12 @@ import numpy as np
 
 from utils.debug_3d_recorder import Debug3DRecorder, load_debug_3d_npz
 from tools.visualize_handover_3d_debug_rerun import (
+    SELECTED_HAND_COLOR,
+    UNSELECTED_HAND_COLOR,
     _build_blueprint,
+    build_hand_payload,
     count_frame_entities,
+    log_frame,
     log_points,
     log_tactile,
     point_coordinate_labels,
@@ -164,6 +168,11 @@ class _FakeRerun:
         def __init__(self, recursive=False):
             self.recursive = recursive
 
+    class LineStrips3D:
+        def __init__(self, strips, **kwargs):
+            self.strips = [np.asarray(strip) for strip in strips]
+            self.kwargs = kwargs
+
     class Scalars:
         def __init__(self, value):
             self.value = float(value)
@@ -174,9 +183,13 @@ class _FakeRerun:
 
     def __init__(self):
         self.logged = []
+        self.times = []
 
     def log(self, entity, payload):
         self.logged.append((entity, payload))
+
+    def set_time(self, timeline, **kwargs):
+        self.times.append((timeline, kwargs))
 
 
 class _FakeBlueprintNode:
@@ -297,6 +310,10 @@ class Debug3DRecorderTests(unittest.TestCase):
         self.assertIn("/tactile/mag_0/x", time_series[1].contents)
         self.assertIn("/tactile/mag_1/z", time_series[1].contents)
 
+        world_views = _collect_blueprint_nodes(blueprint, "Spatial3DView")
+        self.assertEqual(len(world_views), 1)
+        self.assertEqual(world_views[0].kwargs["background"], [255, 255, 255])
+
     def test_blueprint_omits_tactile_graph_without_tactile_stream(self):
         data = {"frame_count": np.asarray(1, dtype=np.int32)}
 
@@ -366,23 +383,55 @@ class Debug3DRecorderTests(unittest.TestCase):
             self.assertEqual(data["template_axes_base"].shape, (1, 3, 3))
             self.assertTrue(np.isnan(data["template_axes_base"][0]).all())
 
-    def test_rerun_entity_count_includes_valid_template_axes(self):
+    def test_hand_payload_uses_high_contrast_colors_for_white_background(self):
+        points = np.arange(9, dtype=np.float32).reshape(3, 3)
+        valid_mask = np.ones((3,), dtype=bool)
+
+        _points, _strips, selected_color = build_hand_payload(points, valid_mask, selected=True)
+        _points, _strips, unselected_color = build_hand_payload(points, valid_mask, selected=False)
+
+        self.assertEqual(selected_color, SELECTED_HAND_COLOR)
+        self.assertEqual(unselected_color, UNSELECTED_HAND_COLOR)
+
+    def test_rerun_logging_omits_template_axes_but_keeps_template_and_eef(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             recorder = Debug3DRecorder(output_dir=Path(temp_dir))
             _append(
                 recorder,
                 0,
-                np.empty((0, 3), dtype=np.float32),
-                np.empty((0, 3), dtype=np.float32),
+                np.asarray([[0.1, 0.2, 0.3]], dtype=np.float32),
+                np.asarray([[0.2, 0.3, 0.4]], dtype=np.float32),
             )
             data = load_debug_3d_npz(recorder.save())
 
-            with_axes = count_frame_entities(data, 0)
-            data_without_axes = dict(data)
-            data_without_axes.pop("template_axes_base")
-            without_axes = count_frame_entities(data_without_axes, 0)
+            fake_rr = _FakeRerun()
+            log_frame(
+                fake_rr,
+                data,
+                0,
+                normal_length_m=0.08,
+                depth_max_m=1.7,
+                include_coordinate_labels=False,
+                point_coordinate_precision=4,
+                selected_hand_only=False,
+                point_radius_scale=0.5,
+                hand_line_radius_scale=0.5,
+            )
+            logged_entities = [entity for entity, _payload in fake_rr.logged]
+            logged_payloads = {entity: payload for entity, payload in fake_rr.logged}
 
-            self.assertEqual(with_axes, without_axes + 1)
+            self.assertNotIn("/world/template/local_axes", logged_entities)
+            self.assertIn("/world/template/cloud", logged_entities)
+            self.assertIn("/world/template/centroid", logged_entities)
+            self.assertIn("/world/eef/axes", logged_entities)
+            np.testing.assert_array_equal(
+                logged_payloads["/world/hands/cam0/keypoints"].kwargs["colors"][0],
+                np.asarray(SELECTED_HAND_COLOR, dtype=np.uint8),
+            )
+            np.testing.assert_array_equal(
+                logged_payloads["/world/hands/cam1/keypoints"].kwargs["colors"][0],
+                np.asarray(UNSELECTED_HAND_COLOR, dtype=np.uint8),
+            )
 
     def test_missing_values_are_nan_or_empty(self):
         with tempfile.TemporaryDirectory() as temp_dir:

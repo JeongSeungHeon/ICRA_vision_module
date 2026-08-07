@@ -414,7 +414,7 @@ class Debug3DRecorder:
             else int(getattr(selected_hand, "selected_camera")),
             "selected_handedness": _none_if_missing(getattr(selected_hand, "handedness", None)),
             "selected_palm_center_base": _vec(getattr(selected_hand, "palm_center_base", None), 3),
-            "selected_palm_normal_base": _vec(getattr(selected_hand, "palm_normal_base", None), 3),
+            #"selected_palm_normal_base": _vec(getattr(selected_hand, "palm_normal_base", None), 3),
             "selected_wrist_base": _vec(getattr(selected_hand, "wrist_base", None), 3),
             "selected_hand_confidence": float(getattr(selected_hand, "confidence", np.nan)),
             "hand_selection_reason": str(_selector_field(hand_selector_debug, "selection_reason", "")),
