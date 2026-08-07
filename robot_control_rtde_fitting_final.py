@@ -33,6 +33,14 @@ from perception.object_merger import ObjectMerger
 from perception.object_worker import HandednessAwareObjectClassLock, ObjectWorkerCam0, ObjectWorkerCam1
 from perception.silhouette_constraint import SilhouetteObservation
 from perception.shape_fitting_tracker_v2 import ShapeFittingTracker
+from perception.sam3d_backend import (
+    bootstrap_runtime_template,
+    build_fastsam_object_workers,
+    build_runtime_shape_fitting_tracker,
+    validate_hands23_runtime_assets,
+    validate_main_runtime,
+)
+from perception.sam3d_live_runtime import Sam3DLiveRuntime, enforce_sam3d_target_gate
 from perception.target_predictor import TargetPredictor
 from robot.rtde_controller import RtdeController
 from system.dual_sensor_hub import DualSensorHub
@@ -77,8 +85,7 @@ HOVER_Z_OFFSET_MM = 0
 DESCEND_EXTRA_MM = 0.0
 BACKOFF_X_MM = 75.0 # 55.0
 DEFAULT_POST_RELEASE_Z_OFFSET_MM = 0.0
-HOME_PLACE_X_OFFSET_MM = 0.0
-HOME_PLACE_Y_OFFSET_MM = 0.0
+DEFAULT_PLACE_OBJECT_XY_MM = (600.0, 0.0)
 HOME_PLACE_MIN_Z_MM = 40.0
 PRE_RELEASE_MIN_Z_EPSILON_MM = 1e-3
 GRASP_POINT_Y_OFFSET_MM = 0.0
@@ -185,6 +192,12 @@ def parse_args():
     """Parse CLI switches for perception, robot follow, debugging, and profiling."""
     parser = argparse.ArgumentParser(
         description="Run dual-camera perception, build a grasp target from hand pose + merged object cloud, and follow it with UR5 RTDE."
+    )
+    parser.add_argument(
+        "--object-backend",
+        choices=("sam3d", "legacy"),
+        default=None,
+        help="Object perception backend. Defaults to perception.object.backend (sam3d).",
     )
     parser.add_argument("--model", default="yoloe-26l-seg.pt", help="Model name or local weights path.")
     parser.add_argument(
@@ -407,12 +420,30 @@ def apply_config_defaults(args, config):
     safety_cfg = config.get("safety", {})
     workspace_cfg = safety_cfg.get("workspace_bounds_m", {})
 
+    if args.object_backend is None:
+        args.object_backend = str(
+            config.get("perception", {}).get("object", {}).get("backend", "sam3d")
+        ).strip().lower()
+    if args.object_backend not in {"sam3d", "legacy"}:
+        raise ValueError(
+            f"Unsupported perception.object.backend={args.object_backend!r}; expected sam3d or legacy"
+        )
+
     if args.robot_ip is None:
         args.robot_ip = rtde_cfg.get("robot_ip")
     if args.control_hz is None:
         args.control_hz = float(live_cfg.get("control_hz", DEFAULT_CONTROL_HZ))
     if args.follow_z is None:
         args.follow_z = bool(live_cfg.get("follow_z", False))
+    place_object_xy_mm = return_sequence_cfg.get(
+        "place_object_xy_mm",
+        DEFAULT_PLACE_OBJECT_XY_MM,
+    )
+    if not isinstance(place_object_xy_mm, (list, tuple)) or len(place_object_xy_mm) != 2:
+        raise ValueError("robot.return_sequence.place_object_xy_mm must contain exactly [x_mm, y_mm]")
+    args.place_object_xy_mm = tuple(float(value) for value in place_object_xy_mm)
+    if not np.all(np.isfinite(np.asarray(args.place_object_xy_mm, dtype=np.float64))):
+        raise ValueError("robot.return_sequence.place_object_xy_mm must contain finite values")
     args.post_release_z_offset_mm = (
         float(return_sequence_cfg.get("post_release_z_offset_m", DEFAULT_POST_RELEASE_Z_OFFSET_MM / 1000.0)) * 1000.0
     )
@@ -1015,12 +1046,6 @@ class FollowSharedState:
         self.follow_idle_event = threading.Event() # follow 스레드가 현재 유휴 상태(즉, 로봇이 움직이지 않고 제어 명령을 기다리는 상태)인지 나타내는 이벤트. follow_pause_requested가 True일 때 follow_idle_event가 set되면 follow 스레드는 제어를 반환할 준비가 된 것으로 간주함. 초기값은 set된 상태로 시작하여, follow 모드가 활성화되고 제어 명령이 주어지면 clear됨. follow 모드가 비활성화되거나 일시 중지 요청이 있을 때 다시 set됨. follow_idle_event는 주로 pregrasp 단계에서 follow 스레드가 로봇 제어를 반환할 때까지 기다리는 데 사용됨.
         self.follow_idle_event.set() # follow 스레드가 초기에는 유휴 상태로 시작하도록 설정
 
-        self.home_object_xyz_mm = None # 홈 위치에서의 object의 xyz 위치 (mm 단위)
-        self.home_object_locked = False # 홈 위치에서 object 위치가 고정되어 있는지 여부. True이면 home_object_xyz_mm이 홈 위치에서의 object 위치로 간주되고, follow 모드에서 참조로 사용될 수 있음.
-        self.home_pose_buffer = deque(maxlen=4) # 홈 위치에서의 최근 로봇 pose 버퍼 (base 좌표계, x/y/z in mm + rotvec)
-        self.home_object_pixel = None # 홈 위치에서 object의 pixel 위치 (u/v in pixels)
-        self.home_pixel_buffer = deque(maxlen=15) #  홈 위치에서의 최근 object pixel 위치 버퍼 (u/v in pixels)
-
         self.object_stopped = False # 로봇이 object를 따라가다가 멈춰야 하는 상황이 발생했는지 여부. True이면 follow 모드에서 로봇이 움직이지 않고 제어 명령을 기다리는 상태로 전환됨.
         self.stop_pose_buffer = deque(maxlen=15) # object이 멈춰야 하는 상황이 발생했을 때의 최근 로봇 pose 버퍼 (base 좌표계, x/y/z in mm + rotvec)
 
@@ -1030,7 +1055,7 @@ class FollowSharedState:
         self.grasp_offset_xyz_mm = None # grasp이 닫힌 후에 로봇과 object 사이의 xyz offset (mm 단위). follow 모드에서 로봇이 grasp 제약으로 움직일 때 참조로 사용됨.
         self.recent_grasp_z_mm_buffer = deque(maxlen=PLACE_Z_GRASP_BUFFER_FRAMES) # 최근 grasp z 샘플 버퍼 (mm 단위). grasp이 닫힌 후에 place 높이 추정에 사용됨.
         self.recent_template_bottom_z_mm_buffer = deque(maxlen=PLACE_Z_GRASP_BUFFER_FRAMES) # 최근 fitted template bottom z 샘플 버퍼 (mm 단위). grasp이 닫힌 후에 place 높이 추정에 사용됨.
-        self.frozen_place_z_mm = None # grasp이 닫힌 후에 place 높이로 고정된 z 값 (mm 단위). follow 모드에서 로봇이 place 제약으로 움직일 때 참조로 사용됨. None이면 아직 고정되지 않은 상태를 나타냄.
+        self.frozen_place_z_mm = None # grasp 직전에 place 높이로 고정된 z 값 (mm 단위). None이면 아직 grasp를 시작할 수 없음.
         self.frozen_place_z_raw_mm = None # 고정된 place z의 원시값 (mm 단위). grasp z 샘플과 fitted template bottom z 샘플의 중앙값을 계산하여 place z로 고정할 때, 이 값은 중앙값 계산에 사용된 원시 샘플의 중앙값을 나타냄. 디버그용으로 사용됨.
         self.frozen_place_z_grasp_median_mm = None # 고정된 place z의 grasp z 샘플 중앙값 (mm 단위). grasp이 닫힌 후에 place 높이로 고정할 때, 이 값은 중앙값 계산에 사용된 grasp z 샘플의 중앙값을 나타냄. 디버그용으로 사용됨.
         self.frozen_place_z_template_bottom_median_mm = None # 고정된 place z의 fitted template bottom z 샘플 중앙값 (mm 단위). grasp이 닫힌 후에 place 높이로 고정할 때, 이 값은 중앙값 계산에 사용된 fitted template bottom z 샘플의 중앙값을 나타냄. 디버그용으로 사용됨.
@@ -1131,7 +1156,7 @@ class FollowSharedState:
                 self.recent_template_bottom_z_mm_buffer.append(template_bottom_z_mm)
 
     def finalize_place_z_from_recent_samples(self):
-        """Freeze the place height estimate after grasp closes."""
+        """Freeze the place height estimate before the gripper closes."""
         with self.lock:
             self.frozen_place_z_mm = None
             self.frozen_place_z_raw_mm = None
@@ -1209,11 +1234,6 @@ class FollowSharedState:
             self.fixed_orientation_base = None
             self.initial_pose_base = None
             self.follow_pause_requested = False
-            self.home_object_xyz_mm = None
-            self.home_object_locked = False
-            self.home_pose_buffer.clear()
-            self.home_object_pixel = None
-            self.home_pixel_buffer.clear()
             self.object_stopped = False
             self.stop_pose_buffer.clear()
             self.latest_object_xyz_mm = None
@@ -1288,7 +1308,6 @@ class FollowSharedState:
                     f"eef_target_dist_xy={dist_xy:.1f} mm"
                 )
 
-        self.try_lock_home_pose(object_xyz_mm, pixel_xy)
         self.update_stop_state(object_xyz_mm)
 
         with self.lock:
@@ -1428,39 +1447,6 @@ class FollowSharedState:
                 "task_state": self.task_state,
                 "task_epoch": self.task_epoch,
             }
-
-    def try_lock_home_pose(self, object_xyz_mm, pixel_xy):
-        """Lock the stable start pose used later as the delivery location."""
-        if self.home_object_locked:
-            return
-
-        self.home_pose_buffer.append(object_xyz_mm.copy())
-        if pixel_xy is not None:
-            self.home_pixel_buffer.append(np.array(pixel_xy, dtype=np.int32))
-
-        if len(self.home_pose_buffer) < self.home_pose_buffer.maxlen:
-            return
-
-        buf = np.stack(self.home_pose_buffer, axis=0)
-        xyz_range = buf.max(axis=0) - buf.min(axis=0)
-
-        stable_xy = (xyz_range[0] < 15.0) and (xyz_range[1] < 15.0)
-        stable_z = xyz_range[2] < 18.0
-
-        if stable_xy and stable_z:
-            self.home_object_xyz_mm = buf.mean(axis=0)
-
-            if len(self.home_pixel_buffer) > 0:
-                pix_buf = np.stack(self.home_pixel_buffer, axis=0)
-                home_pix = np.median(pix_buf, axis=0).astype(np.int32)
-                self.home_object_pixel = (int(home_pix[0]), int(home_pix[1]))
-            else:
-                self.home_object_pixel = None
-
-            self.home_object_locked = True
-            print(f"[INFO] Home object position locked: {self.home_object_xyz_mm}")
-            if self.home_object_pixel is not None:
-                print(f"[INFO] Home object pixel locked: {self.home_object_pixel}")
 
     def update_stop_state(self, object_xyz_mm):
         """Detect when the object has settled after motion starts."""
@@ -2002,6 +1988,15 @@ class RobotWorker:
         # shared_state 기준 final pose check가 실패하면 grasp를 시작하지 않는다.
         if not self.shared_state.is_pregrasp_pose_reached(robot_pose):
             self._set_status(last_error="grasp request ignored because final pose check failed")
+            return
+
+        # Place Z must be frozen before the gripper closes.  The main loop normally
+        # prepares it before submitting this request; recheck here so a reset/race
+        # can never start a grasp without a complete return target.
+        with self.shared_state.lock:
+            frozen_place_z_mm = self.shared_state.frozen_place_z_mm
+        if frozen_place_z_mm is None or not np.isfinite(float(frozen_place_z_mm)):
+            self._set_status(last_error="grasp request ignored because place Z is not ready")
             return
 
         # main loop가 넘긴 geometry/action context를 RobotActionContext로 정규화한다.
@@ -3827,7 +3822,7 @@ def reset_tactile_baseline_after_open(tactile_manager, delay_s, cancel_event=Non
 
 
 def save_grasp_offset(controller, shared_state, on_state_read=None):
-    """Store object-to-tool offset and freeze place-height data after grasp."""
+    """Store the object-to-tool offset after a verified grasp."""
     snap = shared_state.get_snapshot()
     obj_xyz = snap["latest_object_xyz_mm"]
     if obj_xyz is None:
@@ -3848,62 +3843,72 @@ def save_grasp_offset(controller, shared_state, on_state_read=None):
     with shared_state.lock:
         shared_state.grasp_offset_xyz_mm = grasp_offset_xyz
         shared_state.grasp_closed = True
-    place_z_result = shared_state.finalize_place_z_from_recent_samples()
     shared_state.set_task_state("GRASPED", reset_prediction=True, reset_arm=True)
 
     print(f"[INFO] grasp_offset_xyz_mm saved: {grasp_offset_xyz}")
-    if place_z_result["valid"]:
-        print(
-            "[INFO] frozen_place_z_mm saved: "
-            f"grasp_z_med={place_z_result['grasp_z_median_mm']:.1f}, "
-            f"template_bottom_z_med={place_z_result['template_bottom_z_median_mm']:.1f}, "
-            f"raw_place_z={place_z_result['raw_place_z_mm']:.1f}, "
-            f"place_z={place_z_result['place_z_mm']:.1f}"
-        )
-    else:
-        print(
-            "[WARN] frozen_place_z_mm fallback armed: "
-            f"reason={place_z_result['reason']}, "
-            f"grasp_samples={place_z_result['grasp_sample_count']}, "
-            f"template_bottom_samples={place_z_result['template_bottom_sample_count']}"
-        )
     return True
 
 
-def compute_place_target(shared_state):
-    """Compute the delivery tool target from home pose and saved grasp offset."""
+def compute_place_target(shared_state, place_object_xy_mm=DEFAULT_PLACE_OBJECT_XY_MM):
+    """Compute a TCP target that places the object center at a fixed base-frame XY."""
+    place_object_xy = np.asarray(place_object_xy_mm, dtype=np.float64).reshape(2)
+    if not np.all(np.isfinite(place_object_xy)):
+        raise ValueError("place_object_xy_mm must contain finite values")
     with shared_state.lock:
-        home_xyz = None if shared_state.home_object_xyz_mm is None else shared_state.home_object_xyz_mm.copy()
         grasp_offset = None if shared_state.grasp_offset_xyz_mm is None else shared_state.grasp_offset_xyz_mm.copy()
         frozen_place_z_mm = shared_state.frozen_place_z_mm
         frozen_place_z_raw_mm = shared_state.frozen_place_z_raw_mm
         frozen_place_z_grasp_median_mm = shared_state.frozen_place_z_grasp_median_mm
         frozen_place_z_template_bottom_median_mm = shared_state.frozen_place_z_template_bottom_median_mm
 
-    if home_xyz is None:
+    if grasp_offset is None:
         return None, {
-            "used_fallback": True,
-            "fallback_reason": "no_home_xyz",
-            "grasp_z_median_mm": None,
-            "template_bottom_z_median_mm": None,
-            "raw_place_z_mm": None,
+            "used_fallback": False,
+            "fallback_reason": "no_grasp_offset",
+            "grasp_z_median_mm": frozen_place_z_grasp_median_mm,
+            "template_bottom_z_median_mm": frozen_place_z_template_bottom_median_mm,
+            "raw_place_z_mm": frozen_place_z_raw_mm,
+        }
+    if frozen_place_z_mm is None or not np.isfinite(float(frozen_place_z_mm)):
+        return None, {
+            "used_fallback": False,
+            "fallback_reason": "no_frozen_place_z",
+            "grasp_z_median_mm": frozen_place_z_grasp_median_mm,
+            "template_bottom_z_median_mm": frozen_place_z_template_bottom_median_mm,
+            "raw_place_z_mm": frozen_place_z_raw_mm,
         }
 
-    if grasp_offset is not None:
-        home_xyz[0] -= grasp_offset[0]
-    home_xyz[0] += HOME_PLACE_X_OFFSET_MM
-    home_xyz[1] += HOME_PLACE_Y_OFFSET_MM
+    grasp_offset = np.asarray(grasp_offset, dtype=np.float64).reshape(3)
+    if not np.all(np.isfinite(grasp_offset)):
+        return None, {
+            "used_fallback": False,
+            "fallback_reason": "invalid_grasp_offset",
+            "grasp_z_median_mm": frozen_place_z_grasp_median_mm,
+            "template_bottom_z_median_mm": frozen_place_z_template_bottom_median_mm,
+            "raw_place_z_mm": frozen_place_z_raw_mm,
+        }
+    target_xyz = np.asarray(
+        [
+            place_object_xy[0] - grasp_offset[0],
+            place_object_xy[1] - grasp_offset[1],
+            max(float(frozen_place_z_mm), HOME_PLACE_MIN_Z_MM),
+        ],
+        dtype=np.float64,
+    )
     debug = {
-        "used_fallback": frozen_place_z_mm is None,
-        "fallback_reason": "home_z" if frozen_place_z_mm is None else "none",
+        "used_fallback": False,
+        "fallback_reason": "none",
         "grasp_z_median_mm": frozen_place_z_grasp_median_mm,
         "template_bottom_z_median_mm": frozen_place_z_template_bottom_median_mm,
-        "raw_place_z_mm": float(home_xyz[2]) if frozen_place_z_raw_mm is None else float(frozen_place_z_raw_mm),
+        "raw_place_z_mm": (
+            float(frozen_place_z_mm)
+            if frozen_place_z_raw_mm is None
+            else float(frozen_place_z_raw_mm)
+        ),
+        "place_object_x_mm": float(place_object_xy[0]),
+        "place_object_y_mm": float(place_object_xy[1]),
     }
-    if frozen_place_z_mm is not None:
-        home_xyz[2] = float(frozen_place_z_mm)
-    home_xyz[2] = max(float(home_xyz[2]), HOME_PLACE_MIN_Z_MM)
-    return home_xyz, debug
+    return target_xyz, debug
 
 
 def compute_pre_release_descend_target_mm(place_x, place_y, place_z, args):
@@ -3959,10 +3964,20 @@ def execute_return_and_place(
         safe_stop_rtde(controller)
         return False
     # shared_state에 저장된 grasp offset/place z 샘플을 이용해 최종 place 목표 EEF 위치[mm]를 계산한다.
-    target_eef_xyz, place_target_debug = compute_place_target(shared_state)
+    place_object_xy_mm = tuple(
+        float(value)
+        for value in getattr(args, "place_object_xy_mm", DEFAULT_PLACE_OBJECT_XY_MM)
+    )
+    target_eef_xyz, place_target_debug = compute_place_target(
+        shared_state,
+        place_object_xy_mm=place_object_xy_mm,
+    )
     # place 목표를 계산할 수 없으면 이후 이동 경로를 만들 수 없으므로 중단한다.
     if target_eef_xyz is None:
-        print("[WARN] Cannot compute place target.")
+        print(
+            "[WARN] Cannot compute fixed place target: "
+            f"reason={place_target_debug.get('fallback_reason', 'unknown')}"
+        )
         return False
 
     # 현재 공유 상태 snapshot에서 로봇 자세 고정값과 초기 pose를 가져온다.
@@ -4261,8 +4276,13 @@ def execute_return_and_place(
 
     # metadata recorder가 있으면 최종 delivery location을 기록한다.
     if metadata_recorder is not None:
-        home_xyz = None if shared_state.home_object_xyz_mm is None else shared_state.home_object_xyz_mm.copy()
-        metadata_recorder.note_delivery_location(home_xyz)
+        metadata_recorder.note_delivery_bottom_location(
+            (
+                float(place_object_xy_mm[0]),
+                float(place_object_xy_mm[1]),
+                float(RELEASE_PARAMETER_MM),
+            )
+        )
 
     # task state를 DONE으로 바꾸고 prediction/arm 상태를 다음 task를 위해 초기화한다.
     shared_state.set_task_state("DONE", reset_prediction=True, reset_arm=True)
@@ -4294,25 +4314,40 @@ def configure_object_worker_from_args(worker, args, prompt_classes):
         worker.selection_class_names = list(args.select_class)
 
 
-def build_dual_perception_pipeline(args):
+def build_dual_perception_pipeline(args, *, runtime_template_path=None):
     """Construct all camera, perception, fusion, fitting, and debug pipeline objects."""
     sensor_hub = DualSensorHub.from_config(args.config)
     sensor_hub.width = int(args.width)
     sensor_hub.height = int(args.height)
     sensor_hub.fps = int(args.fps)
 
-    object_worker_cam0 = ObjectWorkerCam0.from_config(args.config)
-    object_worker_cam1 = ObjectWorkerCam1.from_config(args.config)
-    prompt_classes = parse_prompt_classes(args.prompt)
-    configure_object_worker_from_args(object_worker_cam0, args, prompt_classes)
-    configure_object_worker_from_args(object_worker_cam1, args, prompt_classes)
+    if args.object_backend == "sam3d":
+        if runtime_template_path is None:
+            raise ValueError("SAM3D backend requires a validated runtime template")
+        (
+            object_worker_cam0,
+            object_worker_cam1,
+            object_class_lock,
+            sam3d_label,
+        ) = build_fastsam_object_workers(args.config)
+        prompt_classes = [sam3d_label]
+    else:
+        object_worker_cam0 = ObjectWorkerCam0.from_config(args.config)
+        object_worker_cam1 = ObjectWorkerCam1.from_config(args.config)
+        prompt_classes = parse_prompt_classes(args.prompt)
+        configure_object_worker_from_args(object_worker_cam0, args, prompt_classes)
+        configure_object_worker_from_args(object_worker_cam1, args, prompt_classes)
+        object_class_lock = HandednessAwareObjectClassLock()
 
     hand_worker_cam0 = HandWorkerCam0.from_config(args.config)
     hand_worker_cam1 = HandWorkerCam1.from_config(args.config)
     hand_selector = HandSelector.from_config(args.config)
     object_merger = ObjectMerger.from_config(args.config)
-    object_class_lock = HandednessAwareObjectClassLock()
-    shape_fitting_tracker = ShapeFittingTracker.from_config(args.config)
+    shape_fitting_tracker = (
+        build_runtime_shape_fitting_tracker(args.config, runtime_template_path)
+        if args.object_backend == "sam3d"
+        else ShapeFittingTracker.from_config(args.config)
+    )
     fusion = PerceptionFusion.from_config(args.config)
     grasp_planner = GraspTargetPlanner.from_config(args.config)
     grasp_z_stabilizer = GraspPointZStabilizer.from_config(args.config)
@@ -4341,6 +4376,8 @@ def build_dual_perception_pipeline(args):
         "t_cam0_base": t_cam0_base,
         "t_cam1_base": t_cam1_base,
         "prompt_classes": prompt_classes,
+        "object_backend": args.object_backend,
+        "runtime_template_path": runtime_template_path,
     }
 
 
@@ -4602,6 +4639,8 @@ def build_runtime_profile_context(args, yolo_model, pipeline):
         "enable_follow": bool(args.enable_follow),
         "control_hz": float(args.control_hz),
         "prompt_classes": list(pipeline.get("prompt_classes", [])),
+        "object_backend": str(pipeline.get("object_backend", "legacy")),
+        "runtime_template_path": pipeline.get("runtime_template_path"),
     }
 
 
@@ -4624,13 +4663,28 @@ def collect_runtime_profile_metrics(
     object_debug_cam0 = getattr(pipeline["object_worker_cam0"], "last_debug", None)
     object_debug_cam1 = getattr(pipeline["object_worker_cam1"], "last_debug", None)
     shape_fit_debug = getattr(pipeline["shape_fitting_tracker"], "last_debug", None)
+    sam3d_runtime = pipeline.get("sam3d_live_runtime")
+    sam3d_debug = None if sam3d_runtime is None else sam3d_runtime.debug()
+    object_backend = str(pipeline.get("object_backend", "legacy"))
+    cam0_object_infer_ms = getattr(object_debug_cam0, "infer_ms", None)
+    cam1_object_infer_ms = getattr(object_debug_cam1, "infer_ms", None)
+    fastsam_engine_cam0 = getattr(pipeline["object_worker_cam0"], "segmentation_engine", None)
+    fastsam_engine_cam1 = getattr(pipeline["object_worker_cam1"], "segmentation_engine", None)
     return {
         "instant_fps": float(instant_fps),
         "smoothed_fps": float(smoothed_fps),
         "camera_pair_delta_ms": float(getattr(snapshot, "timestamp_delta_ms", 0.0)),
         "camera_pair_within_sync_tolerance": bool(getattr(snapshot, "within_sync_tolerance", False)),
-        "cam0_yolo_infer_ms": getattr(object_debug_cam0, "infer_ms", None),
-        "cam1_yolo_infer_ms": getattr(object_debug_cam1, "infer_ms", None),
+        # Keep the historical YOLO keys for profile-reader compatibility and
+        # expose backend-neutral/FastSAM-specific names for new SAM3D runs.
+        "cam0_yolo_infer_ms": cam0_object_infer_ms if object_backend == "legacy" else None,
+        "cam1_yolo_infer_ms": cam1_object_infer_ms if object_backend == "legacy" else None,
+        "cam0_object_infer_ms": cam0_object_infer_ms,
+        "cam1_object_infer_ms": cam1_object_infer_ms,
+        "cam0_fastsam_infer_ms": cam0_object_infer_ms if object_backend == "sam3d" else None,
+        "cam1_fastsam_infer_ms": cam1_object_infer_ms if object_backend == "sam3d" else None,
+        "cam0_fastsam_error": getattr(fastsam_engine_cam0, "last_error", None) if object_backend == "sam3d" else None,
+        "cam1_fastsam_error": getattr(fastsam_engine_cam1, "last_error", None) if object_backend == "sam3d" else None,
         "cam0_object_detected": bool(getattr(object_cam0, "object_detected", False)),
         "cam1_object_detected": bool(getattr(object_cam1, "object_detected", False)),
         "cam0_object_points": int(getattr(object_cam0, "point_count", 0)),
@@ -4665,6 +4719,25 @@ def collect_runtime_profile_metrics(
         "fusion_hand_approach_latched": bool(getattr(fusion_state, "hand_approach_latched", False)),
         "grasp_target_valid": bool(getattr(grasp_target, "valid", False)),
         "measurement_source": str(measurement_source or "none"),
+        "object_backend": object_backend,
+        "sam3d_dynamic_active": bool(getattr(sam3d_debug, "active", False)),
+        "sam3d_gate_blocked": bool(getattr(sam3d_debug, "gate_blocked", False)),
+        "sam3d_initialization_phase": getattr(sam3d_debug, "initialization_phase", None),
+        "sam3d_scaling_valid_frames": getattr(sam3d_debug, "scaling_valid_frames", 0),
+        "sam3d_scaling_required_frames": getattr(sam3d_debug, "scaling_required_frames", 0),
+        "sam3d_silhouette_scale_frozen": bool(
+            getattr(sam3d_debug, "silhouette_scale_frozen", False)
+        ),
+        "hands23_healthy": bool(getattr(sam3d_debug, "healthy", True)),
+        "hands23_inference_ms": getattr(sam3d_debug, "last_inference_ms", None),
+        "hands23_roundtrip_ms": getattr(sam3d_debug, "last_roundtrip_ms", None),
+        "hands23_error": getattr(sam3d_debug, "last_error", None),
+        "hands23_cam0_bbox_age_s": getattr(getattr(sam3d_debug, "cam0", None), "age_s", None),
+        "hands23_cam1_bbox_age_s": getattr(getattr(sam3d_debug, "cam1", None), "age_s", None),
+        "hands23_cam0_bbox_reason": getattr(getattr(sam3d_debug, "cam0", None), "reason", None),
+        "hands23_cam1_bbox_reason": getattr(getattr(sam3d_debug, "cam1", None), "reason", None),
+        "hands23_cam0_bbox_valid": getattr(getattr(sam3d_debug, "cam0", None), "bbox_xyxy", None) is not None,
+        "hands23_cam1_bbox_valid": getattr(getattr(sam3d_debug, "cam1", None), "bbox_xyxy", None) is not None,
     }
 
 
@@ -4684,6 +4757,43 @@ def discard_runtime_profile(runtime_profiler, *, reason):
     if not getattr(runtime_profiler, "enabled", False):
         return
     runtime_profiler.discard_current_session(reason=reason)
+
+
+def draw_sam3d_bbox_overlay(image_bgr, pipeline, camera_id):
+    """Draw the active FastSAM prompt and Hands23 health on one preview."""
+    runtime = pipeline.get("sam3d_live_runtime")
+    if runtime is None:
+        return image_bgr
+    debug = runtime.debug()
+    camera_debug = debug.cam0 if int(camera_id) == 0 else debug.cam1
+    engine = pipeline[f"object_worker_cam{int(camera_id)}"].segmentation_engine
+    bbox = getattr(engine, "bbox", None)
+    if bbox is not None:
+        x1, y1, x2, y2 = (int(round(float(value))) for value in bbox)
+        cv.rectangle(
+            image_bgr,
+            (x1, y1),
+            (max(x1, x2 - 1), max(y1, y2 - 1)),
+            (0, 255, 255),
+            2,
+        )
+    age_text = "-" if camera_debug.age_s is None else f"{camera_debug.age_s:.2f}s"
+    progress_text = (
+        f"{debug.scaling_valid_frames}/{debug.scaling_required_frames}"
+        if debug.initialization_phase == "fixed_scaling"
+        else "frozen"
+    )
+    text = (
+        f"SAM3D {debug.initialization_phase} scale={progress_text} "
+        f"{camera_debug.mode} age={age_text} "
+        f"hand={camera_debug.hand_side or '-'} reason={camera_debug.reason} "
+        f"fastsam={getattr(engine, 'last_error', None) or 'ok'}"
+    )
+    color = (40, 40, 255) if debug.gate_blocked else (0, 255, 255)
+    origin = (10, image_bgr.shape[0] - 16)
+    cv.putText(image_bgr, text, origin, cv.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 0), 3, cv.LINE_AA)
+    cv.putText(image_bgr, text, origin, cv.FONT_HERSHEY_SIMPLEX, 0.48, color, 1, cv.LINE_AA)
+    return image_bgr
 
 
 def render_camera_mask_preview(
@@ -4735,7 +4845,11 @@ def render_camera_mask_preview(
         if pixel is None:
             continue
         cv.circle(image_bgr, pixel, 6, color_bgr, -1, cv.LINE_AA)
-    return image_bgr
+    return draw_sam3d_bbox_overlay(
+        image_bgr,
+        pipeline,
+        0 if camera_label == "cam0" else 1,
+    )
 
 
 def format_record_clock(elapsed_s):
@@ -4792,7 +4906,7 @@ def render_cam0_perception_debug(
     record_elapsed_s=None,
     tactile_manager=None,
 ):
-    """Render the main cam0 preview with mask, object cloud, hand, grasp, and HOME."""
+    """Render the main cam0 preview with mask, object cloud, hand, and grasp."""
     image_bgr = np.asarray(snapshot.cam0.color_image).copy()
 
     object_debug = getattr(pipeline["object_worker_cam0"], "last_debug", None)
@@ -4833,15 +4947,9 @@ def render_cam0_perception_debug(
         cv.putText(image_bgr, label, (pixel[0] + 8, pixel[1] - 8), cv.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv.LINE_AA)
         cv.putText(image_bgr, label, (pixel[0] + 8, pixel[1] - 8), cv.FONT_HERSHEY_SIMPLEX, 0.55, color_bgr, 1, cv.LINE_AA)
 
-    home_pixel = shared_state.home_object_pixel if shared_state.home_object_locked else None
-    if home_pixel is not None:
-        cv.circle(image_bgr, home_pixel, 5, (0, 0, 255), -1, cv.LINE_AA)
-        cv.putText(image_bgr, "HOME", (home_pixel[0] + 10, home_pixel[1] - 10), cv.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv.LINE_AA)
-        cv.putText(image_bgr, "HOME", (home_pixel[0] + 10, home_pixel[1] - 10), cv.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 1, cv.LINE_AA)
-
     image_bgr = draw_record_clock_overlay(image_bgr, record_elapsed_s)
     image_bgr = draw_tactile_status_overlay(image_bgr, tactile_manager)
-    return image_bgr
+    return draw_sam3d_bbox_overlay(image_bgr, pipeline, 0)
 
 
 def main():
@@ -4853,21 +4961,71 @@ def main():
     # YAML에 들어 있는 기본값을 커맨드라인 인자에 반영한다.
     args = apply_config_defaults(args, config)
 
+    runtime_template_path = None
+    sam3d_bootstrap = None
+    if args.object_backend == "sam3d":
+        validate_main_runtime(require_rtde=bool(args.enable_follow))
+        validate_hands23_runtime_assets(args.config)
+        print("[INFO] SAM3D bootstrap preflight starting before RTDE connection ...")
+        sam3d_bootstrap = bootstrap_runtime_template(
+            args.config,
+            capture_python=sys.executable,
+        )
+        args.config = sam3d_bootstrap.effective_config_path
+        config = load_yaml_config(args.config)
+        runtime_template_path = sam3d_bootstrap.template_path
+        print(
+            "[INFO] SAM3D runtime template ready: "
+            f"{runtime_template_path} artifacts={sam3d_bootstrap.artifact_dir}"
+        )
+
     # 듀얼 카메라 모드에서는 개별 시리얼 인자를 사용하지 않으므로 경고만 출력한다.
     if args.serial is not None:
         print("[WARN] --serial is ignored in the dual-camera grasp-target mode. Camera selection comes from configs/handover.yaml")
 
     # 카메라, 검출기, 융합기, 로봇 좌표 변환 등 전체 perception 파이프라인을 구성한다.
-    pipeline = build_dual_perception_pipeline(args)
+    pipeline = build_dual_perception_pipeline(
+        args,
+        runtime_template_path=runtime_template_path,
+    )
     # 두 카메라 프레임을 동기화해서 공급하는 센서 허브를 가져온다.
     sensor_hub = pipeline["sensor_hub"]
+    sam3d_live_runtime = None
     # 촉각 센서 옵션이 켜져 있으면 AnySkin tactile manager를 생성한다.
     tactile_manager = AnySkinTactileManager(args) if bool(getattr(args, "tactile_enabled", False)) else None
-    # tactile manager가 생성된 경우 별도 수집 루프를 시작한다.
-    if tactile_manager is not None:
-        tactile_manager.start()
-    # 듀얼 카메라 스트리밍을 시작한다.
-    sensor_hub.start()
+    # 정상 메인 루프에 진입하기 전 시작 실패해도 sidecar/센서가
+    # 남지 않도록 런타임 리소스를 하나의 시작 트랜잭션으로 묶는다.
+    try:
+        if args.object_backend == "sam3d":
+            sam3d_live_runtime = Sam3DLiveRuntime(
+                pipeline,
+                args.config,
+            )
+            sam3d_live_runtime.start()
+            pipeline["sam3d_live_runtime"] = sam3d_live_runtime
+            print("[INFO] Hands23 sidecar ready; fixed FastSAM bboxes active for initialization.")
+        # tactile manager가 생성된 경우 별도 수집 루프를 시작한다.
+        if tactile_manager is not None:
+            tactile_manager.start()
+        # 듀얼 카메라 스트리밍을 시작한다.
+        sensor_hub.start()
+    except Exception:
+        if tactile_manager is not None:
+            tactile_manager.close()
+        if sam3d_live_runtime is not None:
+            sam3d_live_runtime.close()
+        for hand_worker_key in ("hand_worker_cam0", "hand_worker_cam1"):
+            hand_worker = pipeline.get(hand_worker_key)
+            if hand_worker is not None:
+                try:
+                    hand_worker.close()
+                except Exception:
+                    pass
+        try:
+            sensor_hub.stop()
+        except Exception:
+            pass
+        raise
 
     # 런타임 로그에 남길 YOLO 모델 이름을 prompt class 정보까지 포함해 만든다.
     yolo_model = args.model if not pipeline["prompt_classes"] else f"{args.model} ({','.join(pipeline['prompt_classes'])})"
@@ -4920,8 +5078,11 @@ def main():
     last_task_done_epoch = 0
     # reset이 끝났을 때 runtime profile을 폐기할 사유를 임시로 저장한다.
     pending_reset_reason = None
+    pending_sam3d_regeneration = False
     # grasp/place 요청이 이미 들어갔는지 추적해 중복 명령을 막는다.
     grasp_request_pending = False
+    # Place Z 샘플 부족 경고를 같은 상태에서 반복 출력하지 않는다.
+    place_z_wait_signature = None
     # 현재 perception fallback 상태가 어느 task epoch에 해당하는지 추적한다.
     active_task_epoch = None
     # 현재 task의 녹화 시작 perf_counter 시각이다.
@@ -5032,8 +5193,6 @@ def main():
                 current_task_epoch = int(shared_state.task_epoch)
                 # 로봇 motion이 이미 trigger됐는지 읽어 fallback 판단에 사용한다.
                 motion_triggered = bool(shared_state.motion_triggered)
-                # HOME object 위치가 고정된 뒤에는 silhouette 기반 template scale 변경을 멈춘다.
-                home_object_locked = bool(shared_state.home_object_locked)
             # 로봇 worker가 있을 때는 상태 epoch와 에러 상태를 매 프레임 확인한다.
             if robot_worker is not None:
                 # worker가 유지하는 최신 로봇 상태 snapshot을 가져온다.
@@ -5053,8 +5212,17 @@ def main():
                         pending_reset_reason = None
                     # reset 이후에는 이전 grasp 요청 상태를 무효화한다.
                     grasp_request_pending = False
+                    place_z_wait_signature = None
                     # 메인 thread perception reset이 끝났음을 알린다.
                     print("[INFO] Main-thread perception reset complete after robot reset.")
+                    if pending_sam3d_regeneration and sam3d_live_runtime is not None:
+                        shared_state.stop_follow()
+                        robot_worker.submit(RobotRequest(ROBOT_REQ_STOP_FOLLOW))
+                        with shared_state.lock:
+                            regeneration_task_id = int(shared_state.task_epoch)
+                        if sam3d_live_runtime.begin_regeneration(regeneration_task_id):
+                            print("[INFO] SAM3D regeneration capturing started at HOME.")
+                        pending_sam3d_regeneration = False
                 # task ready epoch가 바뀌면 새 handover trial 기록을 시작한다.
                 if robot_status.task_ready_epoch != last_task_ready_epoch:
                     # 같은 task_ready 이벤트를 중복 처리하지 않도록 epoch를 갱신한다.
@@ -5072,6 +5240,7 @@ def main():
                 if robot_status.task_done_epoch != last_task_done_epoch:
                     last_task_done_epoch = int(robot_status.task_done_epoch)
                     grasp_request_pending = False
+                    place_z_wait_signature = None
                     pipeline["object_class_lock"].reset()
                 # 로봇 에러 상태에서는 새 grasp 요청을 막는다.
                 if robot_status.state == ROBOT_STATE_ERROR:
@@ -5085,9 +5254,35 @@ def main():
                 pipeline["object_class_lock"].reset()
                 active_task_epoch = current_task_epoch
 
+            if sam3d_live_runtime is not None:
+                regeneration_event = sam3d_live_runtime.poll_regeneration()
+                if regeneration_event == "installed":
+                    reset_perception_pipeline_for_system_reset(pipeline)
+                    shared_state.clear_target(reset_prediction=True, reset_arm=True)
+                    print(
+                        "[INFO] New SAM3D tracker installed; waiting for fixed-bbox "
+                        "fitting and a fresh Hands23 bbox. Follow remains disabled."
+                    )
+                elif regeneration_event == "failed":
+                    reset_perception_pipeline_for_system_reset(pipeline)
+                    shared_state.clear_target(reset_prediction=True, reset_arm=True)
+                    print(
+                        "[WARN] SAM3D regeneration failed; previous tracker restored. "
+                        f"Follow remains disabled. {sam3d_live_runtime.debug().last_error}"
+                    )
+
             # 두 카메라에서 시간 동기화된 frame pair를 읽는 구간을 측정한다.
             with runtime_profiler.stage("read_pair"):
                 snapshot = sensor_hub.read_next_pair()
+
+            sam3d_gate_blocked = False
+            if sam3d_live_runtime is not None:
+                with runtime_profiler.stage("hands23_ipc"):
+                    sam3d_gate_blocked = sam3d_live_runtime.before_frame(
+                        snapshot,
+                        task_id=current_task_epoch,
+                        now_ros_s=current_time,
+                    )
 
             # cam0에서 object detection/segmentation을 수행한다.
             with runtime_profiler.stage("object_cam0"):
@@ -5102,6 +5297,14 @@ def main():
                     snapshot.cam1,
                     frame_id=snapshot.pair_index,
                     class_name_filter=pipeline["object_class_lock"].locked_class,
+                )
+            if sam3d_live_runtime is not None:
+                sam3d_gate_blocked = bool(
+                    sam3d_gate_blocked
+                    or sam3d_live_runtime.after_object_perception(
+                        object_cam0,
+                        object_cam1,
+                    )
                 )
             # cam0에서 hand detector/tracker를 수행한다.
             with runtime_profiler.stage("hand_cam0"):
@@ -5119,12 +5322,26 @@ def main():
                 )
             # 병합된 object point cloud에 형상 fitting/tracking을 수행한다.
             with runtime_profiler.stage("shape_fit"):
+                # reset/regeneration이 이 frame 초반에 반영될 수 있으므로
+                # tracker 호출 직전의 runtime phase로 scale freeze를 결정한다.
+                freeze_silhouette_scale = bool(
+                    sam3d_live_runtime is not None
+                    and sam3d_live_runtime.silhouette_scale_frozen
+                )
                 silhouette_observations = build_silhouette_observations(snapshot, pipeline)
                 shape_fitting_state = pipeline["shape_fitting_tracker"].process(
                     merged_object,
                     silhouette_observations=silhouette_observations,
-                    freeze_silhouette_scale=home_object_locked,
+                    freeze_silhouette_scale=freeze_silhouette_scale,
                 )
+                if sam3d_live_runtime is not None:
+                    sam3d_live_runtime.capture_regeneration_frame(snapshot)
+                    if sam3d_live_runtime.after_shape_fit(shape_fitting_state):
+                        print(
+                            "[INFO] Initial SAM3D fitting ready; switching from fixed "
+                            "prompts to Hands23 dynamic bboxes."
+                        )
+                        sam3d_gate_blocked = True
                 # fitting 결과를 metadata recorder에 업데이트한다.
                 metadata_recorder.update_geometry(shape_fitting_state, now_perf=loop_perf)
             # fitted template centroid를 기준으로 active hand를 고른다.
@@ -5331,6 +5548,12 @@ def main():
                     )
 
             # 최종 object target이 있으면 shared state를 갱신하고 필요 시 grasp/place를 시작한다.
+            if sam3d_gate_blocked:
+                object_point_base = None
+                grasp_point_base = None
+                measurement_source = "sam3d_gate_blocked"
+                enforce_sam3d_target_gate(shared_state, True)
+
             if object_point_base is not None:
                 # target update 구간 시간을 profiler에 기록한다.
                 with runtime_profiler.stage("target_update"):
@@ -5357,38 +5580,69 @@ def main():
                     and robot_status.state == ROBOT_STATE_FOLLOWING
                     and shared_state.is_pregrasp_pose_reached(robot_status.last_robot_pose)
                 ):
-                    # direct grasp trigger를 콘솔에 남긴다.
-                    print("[INFO] DIRECT GRASP trigger")
-                    # robot worker에 넘길 fitted point cloud copy를 준비한다.
-                    fitted_points_copy = None
-                    # fitted point가 있으면 thread 간 공유 부작용을 피하기 위해 numpy copy를 만든다.
-                    if shape_fitting_state.fitted_points_base is not None:
-                        fitted_points_copy = np.asarray(shape_fitting_state.fitted_points_base, dtype=np.float32).copy()
-                    # grasp point도 tuple copy로 정규화한다.
-                    grasp_point_copy = None if grasp_point_base is None else tuple(float(v) for v in grasp_point_base)
-                    # template axis 정보가 있으면 함께 넘긴다.
-                    template_axes = getattr(shape_fitting_state, "template_axes_base", None)
-                    # axis 정보 역시 numpy copy로 만들어 worker에 안전하게 전달한다.
-                    template_axes_copy = None if template_axes is None else np.asarray(template_axes, dtype=np.float32).copy()
-                    # grasp/place 동작에 필요한 geometry context를 하나로 묶는다.
-                    action_context = RobotActionContext(
-                        fitted_points_base=fitted_points_copy,
-                        grasp_point_base=grasp_point_copy,
-                        object_label=shape_fitting_state.label,
-                        template_axes_base=template_axes_copy,
-                    )
-                    # robot worker에 grasp/place 시작 요청을 보낸다.
-                    robot_worker.submit(
-                        RobotRequest(
-                            ROBOT_REQ_START_GRASP_PLACE,
-                            payload={"context": action_context},
+                    # 그리퍼를 닫기 전에 place Z를 고정한다. 샘플이 부족하면
+                    # request를 보내지 않고 다음 perception frame을 기다린다.
+                    place_z_result = shared_state.finalize_place_z_from_recent_samples()
+                    if not place_z_result["valid"]:
+                        wait_signature = (
+                            place_z_result["reason"],
+                            place_z_result["grasp_sample_count"],
+                            place_z_result["template_bottom_sample_count"],
                         )
-                    )
-                    # 같은 pregrasp 상태에서 중복 요청하지 않도록 pending flag를 세운다.
-                    grasp_request_pending = True
+                        if wait_signature != place_z_wait_signature:
+                            print(
+                                "[WARN] DIRECT GRASP waiting for place Z samples: "
+                                f"reason={place_z_result['reason']} "
+                                f"grasp_samples={place_z_result['grasp_sample_count']} "
+                                f"template_bottom_samples={place_z_result['template_bottom_sample_count']}"
+                            )
+                            place_z_wait_signature = wait_signature
+                    else:
+                        place_z_wait_signature = None
+                        print(
+                            "[INFO] frozen_place_z_mm prepared before grasp: "
+                            f"grasp_z_med={place_z_result['grasp_z_median_mm']:.1f}, "
+                            f"template_bottom_z_med={place_z_result['template_bottom_z_median_mm']:.1f}, "
+                            f"raw_place_z={place_z_result['raw_place_z_mm']:.1f}, "
+                            f"place_z={place_z_result['place_z_mm']:.1f}"
+                        )
+                        print("[INFO] DIRECT GRASP trigger")
+                        fitted_points_copy = None
+                        if shape_fitting_state.fitted_points_base is not None:
+                            fitted_points_copy = np.asarray(
+                                shape_fitting_state.fitted_points_base,
+                                dtype=np.float32,
+                            ).copy()
+                        grasp_point_copy = (
+                            None
+                            if grasp_point_base is None
+                            else tuple(float(v) for v in grasp_point_base)
+                        )
+                        template_axes = getattr(shape_fitting_state, "template_axes_base", None)
+                        template_axes_copy = (
+                            None
+                            if template_axes is None
+                            else np.asarray(template_axes, dtype=np.float32).copy()
+                        )
+                        action_context = RobotActionContext(
+                            fitted_points_base=fitted_points_copy,
+                            grasp_point_base=grasp_point_copy,
+                            object_label=shape_fitting_state.label,
+                            template_axes_base=template_axes_copy,
+                        )
+                        robot_worker.submit(
+                            RobotRequest(
+                                ROBOT_REQ_START_GRASP_PLACE,
+                                payload={"context": action_context},
+                            )
+                        )
+                        grasp_request_pending = True
             # object target이 없으면 prediction/arm reset 없이 target만 비운다.
             else:
-                shared_state.clear_target(reset_prediction=False, reset_arm=False)
+                shared_state.clear_target(
+                    reset_prediction=bool(sam3d_gate_blocked),
+                    reset_arm=bool(sam3d_gate_blocked),
+                )
 
             # FPS 계산 기준이 되는 현재 perf_counter 시각이다.
             now = time.perf_counter()
@@ -5486,6 +5740,29 @@ def main():
                 else:
                     shared_state.clear_follow_pause()
                     shared_state.toggle_follow()
+            # g 키는 HOME에서 새 SAM3D template을 안전하게 생성한다.
+            elif key == ord("g"):
+                if sam3d_live_runtime is None:
+                    print("[WARN] SAM3D regeneration is only available with --object-backend sam3d.")
+                elif sam3d_live_runtime.regeneration_state in {"capturing", "generating", "fitting"}:
+                    print(
+                        "[WARN] SAM3D regeneration is already running: "
+                        f"state={sam3d_live_runtime.regeneration_state}"
+                    )
+                else:
+                    print("[INFO] SAM3D regeneration requested; stopping follow and returning HOME.")
+                    shared_state.clear_target(reset_prediction=True, reset_arm=True)
+                    shared_state.stop_follow()
+                    if robot_worker is not None:
+                        pending_sam3d_regeneration = True
+                        robot_worker.submit(RobotRequest(ROBOT_REQ_RESET_HOME))
+                    else:
+                        shared_state.reset_for_restart(follow_enabled=False)
+                        reset_perception_pipeline_for_system_reset(pipeline)
+                        with shared_state.lock:
+                            regeneration_task_id = int(shared_state.task_epoch)
+                        if sam3d_live_runtime.begin_regeneration(regeneration_task_id):
+                            print("[INFO] SAM3D regeneration capturing started (perception-only mode).")
             # r 키는 저장하지 않고 startup state로 reset한다.
             elif key == ord("r"):
                 # reset 요청을 콘솔에 남긴다.
@@ -5599,6 +5876,8 @@ def main():
         # tactile manager가 있으면 센서 수집 thread와 연결을 닫는다.
         if tactile_manager is not None:
             tactile_manager.close()
+        if sam3d_live_runtime is not None:
+            sam3d_live_runtime.close()
         # hand worker와 sensor hub는 중첩 finally로 최대한 모두 닫히게 한다.
         try:
             # cam0 hand worker를 닫는다.

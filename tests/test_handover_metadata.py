@@ -288,6 +288,15 @@ class HandoverMetadataTests(unittest.TestCase):
             self.assertAlmostEqual(recorder._fill_mass_fields["fill_level_est_percent_vision"], 0.0, places=5)
             self.assertAlmostEqual(recorder._fill_mass_fields["mass_full_est_g_vision"], 9.0, places=5)
 
+    def test_delivery_bottom_location_records_fixed_target_without_height_shift(self) -> None:
+        recorder = HandoverMetadataRecorder()
+
+        recorder.note_delivery_bottom_location((600.0, 0.0, 80.0))
+
+        self.assertEqual(recorder._delivery_location_mm["delivery_location_est_x_mm"], 600.0)
+        self.assertEqual(recorder._delivery_location_mm["delivery_location_est_y_mm"], 0.0)
+        self.assertEqual(recorder._delivery_location_mm["delivery_location_est_z_mm"], 80.0)
+
 
 if __name__ == "__main__":
     unittest.main()

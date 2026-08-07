@@ -122,13 +122,13 @@ CLI `--fps`의 기본값이 30이므로 현재는 YAML의 카메라 FPS를
 5. HOME 이동 후 현재 TCP orientation 확보
 6. follow enabled이며 pause 요청이 없는 상태
 
-물체의 안정된 초기 위치는 별도의 4프레임 buffer로 확인한다.
+SAM3D backend에서는 fixed FastSAM bbox로 실제 silhouette 평가가 연속 4프레임
+성공할 때까지 로봇 target을 gate한다. 4번째 frame까지 2D scale 보정을
+적용한 뒤 scale을 동결하고 Hands23 dynamic bbox로 전환한다.
 
-- X/Y range가 각각 15 mm 미만
-- Z range가 18 mm 미만
-
-조건을 만족하면 `home_object_xyz_mm`로 저장하며, 이 위치는 grasp 후 물체를
-되돌려 놓을 delivery 기준점으로 사용한다.
+Place 위치는 물체 초기 위치를 관측해 lock하지 않는다. `robot.return_sequence.place_object_xy_mm`
+설정의 고정된 물체 중심 XY와 grasp offset을 이용해 TCP 목표를 계산하며,
+place Z 샘플이 준비되지 않으면 grasp를 시작하지 않는다.
 
 ## 5. Target 생성과 prediction
 

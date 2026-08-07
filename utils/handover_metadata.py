@@ -477,6 +477,18 @@ class HandoverMetadataRecorder:
                 "delivery_location_est_z_mm": float(delivery_z),
             }
 
+    def note_delivery_bottom_location(self, object_bottom_xyz_mm):
+        """Record an intended object-bottom delivery target directly."""
+        if object_bottom_xyz_mm is None:
+            return
+        bottom = np.asarray(object_bottom_xyz_mm, dtype=np.float32).reshape(3)
+        with self._lock:
+            self._delivery_location_mm = {
+                "delivery_location_est_x_mm": float(bottom[0]),
+                "delivery_location_est_y_mm": float(bottom[1]),
+                "delivery_location_est_z_mm": float(bottom[2]),
+            }
+
     def record_completion(self):
         with self._lock:
             if self._task_start_perf is None or self._row_written:

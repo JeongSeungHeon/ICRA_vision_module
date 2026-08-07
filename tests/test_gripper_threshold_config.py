@@ -54,8 +54,27 @@ _STUBS = [
     _stub_module("perception.hand_selector", HandSelector=_Dummy),
     _stub_module("perception.hand_worker", HandWorkerCam0=_Dummy, HandWorkerCam1=_Dummy),
     _stub_module("perception.object_merger", ObjectMerger=_Dummy),
-    _stub_module("perception.object_worker", ObjectWorkerCam0=_Dummy, ObjectWorkerCam1=_Dummy),
+    _stub_module(
+        "perception.object_worker",
+        HandednessAwareObjectClassLock=_Dummy,
+        ObjectWorkerCam0=_Dummy,
+        ObjectWorkerCam1=_Dummy,
+    ),
+    _stub_module("perception.silhouette_constraint", SilhouetteObservation=_Dummy),
     _stub_module("perception.shape_fitting_tracker_v2", ShapeFittingTracker=_Dummy),
+    _stub_module(
+        "perception.sam3d_backend",
+        bootstrap_runtime_template=lambda *args, **kwargs: None,
+        build_fastsam_object_workers=lambda *args, **kwargs: None,
+        build_runtime_shape_fitting_tracker=lambda *args, **kwargs: None,
+        validate_hands23_runtime_assets=lambda *args, **kwargs: None,
+        validate_main_runtime=lambda *args, **kwargs: None,
+    ),
+    _stub_module(
+        "perception.sam3d_live_runtime",
+        Sam3DLiveRuntime=_Dummy,
+        enforce_sam3d_target_gate=lambda *args, **kwargs: False,
+    ),
     _stub_module("perception.target_predictor", TargetPredictor=_Dummy),
     _stub_module("robot.rtde_controller", RtdeController=_Dummy),
     _stub_module("system.dual_sensor_hub", DualSensorHub=_Dummy),
@@ -79,6 +98,7 @@ _STUBS = [
 _MODULE = importlib.import_module("robot_control_rtde_fitting_final")
 configure_gripper_position_threshold_from_geometry = _MODULE.configure_gripper_position_threshold_from_geometry
 compute_pre_release_descend_target_mm = _MODULE.compute_pre_release_descend_target_mm
+compute_place_target = _MODULE.compute_place_target
 execute_gripper_close = _MODULE.execute_gripper_close
 execute_return_and_place = _MODULE.execute_return_and_place
 execute_tactile_release_descent = _MODULE.execute_tactile_release_descent
@@ -308,12 +328,11 @@ class DummyTactile:
 class DummySharedStateForPlace:
     def __init__(self):
         self.lock = threading.Lock()
-        self.home_object_xyz_mm = np.asarray([100.0, 100.0, 100.0], dtype=np.float32)
-        self.grasp_offset_xyz_mm = None
-        self.frozen_place_z_mm = None
-        self.frozen_place_z_raw_mm = None
-        self.frozen_place_z_grasp_median_mm = None
-        self.frozen_place_z_template_bottom_median_mm = None
+        self.grasp_offset_xyz_mm = np.asarray([10.0, -5.0, 20.0], dtype=np.float32)
+        self.frozen_place_z_mm = 100.0
+        self.frozen_place_z_raw_mm = 100.0
+        self.frozen_place_z_grasp_median_mm = 80.0
+        self.frozen_place_z_template_bottom_median_mm = 60.0
         self.task_state = None
 
     def get_snapshot(self):
@@ -391,6 +410,7 @@ class DummyWorkerSharedState:
         self.pregrasp_ok = True
         self.reset_count = 0
         self.task_state = "FOLLOW"
+        self.frozen_place_z_mm = 100.0
 
     def get_snapshot(self, now_perf=None):
         del now_perf
@@ -469,6 +489,7 @@ def worker_args():
 
 def config_args():
     return SimpleNamespace(
+        object_backend=None,
         robot_ip=None,
         control_hz=None,
         follow_z=None,
@@ -571,6 +592,22 @@ class RobotWorkerThreadStructureTests(unittest.TestCase):
         self.assertEqual(status.state, _MODULE.ROBOT_STATE_DONE)
         self.assertTrue(status.grasp_ok)
         self.assertEqual(status.task_done_epoch, 1)
+
+    def test_worker_does_not_close_gripper_without_frozen_place_z(self):
+        worker, shared_state, _controller = self.make_worker()
+        worker._set_status(state=_MODULE.ROBOT_STATE_FOLLOWING)
+        shared_state.frozen_place_z_mm = None
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            with unittest.mock.patch.object(_MODULE, "execute_gripper_close") as close:
+                worker._handle_start_grasp_place({"context": _MODULE.RobotActionContext()})
+
+        close.assert_not_called()
+        self.assertEqual(worker.get_status().state, _MODULE.ROBOT_STATE_FOLLOWING)
+        self.assertEqual(
+            worker.get_status().last_error,
+            "grasp request ignored because place Z is not ready",
+        )
 
     def test_worker_grasp_place_publishes_pose_from_blocking_callbacks(self):
         worker, _shared_state, _controller = self.make_worker()
@@ -695,6 +732,28 @@ class RobotWorkerThreadStructureTests(unittest.TestCase):
 
 
 class GripperThresholdConfigTests(unittest.TestCase):
+    def test_fixed_place_target_applies_both_xy_grasp_offsets(self):
+        shared_state = DummySharedStateForPlace()
+
+        target, debug = compute_place_target(
+            shared_state,
+            place_object_xy_mm=(600.0, 0.0),
+        )
+
+        np.testing.assert_allclose(target, np.asarray([590.0, 5.0, 100.0]))
+        self.assertEqual(debug["fallback_reason"], "none")
+        self.assertEqual(debug["place_object_x_mm"], 600.0)
+        self.assertEqual(debug["place_object_y_mm"], 0.0)
+
+    def test_fixed_place_target_fails_closed_without_place_z(self):
+        shared_state = DummySharedStateForPlace()
+        shared_state.frozen_place_z_mm = None
+
+        target, debug = compute_place_target(shared_state)
+
+        self.assertIsNone(target)
+        self.assertEqual(debug["fallback_reason"], "no_frozen_place_z")
+
     def test_home_joint_degrees_are_converted_to_radians(self):
         expected = tuple(float(np.deg2rad(value)) for value in HOME_JOINTS_DEG)
         self.assertEqual(_MODULE.get_home_joints_rad(), expected)
@@ -953,8 +1012,17 @@ class TactileConfigAndBehaviorTests(unittest.TestCase):
     def test_tactile_config_defaults_are_read_from_yaml(self):
         args = config_args()
         config = {
+            "perception": {"object": {"backend": "sam3d"}},
+            "safety": {
+                "workspace_bounds_m": {
+                    "x": [-1.0, 1.0],
+                    "y": [-1.0, 1.0],
+                    "z": [0.0, 1.0],
+                }
+            },
             "robot": {
                 "return_sequence": {
+                    "place_object_xy_mm": [600.0, 0.0],
                     "post_backoff_stop_check_enabled": True,
                     "post_backoff_stop_speed_threshold_mps": 0.003,
                     "post_backoff_stop_timeout_s": 0.4,
@@ -994,6 +1062,7 @@ class TactileConfigAndBehaviorTests(unittest.TestCase):
         self.assertAlmostEqual(resolved.tactile_release_descent_step_mm, 3.0)
         self.assertAlmostEqual(resolved.tactile_release_descent_poll_dt_s, 0.02)
         self.assertFalse(resolved.tactile_debug)
+        self.assertEqual(resolved.place_object_xy_mm, (600.0, 0.0))
         self.assertTrue(resolved.post_backoff_stop_check_enabled)
         self.assertAlmostEqual(resolved.post_backoff_stop_speed_threshold_mps, 0.003)
         self.assertAlmostEqual(resolved.post_backoff_stop_timeout_s, 0.4)

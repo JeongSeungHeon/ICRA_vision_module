@@ -6,7 +6,10 @@ This repository is currently organized around one active handover pipeline:
 bash run_fitting_final.sh
 ```
 
-The main script runs dual RealSense perception, object segmentation, hand pose lifting, point-cloud fusion, template shape fitting, fill-level estimation, grasp target generation, UR RTDE control, Robotiq gripper control, metadata logging, and web-assisted video recording.
+The main script defaults to classless Hands23 + FastSAM object tracking and a
+runtime SAM3D template, followed by dual-camera point-cloud fusion and ICP
+shape fitting. MediaPipe remains responsible for 3D palm pose. A legacy
+YOLOE/static-template backend is retained for explicit rollback.
 
 ## Main Entry Point
 
@@ -18,7 +21,8 @@ The launcher currently runs:
 
 ```bash
 python robot_control_rtde_fitting_final.py \
-  --select-mode highest_score \
+  --config configs/handover.yaml \
+  --object-backend sam3d \
   --enable-follow --follow-z
 ```
 
@@ -48,10 +52,49 @@ archive_non_rtde_main/
 
 ## Setup
 
-Install Python dependencies:
+Install the main Python dependencies, then apply the CUDA pin file to the
+main conda environment:
 
 ```bash
 pip install -r requirements.txt
+conda env update -n handover_ros2 -f environment/handover_rtde_cuda.yml
+```
+
+Place the pinned SAM3D and Hands23 checkouts under `external/` as documented
+in `external/README.md`. The main, SAM3D, and Hands23 runtimes intentionally
+use separate conda environments; their interpreter paths are configured in
+`configs/handover.yaml`. The Hands23 environment recipe and its Detectron2
+build helper are under `environment/`.
+
+## SAM3D startup
+
+Select and validate independent FastSAM prompts whenever a camera, resolution,
+or cell layout changes:
+
+```bash
+bash run_select_fastsam_bbox.sh
+```
+
+Start the persistent stage1 model server in a separate terminal and wait for
+the `model ready` message:
+
+```bash
+bash run_sam3d_model_server.sh
+```
+
+Then start the RTDE application:
+
+```bash
+bash run_fitting_final.sh
+```
+
+Startup fails before RTDE connection if the bbox selection, CUDA FastSAM,
+SAM3D server signature, generated template, or Hands23 sidecar is invalid.
+Use `--object-backend legacy` only for an explicit YOLOE/static-template
+rollback.
+
+```bash
+bash run_fitting_final.sh --object-backend legacy
 ```
 
 Expected hardware/runtime pieces:
@@ -59,7 +102,8 @@ Expected hardware/runtime pieces:
 - Two Intel RealSense cameras
 - UR robot reachable over RTDE
 - Robotiq gripper daemon/socket access if gripper control is enabled
-- Local YOLOE weights, for example `yoloe-26l-seg.pt`
+- Local FastSAM, SAM3D, and Hands23 weights described in `external/README.md`
+- Local YOLOE weights only when using `--object-backend legacy`
 - Open3D for shape fitting
 - Optional FDCT checkpoint at `FDCT/TransCG.tar` if FDCT depth completion is enabled
 
@@ -72,7 +116,7 @@ Important sections:
 - `cameras`: RealSense serials, resolution, fps, and depth filters
 - `calibration`: cam0-to-base and cam1-to-cam0 transform files
 - `perception.depth_completion.fdct`: optional FDCT depth completion
-- `perception.object`: YOLOE segmentation and object point-cloud parameters
+- `perception.object`: backend choice, FastSAM/Hands23, legacy YOLOE, and object point-cloud parameters
 - `perception.hand`: MediaPipe hand detection and depth lifting parameters
 - `perception.fusion`: temporal filtering and hand-approach activation
 - `perception.shape_fitting`: template library, clustering, scale init, ICP, and output downsampling
@@ -109,7 +153,7 @@ Or call the script directly:
 ```bash
 python robot_control_rtde_fitting_final.py \
   --config configs/handover.yaml \
-  --select-mode highest_score \
+  --object-backend sam3d \
   --enable-follow \
   --follow-z
 ```
@@ -117,9 +161,8 @@ python robot_control_rtde_fitting_final.py \
 Useful options:
 
 - `--config`: alternate YAML config path
-- `--model`: YOLOE model or local weights path
-- `--prompt`: segmentation prompt classes
-- `--select-mode`: instance selection policy
+- `--object-backend sam3d|legacy`: object backend; `sam3d` is the default
+- `--model`, `--prompt`, `--select-mode`: legacy YOLOE backend options
 - `--robot-ip`: override `robot.rtde.robot_ip`
 - `--enable-follow`: enable RTDE follow thread
 - `--follow-z` / `--no-follow-z`: toggle Z-axis following
@@ -169,6 +212,7 @@ While the OpenCV windows are focused:
 
 - `f`: toggle follow mode
 - `r`: reset system to startup state
+- `g`: stop follow, return HOME, and regenerate the SAM3D template
 - `d`: save the current 3D debug recording and reset
 - `s`: stop/finalize the current handover metadata and video recording
 - `q` or `Esc`: quit

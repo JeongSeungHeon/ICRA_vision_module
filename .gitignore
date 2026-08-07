@@ -203,4 +203,9 @@ pyrightconfig.json
 *.rrd
 *.webm
 output/debug_3d/
+
+# Large external perception checkouts and generated SAM3D artifacts
+/external/sam-3d-objects/
+/external/hands23_detector/
+/output/sam3d/
 archive_non_rtde_main/

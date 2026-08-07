@@ -28,6 +28,9 @@ cameras:
   cam0:
     # DualSensorHub가 cam0 RealSense 장치를 열 때 사용할 serial입니다.
     serial: "148522072369"
+    width: 640
+    height: 480
+    fps: 30
     # # cam0 color/depth stream 폭입니다. 실행 인자 --width가 있으면 런타임에 override됩니다.
     # width: 640
     # # cam0 color/depth stream 높이입니다. 실행 인자 --height가 있으면 런타임에 override됩니다.
@@ -168,10 +171,44 @@ perception:
       debug_every: 30
 
   object:
+    # 기본은 classless FastSAM + runtime SAM3D template입니다.
+    backend: sam3d
     # segmentation label이 없을 때 ObjectState에 넣을 fallback label입니다.
     target_label: cup
     # 선택된 segmentation confidence가 이 값 미만이면 object를 invalid 처리합니다.
     confidence_threshold: 0.15
+    fastsam:
+      model_name: external/sam-3d-objects/FastSAM-s.pt
+      label: sam3d_object
+      imgsz: 640
+      conf: 0.4
+      iou: 0.9
+      device: cuda:0
+      require_cuda: true
+      half: false
+      bboxes:
+        cam0: [160, 120, 480, 360]
+        cam1: [160, 120, 480, 360]
+      min_bbox_size_px: 8
+      stable_frames: 3
+      min_mask_pixels: 300
+      min_temporal_iou: 0.8
+      capture_timeout_s: 30.0
+      warmup_frames: 5
+    hands23_bbox:
+      enabled: true
+      require_cuda: true
+      min_size_test: 640
+      hand_threshold: 0.7
+      first_object_threshold: 0.5
+      second_object_threshold: 0.3
+      hand_relation_threshold: 0.3
+      object_relation_threshold: 0.7
+      padding_ratio: 0.10
+      ema_alpha: 0.60
+      hold_timeout_s: 0.50
+      result_age_timeout_s: 1.00
+      max_input_hz: 10.0
     segmentation:
       # YOLOE segmentation weights/model 이름입니다. 실행 인자 --model이 있으면 override됩니다.
       model_name: yoloe-26l-seg.pt
@@ -337,6 +374,36 @@ perception:
   shape_fitting:
     # template 기반 shape fitting/ICP 사용 여부입니다.
     enabled: true
+    sam3d:
+      repo_path: external/sam-3d-objects
+      checkpoint_config: checkpoints/hf/pipeline.yaml
+      require_cuda: true
+      compile: false
+      seed: 42
+      canonical_extent_m: 0.1
+      robust_percentile: 1.0
+      min_template_points: 100
+      min_axis_extent_m: 0.0001
+      template_id: sam3d_runtime
+      scale_mode: axis_xyz
+      # fixed FastSAM bbox에서 실제 silhouette 평가가 연속 성공해야 하는 횟수입니다.
+      # 이 횟수 이후 scale을 동결하고 Hands23 dynamic bbox로 전환합니다.
+      initial_silhouette_scaling_frames: 4
+      artifact_root: output/sam3d
+      z_rotation:
+        enabled: true
+        min_deg: -180.0
+        max_deg: 180.0
+        step_deg: 15.0
+        coarse_to_fine:
+          enabled: true
+          coarse_step_deg: 30.0
+          refine_radius_deg: 15.0
+          refine_step_deg: 5.0
+      axis_rotation_candidates:
+        enabled: false
+        roll_deg: [90.0, -90.0]
+        pitch_deg: [90.0, -90.0]
     template_library:
       cup:
         # cup template 식별자입니다.
@@ -544,6 +611,8 @@ grasp:
 
 robot:
   return_sequence:
+    # 놓을 물체 중심의 robot base-frame XY 목표입니다. 단위는 mm입니다.
+    place_object_xy_mm: [600.0, 0.0]
     # true이면 PLACE 도착 후 gripper open 전에 아래 방향으로 한 번 더 이동합니다.
     pre_release_descend_enabled: true
     # gripper open 전 추가 하강 거리입니다. 기본 코드 상수 RELEASE_PARAMETER_MM와 같은 10 mm입니다.
@@ -718,6 +787,26 @@ robot:
     enabled: true
     # position mapping에 곱할 x/y/z sign입니다.
     position_signs: [-1.0, -1.0, 1.0]
+
+runtime:
+  sam3d_server:
+    python_interpreter: /home/ur5/miniforge3/envs/sam3d-objects/bin/python
+    repo_path: external/sam-3d-objects
+    execution_mode: server
+    server_socket: /tmp/handover_sam3d_stage1.sock
+    server_ready_timeout_s: 120.0
+    request_timeout_s: 120.0
+    artifact_root: output/sam3d
+    fastsam_bbox_file: output/sam3d/fastsam_bbox.yaml
+    require_fastsam_bbox_selection: true
+  hands23_sidecar:
+    python_interpreter: /home/ur5/miniforge3/envs/hands23_ros2/bin/python
+    repo_path: external/hands23_detector
+    config_path: external/hands23_detector/faster_rcnn_X_101_32x8d_FPN_3x_Hands23.yaml
+    weights_path: external/hands23_detector/model_weights/model_hands23.pth
+    socket: /tmp/handover_hands23.sock
+    startup_timeout_s: 60.0
+    request_timeout_s: 10.0
 
 safety:
   workspace_bounds_m:

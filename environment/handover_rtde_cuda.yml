@@ -1,0 +1,12 @@
+name: handover_ros2
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  # Keep the versions already used by this environment, but pin CUDA builds
+  # so the solver cannot silently select py3.10_cpu / py310_cpu packages.
+  - pytorch::pytorch=2.1.2
+  - pytorch::torchvision=0.16.2=py310_cu121
+  - pytorch::pytorch-cuda=12.1
+  - pytorch::pytorch-mutex=1.0=cuda

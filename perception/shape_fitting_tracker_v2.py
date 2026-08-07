@@ -577,7 +577,13 @@ class _SilhouetteCandidateScore:
 class ShapeFittingTracker:
     """Fits a canonical template cloud to the merged object cloud using translation-only ICP."""
 
-    def __init__(self, config: dict[str, Any], *, config_path: str | Path = DEFAULT_CONFIG_PATH) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any],
+        *,
+        config_path: str | Path = DEFAULT_CONFIG_PATH,
+        runtime_template_override: dict[str, Any] | None = None,
+    ) -> None:
         if o3d is None:
             raise RuntimeError(
                 "open3d is required for ShapeFittingTracker. "
@@ -591,6 +597,16 @@ class ShapeFittingTracker:
 
         self.enabled = bool(fitting_cfg.get("enabled", True))
         template_cfg = fitting_cfg.get("template_library") or pose_tracking_cfg.get("template_library") or {}
+        self._runtime_template_label: str | None = None
+        if runtime_template_override is not None:
+            override = dict(runtime_template_override)
+            override_label = str(override.pop("label", "sam3d_object")).strip()
+            if not override_label:
+                raise ValueError("runtime template override label cannot be empty")
+            if "asset_path" not in override:
+                raise ValueError("runtime template override requires asset_path")
+            template_cfg = {override_label: override}
+            self._runtime_template_label = override_label
         if not template_cfg:
             raise ValueError("No template library configured for perception.shape_fitting.")
 
@@ -644,6 +660,8 @@ class ShapeFittingTracker:
             for label in silhouette_cfg.get("apply_to_labels", default_silhouette_labels)
             if str(label).strip()
         }
+        if self._runtime_template_label is not None:
+            self.silhouette_apply_to_labels.add(self._runtime_template_label.lower())
         self.silhouette_lambda_3d = float(silhouette_cfg.get("lambda_3d", 1.0))
         self.silhouette_lambda_iou = float(silhouette_cfg.get("lambda_iou", 0.75))
         self.silhouette_lambda_outside = float(silhouette_cfg.get("lambda_outside", 1.25))
@@ -745,11 +763,20 @@ class ShapeFittingTracker:
         )
 
     @classmethod
-    def from_config(cls, config_path: str | Path = DEFAULT_CONFIG_PATH) -> "ShapeFittingTracker":
+    def from_config(
+        cls,
+        config_path: str | Path = DEFAULT_CONFIG_PATH,
+        *,
+        runtime_template_override: dict[str, Any] | None = None,
+    ) -> "ShapeFittingTracker":
         resolved_config_path = _resolve_path(config_path)
         with open(resolved_config_path, "r", encoding="utf-8") as handle:
             config = yaml.safe_load(handle) or {}
-        return cls(config=config, config_path=resolved_config_path)
+        return cls(
+            config=config,
+            config_path=resolved_config_path,
+            runtime_template_override=runtime_template_override,
+        )
 
     def reset(self) -> None:
         self._tracked_cluster_centroid = None
@@ -992,7 +1019,7 @@ class ShapeFittingTracker:
         if freeze_silhouette_scale:
             self._last_silhouette_debug = self._make_empty_silhouette_debug(
                 enabled=True,
-                reason="scale_frozen_home_locked",
+                reason="scale_frozen_initial_scaling_complete",
             )
             self._apply_silhouette_fields_to_state(state)
             self._apply_silhouette_fields_to_debug()
@@ -1616,7 +1643,7 @@ class ShapeFittingTracker:
         if not template.z_rotation_enabled:
             return [0.0]
 
-        return self._build_z_rotation_candidate_degrees(
+        return ShapeFittingTracker._build_z_rotation_candidate_degrees(
             template.z_rotation_min_deg,
             template.z_rotation_max_deg,
             template.z_rotation_step_deg,
@@ -1645,7 +1672,7 @@ class ShapeFittingTracker:
     def _z_rotation_coarse_candidate_degrees(self, template: ShapeTemplateModel) -> list[float]:
         if not template.z_rotation_enabled:
             return [0.0]
-        return self._build_z_rotation_candidate_degrees(
+        return ShapeFittingTracker._build_z_rotation_candidate_degrees(
             template.z_rotation_min_deg,
             template.z_rotation_max_deg,
             template.z_rotation_coarse_step_deg,
@@ -1665,7 +1692,7 @@ class ShapeFittingTracker:
             radius_deg = 10.0
         lower_deg = max(min_deg, float(center_deg) - radius_deg)
         upper_deg = min(max_deg, float(center_deg) + radius_deg)
-        return self._build_z_rotation_candidate_degrees(
+        return ShapeFittingTracker._build_z_rotation_candidate_degrees(
             lower_deg,
             upper_deg,
             template.z_rotation_refine_step_deg,
