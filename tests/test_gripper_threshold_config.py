@@ -109,10 +109,121 @@ HOME_JOINTS_DEG = _MODULE.HOME_JOINTS_DEG
 PRE_RELEASE_MIN_Z_EPSILON_MM = _MODULE.PRE_RELEASE_MIN_Z_EPSILON_MM
 RELEASE_PARAMETER_MM = _MODULE.RELEASE_PARAMETER_MM
 apply_config_defaults = _MODULE.apply_config_defaults
+build_raw_point_cloud_geometry_state = _MODULE.build_raw_point_cloud_geometry_state
 resolve_gripper_position_stall_detection_config = _MODULE.resolve_gripper_position_stall_detection_config
 resolve_gripper_position_threshold_from_geometry = _MODULE.resolve_gripper_position_threshold_from_geometry
 reset_gripper_position_threshold_to_config_default = _MODULE.reset_gripper_position_threshold_to_config_default
 reset_tactile_state_for_system_reset = _MODULE.reset_tactile_state_for_system_reset
+
+
+class AblationOptionTests(unittest.TestCase):
+    @staticmethod
+    def _minimal_config(backend="sam3d", tactile_enabled=True):
+        return {
+            "perception": {"object": {"backend": backend}},
+            "safety": {
+                "workspace_bounds_m": {
+                    "x": [-1.0, 1.0],
+                    "y": [-1.0, 1.0],
+                    "z": [0.0, 1.0],
+                }
+            },
+            "robot": {"tactile": {"enabled": tactile_enabled}},
+        }
+
+    def test_cli_defaults_to_baseline_and_accepts_single_mode(self):
+        with unittest.mock.patch.object(sys, "argv", ["handover"]):
+            baseline = _MODULE.parse_args()
+        with unittest.mock.patch.object(
+            sys,
+            "argv",
+            ["handover", "--ablation", "shape-fitting"],
+        ):
+            shape = _MODULE.parse_args()
+
+        self.assertEqual(baseline.ablation, "baseline")
+        self.assertEqual(shape.ablation, "shape-fitting")
+
+    def test_cli_can_disable_and_reenable_place_grasp_offset_xy(self):
+        with unittest.mock.patch.object(
+            sys,
+            "argv",
+            ["handover", "--disable-place-grasp-offset-xy"],
+        ):
+            disabled = _MODULE.parse_args()
+        with unittest.mock.patch.object(
+            sys,
+            "argv",
+            ["handover", "--apply-place-grasp-offset-xy"],
+        ):
+            enabled = _MODULE.parse_args()
+
+        self.assertFalse(disabled.apply_place_grasp_offset_xy)
+        self.assertTrue(enabled.apply_place_grasp_offset_xy)
+
+    def test_place_grasp_offset_xy_defaults_on_and_cli_overrides_yaml(self):
+        default_args = config_args()
+        default_resolved = apply_config_defaults(default_args, self._minimal_config())
+        self.assertTrue(default_resolved.apply_place_grasp_offset_xy)
+
+        override_args = config_args()
+        override_args.apply_place_grasp_offset_xy = True
+        config = self._minimal_config()
+        config["robot"]["return_sequence"] = {"apply_grasp_offset_xy": False}
+        override_resolved = apply_config_defaults(override_args, config)
+        self.assertTrue(override_resolved.apply_place_grasp_offset_xy)
+
+    def test_tactile_ablation_overrides_yaml_and_selects_obj_only(self):
+        args = config_args()
+        args.ablation = "tactile-sensing"
+
+        resolved = apply_config_defaults(args, self._minimal_config())
+
+        self.assertFalse(resolved.tactile_enabled)
+        self.assertEqual(resolved.grasp_detection_mode, "robotiq_object_only")
+        self.assertEqual(resolved.release_parameter_mm, 20.0)
+
+        shared_state = _MODULE.FollowSharedState.__new__(_MODULE.FollowSharedState)
+        shared_state.args = resolved
+        shared_state.lock = threading.Lock()
+        shared_state.recent_grasp_z_mm_buffer = [100.0, 100.0, 100.0]
+        shared_state.recent_template_bottom_z_mm_buffer = [50.0, 50.0, 50.0]
+        place_z = shared_state.finalize_place_z_from_recent_samples()
+
+        self.assertEqual(place_z["release_parameter_mm"], 20.0)
+        self.assertEqual(place_z["raw_place_z_mm"], 70.0)
+
+    def test_baseline_keeps_eighty_mm_release_parameter(self):
+        args = config_args()
+        args.ablation = "baseline"
+
+        resolved = apply_config_defaults(args, self._minimal_config())
+
+        self.assertEqual(resolved.release_parameter_mm, RELEASE_PARAMETER_MM)
+
+    def test_shape_and_silhouette_ablation_reject_legacy_backend(self):
+        for mode in ("shape-fitting", "silhouette-scaling"):
+            args = config_args()
+            args.ablation = mode
+            args.object_backend = "legacy"
+            with self.assertRaisesRegex(ValueError, "requires --object-backend sam3d"):
+                apply_config_defaults(args, self._minimal_config(backend="legacy"))
+
+    def test_raw_geometry_preserves_cloud_centroid_and_source(self):
+        merged = SimpleNamespace(
+            valid=True,
+            label="sam3d_object",
+            centroid_base=(0.1, 0.2, 0.3),
+            merged_points_base=[(0.0, 0.0, 0.1), (0.2, 0.4, 0.5)],
+        )
+
+        state = build_raw_point_cloud_geometry_state(merged)
+
+        self.assertTrue(state.valid)
+        self.assertEqual(state.centroid_base, merged.centroid_base)
+        self.assertEqual(state.scale_mode, "raw_point_cloud")
+        self.assertIsNone(state.template_id)
+        np.testing.assert_allclose(state.fitted_points_base, merged.merged_points_base)
 sys.modules.pop("robot_control_rtde_fitting_final", None)
 
 for _name, _original in _STUBS:
@@ -252,6 +363,23 @@ class DummyCloseController:
 
     def stop_gripper_motion(self):
         self.stop_count += 1
+
+
+class DummyRobotiqObjectController(DummyCloseController):
+    def __init__(self, statuses, *, position=255):
+        super().__init__([position] * max(len(statuses), 1), threshold=1)
+        self._statuses = list(statuses)
+        self.min_tcp_force_norm_n = -1.0
+
+    def get_gripper_close_state(self):
+        if not self._statuses:
+            return None
+        return {
+            "position": 255,
+            "closed_position": 255,
+            "fully_closed": True,
+            "object_status": self._statuses.pop(0),
+        }
 
 
 class DummyPoseController:
@@ -744,6 +872,33 @@ class GripperThresholdConfigTests(unittest.TestCase):
         self.assertEqual(debug["fallback_reason"], "none")
         self.assertEqual(debug["place_object_x_mm"], 600.0)
         self.assertEqual(debug["place_object_y_mm"], 0.0)
+        self.assertTrue(debug["grasp_offset_xy_applied"])
+
+    def test_fixed_place_target_can_ignore_grasp_xy_offset(self):
+        shared_state = DummySharedStateForPlace()
+
+        target, debug = compute_place_target(
+            shared_state,
+            place_object_xy_mm=(600.0, 0.0),
+            apply_grasp_offset_xy=False,
+        )
+
+        np.testing.assert_allclose(target, np.asarray([600.0, 0.0, 100.0]))
+        self.assertFalse(debug["grasp_offset_xy_applied"])
+        self.assertEqual(debug["applied_grasp_offset_x_mm"], 0.0)
+        self.assertEqual(debug["applied_grasp_offset_y_mm"], 0.0)
+
+    def test_fixed_place_target_without_offset_does_not_require_grasp_offset(self):
+        shared_state = DummySharedStateForPlace()
+        shared_state.grasp_offset_xyz_mm = None
+
+        target, debug = compute_place_target(
+            shared_state,
+            apply_grasp_offset_xy=False,
+        )
+
+        np.testing.assert_allclose(target, np.asarray([600.0, 0.0, 100.0]))
+        self.assertEqual(debug["fallback_reason"], "none")
 
     def test_fixed_place_target_fails_closed_without_place_z(self):
         shared_state = DummySharedStateForPlace()
@@ -1008,6 +1163,44 @@ class GripperCloseStallFallbackTests(unittest.TestCase):
         self.assertEqual(resolved["min_elapsed_s"], 0.0)
 
 
+class RobotiqObjectOnlyTests(unittest.TestCase):
+    def _run(self, statuses, timeout_s=0.1):
+        controller = DummyRobotiqObjectController(statuses)
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = execute_gripper_close(
+                controller,
+                timeout_s=timeout_s,
+                poll_dt=0.0,
+                verbose=False,
+                detection_mode="robotiq_object_only",
+            )
+        return result, controller
+
+    def test_inner_object_is_the_only_success_status(self):
+        result, controller = self._run(["MOVING", "STOPPED_INNER_OBJECT"])
+        self.assertTrue(result)
+        self.assertEqual(controller.stop_count, 1)
+
+    def test_stale_at_dest_before_motion_does_not_cancel_close(self):
+        result, controller = self._run(
+            ["AT_DEST", "MOVING", "STOPPED_INNER_OBJECT"]
+        )
+        self.assertTrue(result)
+        self.assertEqual(controller.stop_count, 1)
+
+    def test_full_close_does_not_succeed_from_force_position_or_stall(self):
+        result, controller = self._run(["MOVING", "AT_DEST"])
+        self.assertFalse(result)
+        self.assertEqual(controller.stop_count, 1)
+
+    def test_outer_object_and_missing_status_fail_closed(self):
+        outer_result, _ = self._run(["STOPPED_OUTER_OBJECT"])
+        missing_result, missing_controller = self._run([], timeout_s=0.001)
+        self.assertFalse(outer_result)
+        self.assertFalse(missing_result)
+        self.assertEqual(missing_controller.stop_count, 1)
+
+
 class TactileConfigAndBehaviorTests(unittest.TestCase):
     def test_tactile_config_defaults_are_read_from_yaml(self):
         args = config_args()
@@ -1023,6 +1216,7 @@ class TactileConfigAndBehaviorTests(unittest.TestCase):
             "robot": {
                 "return_sequence": {
                     "place_object_xy_mm": [600.0, 0.0],
+                    "apply_grasp_offset_xy": False,
                     "post_backoff_stop_check_enabled": True,
                     "post_backoff_stop_speed_threshold_mps": 0.003,
                     "post_backoff_stop_timeout_s": 0.4,
@@ -1063,6 +1257,7 @@ class TactileConfigAndBehaviorTests(unittest.TestCase):
         self.assertAlmostEqual(resolved.tactile_release_descent_poll_dt_s, 0.02)
         self.assertFalse(resolved.tactile_debug)
         self.assertEqual(resolved.place_object_xy_mm, (600.0, 0.0))
+        self.assertFalse(resolved.apply_place_grasp_offset_xy)
         self.assertTrue(resolved.post_backoff_stop_check_enabled)
         self.assertAlmostEqual(resolved.post_backoff_stop_speed_threshold_mps, 0.003)
         self.assertAlmostEqual(resolved.post_backoff_stop_timeout_s, 0.4)

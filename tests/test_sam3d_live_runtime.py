@@ -10,7 +10,11 @@ from unittest import mock
 import numpy as np
 
 from perception.hands23_ipc import Hands23BBoxResult
-from perception.sam3d_live_runtime import Sam3DLiveRuntime
+from perception.sam3d_live_runtime import (
+    READINESS_RAW_CLOUD,
+    READINESS_SHAPE_FIT,
+    Sam3DLiveRuntime,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -149,6 +153,45 @@ class Sam3DLiveRuntimeTest(unittest.TestCase):
 
         self.runtime.after_shape_fit(self._shape_state(silhouette_valid=False))
         self.assertEqual(self.runtime.initial_scaling_progress, (0, 4))
+
+    def test_shape_fit_readiness_does_not_require_silhouette_evidence(self):
+        runtime = Sam3DLiveRuntime(
+            self.runtime.pipeline,
+            REPO_ROOT / "configs" / "handover.yaml",
+            repo_root=REPO_ROOT,
+            client=self.client,
+            readiness_strategy=READINESS_SHAPE_FIT,
+            ready_valid_frames=2,
+        )
+        runtime.reset(3)
+        state = self._shape_state(silhouette_valid=False)
+
+        self.assertFalse(runtime.after_shape_fit(state))
+        self.assertTrue(runtime.after_shape_fit(state))
+        self.assertEqual(runtime.initialization_phase, "waiting_hands23")
+        self.assertFalse(runtime.silhouette_scale_frozen)
+
+    def test_raw_cloud_readiness_and_regeneration_disable(self):
+        runtime = Sam3DLiveRuntime(
+            self.runtime.pipeline,
+            REPO_ROOT / "configs" / "handover.yaml",
+            repo_root=REPO_ROOT,
+            client=self.client,
+            readiness_strategy=READINESS_RAW_CLOUD,
+            ready_valid_frames=2,
+            regeneration_enabled=False,
+        )
+        runtime.reset(3)
+        valid = SimpleNamespace(valid=True, merged_point_count=20)
+        invalid = SimpleNamespace(valid=False, merged_point_count=0)
+
+        self.assertEqual(runtime.initialization_phase, "fixed_raw_cloud")
+        self.assertFalse(runtime.after_raw_cloud(valid))
+        self.assertFalse(runtime.after_raw_cloud(invalid))
+        self.assertEqual(runtime.initial_scaling_progress, (0, 2))
+        self.assertFalse(runtime.after_raw_cloud(valid))
+        self.assertTrue(runtime.after_raw_cloud(valid))
+        self.assertFalse(runtime.begin_regeneration(3))
         self.runtime.after_shape_fit(self._shape_state())
         self.runtime.after_shape_fit(self._shape_state(valid=False))
         self.assertEqual(self.runtime.initial_scaling_progress, (0, 4))

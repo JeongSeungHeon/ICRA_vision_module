@@ -238,10 +238,13 @@ def runtime_template_override(
 def build_runtime_shape_fitting_tracker(
     config_path: str | Path,
     runtime_template_path: str | Path,
+    *,
+    silhouette_enabled_override: bool | None = None,
 ) -> ShapeFittingTracker:
     return ShapeFittingTracker.from_config(
         config_path,
         runtime_template_override=runtime_template_override(config_path, runtime_template_path),
+        silhouette_enabled_override=silhouette_enabled_override,
     )
 
 

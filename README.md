@@ -161,15 +161,49 @@ python robot_control_rtde_fitting_final.py \
 Useful options:
 
 - `--config`: alternate YAML config path
+- `--ablation baseline|shape-fitting|tactile-sensing|silhouette-scaling`: run one isolated ablation; defaults to `baseline`
 - `--object-backend sam3d|legacy`: object backend; `sam3d` is the default
 - `--model`, `--prompt`, `--select-mode`: legacy YOLOE backend options
 - `--robot-ip`: override `robot.rtde.robot_ip`
 - `--enable-follow`: enable RTDE follow thread
 - `--follow-z` / `--no-follow-z`: toggle Z-axis following
+- `--disable-place-grasp-offset-xy`: use `place_object_xy_mm` directly as the
+  final TCP XY; `--apply-place-grasp-offset-xy` restores offset compensation
 - `--open-gripper`: open gripper during startup
 - `--show-depth`: show a cam0 depth preview window
 - `--enable-fdct-depth` / `--disable-fdct-depth`: override FDCT setting from config
 - `--profile-runtime`: collect CPU/RAM/GPU/VRAM and stage timing logs for hardware sizing
+
+### Ablation runs
+
+The launcher forwards the ablation selector to the main runtime:
+
+```bash
+bash run_fitting_final.sh --ablation baseline
+bash run_fitting_final.sh --ablation shape-fitting
+bash run_fitting_final.sh --ablation tactile-sensing
+bash run_fitting_final.sh --ablation silhouette-scaling
+```
+
+- `shape-fitting` skips SAM3D template bootstrap/generation, scale/rotation fitting,
+  ICP, silhouette scoring, and template regeneration. FastSAM starts from the
+  configured fixed bboxes and switches to Hands23 dynamic bboxes after
+  `perception.object.hands23_bbox.raw_cloud_ready_frames` consecutive valid raw
+  merged clouds. Grasp and place geometry comes directly from that cloud; the
+  SAM3D model server is not required.
+- `tactile-sensing` does not create or start AnySkin. During gripper close,
+  Robotiq `STOPPED_INNER_OBJECT` is the only success signal; RTDE force/current,
+  position thresholds, and position stall cannot verify the grasp. Release uses
+  a 20 mm place-Z release parameter and the existing non-tactile
+  fixed-descend/open path. Other modes keep the baseline 80 mm release parameter.
+- `silhouette-scaling` keeps SAM3D template generation, 3D scale initialization,
+  rotation search, and ICP, but skips mask observation and silhouette candidate
+  reranking. Consecutive valid initialized fits open the Hands23 dynamic-bbox
+  gate.
+
+`shape-fitting` and `silhouette-scaling` require `--object-backend sam3d`.
+The active mode and geometry source are printed at startup and included in
+runtime-profile and 3D-debug context.
 
 For the full CLI:
 

@@ -251,42 +251,44 @@ class Hands23SidecarClient:
             "--weights", str(self.weights_path),
             "--socket", str(self.socket_path),
         ]
-        self._process = subprocess.Popen(command, env=self._environment())
-        deadline = time.monotonic() + self.startup_timeout_s
-        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        while True:
-            if self._process.poll() is not None:
-                return_code = self._process.returncode
-                connection.close()
-                self.close()
-                raise Hands23IPCError(
-                    f"Hands23 sidecar exited during startup with code {return_code}"
-                )
-            try:
-                connection.connect(str(self.socket_path))
-                self._socket_inode = self.socket_path.stat().st_ino
-                break
-            except (FileNotFoundError, ConnectionRefusedError):
-                if time.monotonic() >= deadline:
-                    self.close()
-                    raise TimeoutError(
-                        f"Hands23 sidecar did not become ready within {self.startup_timeout_s:.1f}s"
-                    )
-                time.sleep(0.05)
-        connection.settimeout(self.request_timeout_s)
+        connection: socket.socket | None = None
         try:
+            self._process = subprocess.Popen(command, env=self._environment())
+            deadline = time.monotonic() + self.startup_timeout_s
+            connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            while True:
+                if self._process.poll() is not None:
+                    return_code = self._process.returncode
+                    raise Hands23IPCError(
+                        f"Hands23 sidecar exited during startup with code {return_code}"
+                    )
+                try:
+                    connection.connect(str(self.socket_path))
+                    self._socket_inode = self.socket_path.stat().st_ino
+                    break
+                except (FileNotFoundError, ConnectionRefusedError):
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"Hands23 sidecar did not become ready within {self.startup_timeout_s:.1f}s"
+                        )
+                    time.sleep(0.05)
+            connection.settimeout(self.request_timeout_s)
             ready, _ = receive_packet(connection)
-        except Exception:
-            connection.close()
+            if ready.get("type") != "ready":
+                raise Hands23IPCError(f"unexpected Hands23 startup response: {ready}")
+            self._connection = connection
+            connection = None
+            self._thread = threading.Thread(
+                target=self._run,
+                name="hands23-ipc",
+                daemon=True,
+            )
+            self._thread.start()
+        except BaseException:
+            if connection is not None:
+                connection.close()
             self.close()
             raise
-        if ready.get("type") != "ready":
-            connection.close()
-            self.close()
-            raise Hands23IPCError(f"unexpected Hands23 startup response: {ready}")
-        self._connection = connection
-        self._thread = threading.Thread(target=self._run, name="hands23-ipc", daemon=True)
-        self._thread.start()
 
     def reset(self, task_id: int) -> None:
         with self._condition:

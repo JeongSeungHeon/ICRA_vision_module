@@ -583,6 +583,7 @@ class ShapeFittingTracker:
         *,
         config_path: str | Path = DEFAULT_CONFIG_PATH,
         runtime_template_override: dict[str, Any] | None = None,
+        silhouette_enabled_override: bool | None = None,
     ) -> None:
         if o3d is None:
             raise RuntimeError(
@@ -652,7 +653,17 @@ class ShapeFittingTracker:
         self.icp_crop_min_height_extent_m = float(crop_cfg.get("min_height_extent_m", 0.01))
 
         # 2D segmentation silhouette와 3D 거리 손실을 함께 사용해 scale 후보를 재평가합니다.
-        self.silhouette_enabled = bool(silhouette_cfg.get("enabled", False))
+        configured_silhouette_enabled = bool(silhouette_cfg.get("enabled", False))
+        self.silhouette_enabled = (
+            configured_silhouette_enabled
+            if silhouette_enabled_override is None
+            else bool(silhouette_enabled_override)
+        )
+        self._silhouette_disabled_reason = (
+            "disabled_by_ablation"
+            if silhouette_enabled_override is False and configured_silhouette_enabled
+            else "disabled"
+        )
         default_silhouette_labels = ["cup", "wine glass", "glass", "bottle"]
         self.silhouette_apply_to_all = bool(silhouette_cfg.get("apply_to_all", False))
         self.silhouette_apply_to_labels = {
@@ -714,7 +725,7 @@ class ShapeFittingTracker:
         self._last_silhouette_scale_xyz: np.ndarray | None = None
         self._last_silhouette_debug = self._make_empty_silhouette_debug(
             enabled=self.silhouette_enabled,
-            reason="disabled" if not self.silhouette_enabled else "not_evaluated",
+            reason=self._silhouette_disabled_reason if not self.silhouette_enabled else "not_evaluated",
         )
         self._initialized = False
 
@@ -768,6 +779,7 @@ class ShapeFittingTracker:
         config_path: str | Path = DEFAULT_CONFIG_PATH,
         *,
         runtime_template_override: dict[str, Any] | None = None,
+        silhouette_enabled_override: bool | None = None,
     ) -> "ShapeFittingTracker":
         resolved_config_path = _resolve_path(config_path)
         with open(resolved_config_path, "r", encoding="utf-8") as handle:
@@ -776,6 +788,7 @@ class ShapeFittingTracker:
             config=config,
             config_path=resolved_config_path,
             runtime_template_override=runtime_template_override,
+            silhouette_enabled_override=silhouette_enabled_override,
         )
 
     def reset(self) -> None:
@@ -794,7 +807,7 @@ class ShapeFittingTracker:
         self._last_silhouette_scale_xyz = None
         self._last_silhouette_debug = self._make_empty_silhouette_debug(
             enabled=self.silhouette_enabled,
-            reason="disabled" if not self.silhouette_enabled else "reset",
+            reason=self._silhouette_disabled_reason if not self.silhouette_enabled else "reset",
         )
         self._initialized = False
 
@@ -808,7 +821,7 @@ class ShapeFittingTracker:
         # process()는 한 프레임의 merged object를 받아 템플릿 점군을 base 좌표계에 맞춘 상태로 갱신합니다.
         self._last_silhouette_debug = self._make_empty_silhouette_debug(
             enabled=self.silhouette_enabled,
-            reason="disabled" if not self.silhouette_enabled else "not_evaluated",
+            reason=self._silhouette_disabled_reason if not self.silhouette_enabled else "not_evaluated",
         )
         if not self.enabled:
             return self._make_state(valid=False, template=None, fitted_points=None, centroid=None, reason="disabled")
@@ -1005,7 +1018,10 @@ class ShapeFittingTracker:
     ) -> ShapeFittingState:
         # silhouette constraint는 3D ICP가 만든 결과를 2D 마스크 투영 품질로 한 번 더 고르는 후처리입니다.
         if not self.silhouette_enabled:
-            self._last_silhouette_debug = self._make_empty_silhouette_debug(enabled=False, reason="disabled")
+            self._last_silhouette_debug = self._make_empty_silhouette_debug(
+                enabled=False,
+                reason=self._silhouette_disabled_reason,
+            )
             self._apply_silhouette_fields_to_state(state)
             self._apply_silhouette_fields_to_debug()
             return state

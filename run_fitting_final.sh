@@ -2,6 +2,12 @@
 set -euo pipefail
 
 # sudo chmod a+rw /dev/ttyACM0
+# Ablation examples (all extra arguments are forwarded to the Python entry point):
+#   bash run_fitting_final.sh --ablation shape-fitting
+#   bash run_fitting_final.sh --ablation tactile-sensing
+#   bash run_fitting_final.sh --ablation silhouette-scaling
+# Place without grasp-offset XY compensation:
+#   bash run_fitting_final.sh --disable-place-grasp-offset-xy
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 main_python="${HANDOVER_PYTHON:-python}"
 

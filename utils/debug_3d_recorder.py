@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 IMAGE_ARRAY_KEYS = (
     "cam0_color_image",
     "cam0_depth_image_m",
@@ -301,6 +301,7 @@ class Debug3DRecorder:
         grasp_point_base: Any,
         eef_pose_base: Any,
         measurement_source: str,
+        geometry_source: str = "fitted_template",
         hand_selector_debug: Any = None,
         tactile_snapshot: Any = None,
         snapshot: Any = None,
@@ -329,6 +330,7 @@ class Debug3DRecorder:
             "record_clock_text": format_record_clock(record_elapsed_s),
             "task_epoch": int(task_epoch),
             "measurement_source": str(measurement_source or "none"),
+            "geometry_source": str(geometry_source or "unknown"),
             "object_label": _none_if_missing(getattr(raw_merged_object, "label", None)),
             "object_valid": bool(getattr(raw_merged_object, "valid", False)),
             "object_point_count": int(getattr(raw_merged_object, "merged_point_count", len(raw_points))),
@@ -475,6 +477,7 @@ class Debug3DRecorder:
         variable_cloud_keys = ("object_points_base", "template_points_base")
         string_keys = (
             "measurement_source",
+            "geometry_source",
             "object_label",
             "fitted_label",
             "template_id",

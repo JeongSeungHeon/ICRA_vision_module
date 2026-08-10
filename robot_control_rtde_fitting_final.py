@@ -40,7 +40,10 @@ from perception.sam3d_backend import (
     validate_hands23_runtime_assets,
     validate_main_runtime,
 )
-from perception.sam3d_live_runtime import Sam3DLiveRuntime, enforce_sam3d_target_gate
+from perception.sam3d_live_runtime import (
+    Sam3DLiveRuntime,
+    enforce_sam3d_target_gate,
+)
 from perception.target_predictor import TargetPredictor
 from robot.rtde_controller import RtdeController
 from system.dual_sensor_hub import DualSensorHub
@@ -64,6 +67,21 @@ from utils.runtime_profiler import RuntimeProfiler
 # Constants
 # =========================
 DEFAULT_CONFIG_PATH = Path("configs/handover.yaml")
+ABLATION_BASELINE = "baseline"
+ABLATION_SHAPE_FITTING = "shape-fitting"
+ABLATION_TACTILE_SENSING = "tactile-sensing"
+ABLATION_SILHOUETTE_SCALING = "silhouette-scaling"
+ABLATION_CHOICES = (
+    ABLATION_BASELINE,
+    ABLATION_SHAPE_FITTING,
+    ABLATION_TACTILE_SENSING,
+    ABLATION_SILHOUETTE_SCALING,
+)
+GRASP_DETECTION_HYBRID = "hybrid"
+GRASP_DETECTION_ROBOTIQ_OBJECT_ONLY = "robotiq_object_only"
+READINESS_SILHOUETTE = "silhouette_ready"
+READINESS_SHAPE_FIT = "shape_fit_ready"
+READINESS_RAW_CLOUD = "raw_cloud_ready"
 
 
 # object motion trigger
@@ -94,12 +112,15 @@ PLACE_Z_GRASP_BUFFER_FRAMES = 5
 PLACE_Z_MIN_VALID_SAMPLES = 3
 GRIPPER_FORCE_STOP_DELTA_N = 100000
 GRIPPER_FORCE_STOP_MIN_ELAPSED_S = 0.12
+ROBOTIQ_OBJ_COMMAND_GRACE_S = 0.15
+ROBOTIQ_OBJ_POSITION_START_DELTA = 2
 DEFAULT_GRIPPER_POSITION_COMPLETE_THRESHOLD = 200
 DEFAULT_GRIPPER_POSITION_STALL_ENABLED = True
 DEFAULT_GRIPPER_POSITION_STALL_STABLE_READS = 3
 DEFAULT_GRIPPER_POSITION_STALL_TOLERANCE = 1
 DEFAULT_GRIPPER_POSITION_STALL_MIN_ELAPSED_S = 0.12
 RELEASE_PARAMETER_MM = 80.0
+TACTILE_SENSING_ABLATION_RELEASE_PARAMETER_MM = 20.0
 DEFAULT_TACTILE_PORT = "/dev/ttyACM0"
 DEFAULT_TACTILE_NUM_MAGS = 5
 DEFAULT_TACTILE_BASELINE_SAMPLES = 5
@@ -173,6 +194,29 @@ class RobotActionContext:
 
 
 @dataclass
+class RawPointCloudGeometryState:
+    """Shape-state-compatible view used only by the shape-fitting ablation."""
+
+    valid: bool
+    label: object
+    template_id: object
+    fitted_points_base: object
+    centroid_base: object
+    scale: object = None
+    scale_xyz: object = None
+    scale_mode: str = "raw_point_cloud"
+    template_axes_base: object = None
+    z_rotation_deg: object = None
+    roll_rotation_deg: object = None
+    pitch_rotation_deg: object = None
+    bowl_height_fraction: object = None
+    initialized: bool = False
+    reason: str = "no_merged_object"
+    silhouette_enabled: bool = False
+    silhouette_reason: str = "not_applicable_shape_fitting_ablation"
+
+
+@dataclass
 class RobotStatus:
     state: str = ROBOT_STATE_IDLE
     last_error: object = None
@@ -192,6 +236,16 @@ def parse_args():
     """Parse CLI switches for perception, robot follow, debugging, and profiling."""
     parser = argparse.ArgumentParser(
         description="Run dual-camera perception, build a grasp target from hand pose + merged object cloud, and follow it with UR5 RTDE."
+    )
+    parser.add_argument(
+        "--ablation",
+        choices=ABLATION_CHOICES,
+        default=ABLATION_BASELINE,
+        help=(
+            "Run one isolated ablation: shape-fitting skips SAM3D template/ICP, "
+            "tactile-sensing uses only the Robotiq OBJ close signal, and "
+            "silhouette-scaling keeps ICP but disables silhouette reranking."
+        ),
     )
     parser.add_argument(
         "--object-backend",
@@ -256,6 +310,19 @@ def parse_args():
     parser.add_argument("--move-timeout-s", type=float, default=10.0, help="Timeout for blocking move steps.")
     parser.add_argument("--gripper-close-timeout-s", type=float, default=2.0, help="Timeout for force/current grasp verification.")
     parser.add_argument("--gripper-release-dwell-s", type=float, default=0.5, help="Dwell after opening gripper.")
+    parser.add_argument(
+        "--apply-place-grasp-offset-xy",
+        dest="apply_place_grasp_offset_xy",
+        action="store_true",
+        help="Apply the grasp-time object-to-TCP XY offset to the configured place-object XY target.",
+    )
+    parser.add_argument(
+        "--disable-place-grasp-offset-xy",
+        dest="apply_place_grasp_offset_xy",
+        action="store_false",
+        help="Use place_object_xy_mm directly as the final TCP XY without grasp-offset compensation.",
+    )
+    parser.set_defaults(apply_place_grasp_offset_xy=None)
     parser.add_argument(
         "--enable-pre-release-descend-before-open",
         dest="pre_release_descend_before_open",
@@ -412,6 +479,11 @@ def get_video_recorder_tactile_logging_config(config):
 
 def apply_config_defaults(args, config):
     """Fill CLI defaults from config while keeping explicit command-line values."""
+    args.ablation = str(getattr(args, "ablation", ABLATION_BASELINE)).strip().lower()
+    if args.ablation not in ABLATION_CHOICES:
+        raise ValueError(
+            f"Unsupported ablation mode={args.ablation!r}; expected one of {ABLATION_CHOICES}"
+        )
     robot_cfg = config.get("robot", {})
     live_cfg = robot_cfg.get("live_follow", {})
     return_sequence_cfg = robot_cfg.get("return_sequence", {})
@@ -428,6 +500,23 @@ def apply_config_defaults(args, config):
         raise ValueError(
             f"Unsupported perception.object.backend={args.object_backend!r}; expected sam3d or legacy"
         )
+    if args.ablation in {ABLATION_SHAPE_FITTING, ABLATION_SILHOUETTE_SCALING} and args.object_backend != "sam3d":
+        raise ValueError(
+            f"--ablation {args.ablation} requires --object-backend sam3d"
+        )
+
+    args.shape_fitting_ablation = args.ablation == ABLATION_SHAPE_FITTING
+    args.silhouette_scaling_ablation = args.ablation == ABLATION_SILHOUETTE_SCALING
+    args.grasp_detection_mode = (
+        GRASP_DETECTION_ROBOTIQ_OBJECT_ONLY
+        if args.ablation == ABLATION_TACTILE_SENSING
+        else GRASP_DETECTION_HYBRID
+    )
+    args.release_parameter_mm = (
+        TACTILE_SENSING_ABLATION_RELEASE_PARAMETER_MM
+        if args.ablation == ABLATION_TACTILE_SENSING
+        else RELEASE_PARAMETER_MM
+    )
 
     if args.robot_ip is None:
         args.robot_ip = rtde_cfg.get("robot_ip")
@@ -444,6 +533,10 @@ def apply_config_defaults(args, config):
     args.place_object_xy_mm = tuple(float(value) for value in place_object_xy_mm)
     if not np.all(np.isfinite(np.asarray(args.place_object_xy_mm, dtype=np.float64))):
         raise ValueError("robot.return_sequence.place_object_xy_mm must contain finite values")
+    if getattr(args, "apply_place_grasp_offset_xy", None) is None:
+        args.apply_place_grasp_offset_xy = bool(
+            return_sequence_cfg.get("apply_grasp_offset_xy", True)
+        )
     args.post_release_z_offset_mm = (
         float(return_sequence_cfg.get("post_release_z_offset_m", DEFAULT_POST_RELEASE_Z_OFFSET_MM / 1000.0)) * 1000.0
     )
@@ -496,6 +589,8 @@ def apply_config_defaults(args, config):
         setattr(args, arg_name, mm_bounds)
 
     args.tactile_enabled = bool(tactile_cfg.get("enabled", False))
+    if args.ablation == ABLATION_TACTILE_SENSING:
+        args.tactile_enabled = False
     args.tactile_port = str(tactile_cfg.get("port", DEFAULT_TACTILE_PORT))
     args.tactile_num_mags = max(1, int(tactile_cfg.get("num_mags", DEFAULT_TACTILE_NUM_MAGS)))
     args.tactile_baseline_samples = max(
@@ -1183,7 +1278,15 @@ class FollowSharedState:
 
             grasp_z_median_mm = float(np.median(grasp_samples))
             template_bottom_z_median_mm = float(np.median(template_bottom_samples))
-            raw_place_z_mm = float(grasp_z_median_mm - template_bottom_z_median_mm + RELEASE_PARAMETER_MM)
+            release_parameter_mm = max(
+                0.0,
+                float(getattr(self.args, "release_parameter_mm", RELEASE_PARAMETER_MM)),
+            )
+            raw_place_z_mm = float(
+                grasp_z_median_mm
+                - template_bottom_z_median_mm
+                + release_parameter_mm
+            )
             place_z_mm = max(raw_place_z_mm, HOME_PLACE_MIN_Z_MM)
 
             self.frozen_place_z_mm = place_z_mm
@@ -1198,6 +1301,7 @@ class FollowSharedState:
                 "template_bottom_sample_count": int(len(template_bottom_samples)),
                 "grasp_z_median_mm": grasp_z_median_mm,
                 "template_bottom_z_median_mm": template_bottom_z_median_mm,
+                "release_parameter_mm": release_parameter_mm,
                 "raw_place_z_mm": raw_place_z_mm,
                 "place_z_mm": place_z_mm,
             }
@@ -2014,7 +2118,17 @@ class RobotWorker:
 
         # tactile grasp 판정이 있으면 geometry 기반 threshold 대신 config 기본값을 사용한다.
         tactile_enabled = self.tactile_manager is not None and bool(getattr(self.tactile_manager, "enabled", False))
-        if tactile_enabled:
+        grasp_detection_mode = getattr(
+            self.args,
+            "grasp_detection_mode",
+            GRASP_DETECTION_HYBRID,
+        )
+        if grasp_detection_mode == GRASP_DETECTION_ROBOTIQ_OBJECT_ONLY:
+            print(
+                "[INFO] Tactile-sensing ablation active; gripper geometry, RTDE force/current, "
+                "position threshold, and stall detection will not determine grasp success."
+            )
+        elif tactile_enabled:
             reset_gripper_position_threshold_to_config_default(self.controller)
         else:
             # tactile이 없으면 fitted geometry로 gripper close 완료 threshold를 조정한다.
@@ -2037,6 +2151,7 @@ class RobotWorker:
             tactile_manager=self.tactile_manager,
             tactile_contact_threshold=self.args.tactile_contact_norm_threshold,
             tactile_extra_grasp_pos=self.args.tactile_extra_grasp_pos,
+            detection_mode=grasp_detection_mode,
             cancel_event=self._cancel_event,
             on_state_read=self._publish_robot_state,
         )
@@ -3136,10 +3251,15 @@ def execute_gripper_close(
     tactile_manager=None,
     tactile_contact_threshold=None,
     tactile_extra_grasp_pos=None,
+    detection_mode=GRASP_DETECTION_HYBRID,
     cancel_event=None,
     on_state_read=None,
 ):
     """Close the gripper and stop when force or position indicates contact."""
+    detection_mode = str(detection_mode).strip().lower()
+    if detection_mode not in {GRASP_DETECTION_HYBRID, GRASP_DETECTION_ROBOTIQ_OBJECT_ONLY}:
+        raise ValueError(f"Unsupported grasp detection mode: {detection_mode!r}")
+    robotiq_object_only = detection_mode == GRASP_DETECTION_ROBOTIQ_OBJECT_ONLY
     if verbose:
         print("[INFO] GRIPPER CLOSE start")
 
@@ -3190,6 +3310,8 @@ def execute_gripper_close(
     tactile_contact_detected = False
     tactile_contact_position = None
     tactile_extra_target_position = None
+    robotiq_command_armed = False
+    robotiq_initial_position = None
     if tactile_enabled:
         tactile_manager.release_status = "close_monitoring"
 
@@ -3251,6 +3373,52 @@ def execute_gripper_close(
             except Exception as exc:
                 if verbose:
                     print(f"[WARN] Failed to read gripper close state: {exc}")
+
+        if robotiq_object_only:
+            object_status = (
+                None
+                if gripper_close_state is None
+                else str(gripper_close_state.get("object_status", "")).strip().upper()
+            )
+            if robotiq_initial_position is None and position_value_int is not None:
+                robotiq_initial_position = int(position_value_int)
+            position_delta = None
+            if robotiq_initial_position is not None and position_value_int is not None:
+                position_delta = int(position_value_int) - int(robotiq_initial_position)
+            if object_status == "MOVING" or (
+                position_delta is not None
+                and position_delta >= ROBOTIQ_OBJ_POSITION_START_DELTA
+            ):
+                robotiq_command_armed = True
+            if verbose:
+                print(
+                    "[GRIPPER][ROBOTIQ_OBJ_ONLY] "
+                    f"object_status={object_status or 'unavailable'}, "
+                    f"position={position_value_int}, position_delta={position_delta}, "
+                    f"armed={robotiq_command_armed}, elapsed_s={elapsed:.3f}"
+                )
+            if object_status == "STOPPED_INNER_OBJECT":
+                stop_gripper_motion_safely(controller, "Robotiq OBJ inner-object detection")
+                note_robot_first_contact(metadata_recorder)
+                print("[INFO] Robotiq OBJ detected an object while closing; grasp verified.")
+                return True
+            if object_status in {"AT_DEST", "STOPPED_OUTER_OBJECT"}:
+                if not robotiq_command_armed and elapsed < ROBOTIQ_OBJ_COMMAND_GRACE_S:
+                    if verbose:
+                        print(
+                            "[GRIPPER][ROBOTIQ_OBJ_ONLY] Ignoring pre-motion terminal status "
+                            f"{object_status}; waiting for close command propagation."
+                        )
+                    time.sleep(poll_dt)
+                    continue
+                stop_gripper_motion_safely(controller, f"Robotiq OBJ terminal status {object_status}")
+                print(
+                    "[WARN] Robotiq OBJ did not verify an inner object while closing: "
+                    f"status={object_status}."
+                )
+                return False
+            time.sleep(poll_dt)
+            continue
 
         tactile_norm = None
         tactile_triggered = False
@@ -3364,7 +3532,10 @@ def execute_gripper_close(
     stop_gripper_motion_safely(controller, "close timeout")
     if tactile_enabled:
         tactile_manager.release_status = "close_timeout"
-    print("[WARN] Grasp could not be verified from RTDE force/current.")
+    if robotiq_object_only:
+        print("[WARN] Grasp could not be verified from the Robotiq OBJ signal before timeout.")
+    else:
+        print("[WARN] Grasp could not be verified from RTDE force/current.")
     return False
 
 
@@ -3849,8 +4020,13 @@ def save_grasp_offset(controller, shared_state, on_state_read=None):
     return True
 
 
-def compute_place_target(shared_state, place_object_xy_mm=DEFAULT_PLACE_OBJECT_XY_MM):
-    """Compute a TCP target that places the object center at a fixed base-frame XY."""
+def compute_place_target(
+    shared_state,
+    place_object_xy_mm=DEFAULT_PLACE_OBJECT_XY_MM,
+    *,
+    apply_grasp_offset_xy=True,
+):
+    """Compute the fixed place TCP target, optionally compensating grasp XY offset."""
     place_object_xy = np.asarray(place_object_xy_mm, dtype=np.float64).reshape(2)
     if not np.all(np.isfinite(place_object_xy)):
         raise ValueError("place_object_xy_mm must contain finite values")
@@ -3861,7 +4037,7 @@ def compute_place_target(shared_state, place_object_xy_mm=DEFAULT_PLACE_OBJECT_X
         frozen_place_z_grasp_median_mm = shared_state.frozen_place_z_grasp_median_mm
         frozen_place_z_template_bottom_median_mm = shared_state.frozen_place_z_template_bottom_median_mm
 
-    if grasp_offset is None:
+    if apply_grasp_offset_xy and grasp_offset is None:
         return None, {
             "used_fallback": False,
             "fallback_reason": "no_grasp_offset",
@@ -3878,8 +4054,9 @@ def compute_place_target(shared_state, place_object_xy_mm=DEFAULT_PLACE_OBJECT_X
             "raw_place_z_mm": frozen_place_z_raw_mm,
         }
 
-    grasp_offset = np.asarray(grasp_offset, dtype=np.float64).reshape(3)
-    if not np.all(np.isfinite(grasp_offset)):
+    if grasp_offset is not None:
+        grasp_offset = np.asarray(grasp_offset, dtype=np.float64).reshape(3)
+    if apply_grasp_offset_xy and not np.all(np.isfinite(grasp_offset)):
         return None, {
             "used_fallback": False,
             "fallback_reason": "invalid_grasp_offset",
@@ -3887,10 +4064,15 @@ def compute_place_target(shared_state, place_object_xy_mm=DEFAULT_PLACE_OBJECT_X
             "template_bottom_z_median_mm": frozen_place_z_template_bottom_median_mm,
             "raw_place_z_mm": frozen_place_z_raw_mm,
         }
+    applied_grasp_offset_xy = (
+        grasp_offset[:2]
+        if apply_grasp_offset_xy
+        else np.zeros(2, dtype=np.float64)
+    )
     target_xyz = np.asarray(
         [
-            place_object_xy[0] - grasp_offset[0],
-            place_object_xy[1] - grasp_offset[1],
+            place_object_xy[0] - applied_grasp_offset_xy[0],
+            place_object_xy[1] - applied_grasp_offset_xy[1],
             max(float(frozen_place_z_mm), HOME_PLACE_MIN_Z_MM),
         ],
         dtype=np.float64,
@@ -3907,6 +4089,9 @@ def compute_place_target(shared_state, place_object_xy_mm=DEFAULT_PLACE_OBJECT_X
         ),
         "place_object_x_mm": float(place_object_xy[0]),
         "place_object_y_mm": float(place_object_xy[1]),
+        "grasp_offset_xy_applied": bool(apply_grasp_offset_xy),
+        "applied_grasp_offset_x_mm": float(applied_grasp_offset_xy[0]),
+        "applied_grasp_offset_y_mm": float(applied_grasp_offset_xy[1]),
     }
     return target_xyz, debug
 
@@ -3971,6 +4156,9 @@ def execute_return_and_place(
     target_eef_xyz, place_target_debug = compute_place_target(
         shared_state,
         place_object_xy_mm=place_object_xy_mm,
+        apply_grasp_offset_xy=bool(
+            getattr(args, "apply_place_grasp_offset_xy", True)
+        ),
     )
     # place 목표를 계산할 수 없으면 이후 이동 경로를 만들 수 없으므로 중단한다.
     if target_eef_xyz is None:
@@ -4055,6 +4243,14 @@ def execute_return_and_place(
     # return/place 시퀀스에서 사용할 주요 target을 콘솔에 출력한다.
     print(f"[INFO] RETURN hover target: ({hover_x:.1f}, {hover_y:.1f}, {hover_z:.1f})")
     print(f"[INFO] PLACE target: ({place_x:.1f}, {place_y:.1f}, {place_z:.1f})")
+    print(
+        "[INFO] PLACE XY mode: "
+        f"grasp_offset_applied={place_target_debug['grasp_offset_xy_applied']} "
+        f"configured_object_xy=({place_object_xy_mm[0]:.1f}, {place_object_xy_mm[1]:.1f}) "
+        f"applied_offset_xy=("
+        f"{place_target_debug['applied_grasp_offset_x_mm']:.1f}, "
+        f"{place_target_debug['applied_grasp_offset_y_mm']:.1f})"
+    )
     # place z가 어떤 기준으로 계산됐는지 디버그 정보를 출력한다.
     print(
         "[INFO] PLACE z debug: "
@@ -4322,7 +4518,7 @@ def build_dual_perception_pipeline(args, *, runtime_template_path=None):
     sensor_hub.fps = int(args.fps)
 
     if args.object_backend == "sam3d":
-        if runtime_template_path is None:
+        if runtime_template_path is None and not args.shape_fitting_ablation:
             raise ValueError("SAM3D backend requires a validated runtime template")
         (
             object_worker_cam0,
@@ -4343,11 +4539,16 @@ def build_dual_perception_pipeline(args, *, runtime_template_path=None):
     hand_worker_cam1 = HandWorkerCam1.from_config(args.config)
     hand_selector = HandSelector.from_config(args.config)
     object_merger = ObjectMerger.from_config(args.config)
-    shape_fitting_tracker = (
-        build_runtime_shape_fitting_tracker(args.config, runtime_template_path)
-        if args.object_backend == "sam3d"
-        else ShapeFittingTracker.from_config(args.config)
-    )
+    if args.shape_fitting_ablation:
+        shape_fitting_tracker = None
+    elif args.object_backend == "sam3d":
+        shape_fitting_tracker = build_runtime_shape_fitting_tracker(
+            args.config,
+            runtime_template_path,
+            silhouette_enabled_override=False if args.silhouette_scaling_ablation else None,
+        )
+    else:
+        shape_fitting_tracker = ShapeFittingTracker.from_config(args.config)
     fusion = PerceptionFusion.from_config(args.config)
     grasp_planner = GraspTargetPlanner.from_config(args.config)
     grasp_z_stabilizer = GraspPointZStabilizer.from_config(args.config)
@@ -4378,6 +4579,7 @@ def build_dual_perception_pipeline(args, *, runtime_template_path=None):
         "prompt_classes": prompt_classes,
         "object_backend": args.object_backend,
         "runtime_template_path": runtime_template_path,
+        "ablation_mode": args.ablation,
     }
 
 
@@ -4402,6 +4604,35 @@ def build_fitted_merged_object(raw_merged_object, shape_fitting_state):
         merged_point_count=int(len(fitted_points)),
         merged_points_base=[tuple(float(v) for v in point) for point in fitted_points],
         valid=True,
+    )
+
+
+def build_raw_point_cloud_geometry_state(raw_merged_object):
+    """Expose raw merged geometry without pretending that a template was fitted."""
+    points = np.asarray(
+        getattr(raw_merged_object, "merged_points_base", []),
+        dtype=np.float32,
+    ).reshape((-1, 3))
+    valid = bool(getattr(raw_merged_object, "valid", False) and len(points) > 0)
+    centroid = getattr(raw_merged_object, "centroid_base", None) if valid else None
+    return RawPointCloudGeometryState(
+        valid=valid,
+        label=getattr(raw_merged_object, "label", None),
+        template_id=None,
+        fitted_points_base=points if valid else np.empty((0, 3), dtype=np.float32),
+        centroid_base=centroid,
+        scale=None,
+        scale_xyz=None,
+        scale_mode="raw_point_cloud",
+        template_axes_base=None,
+        z_rotation_deg=None,
+        roll_rotation_deg=None,
+        pitch_rotation_deg=None,
+        bowl_height_fraction=None,
+        initialized=valid,
+        reason="raw_point_cloud" if valid else "no_merged_object",
+        silhouette_enabled=False,
+        silhouette_reason="not_applicable_shape_fitting_ablation",
     )
 
 
@@ -4616,6 +4847,11 @@ def append_debug_3d_frame(
         grasp_point_base=grasp_point_base,
         eef_pose_base=eef_pose_base,
         measurement_source=measurement_source,
+        geometry_source=(
+            "raw_point_cloud"
+            if pipeline.get("ablation_mode") == ABLATION_SHAPE_FITTING
+            else "fitted_template"
+        ),
         hand_selector_debug=getattr(pipeline["hand_selector"], "last_debug", None),
         tactile_snapshot=tactile_snapshot,
         snapshot=snapshot if debug_3d_recorder.save_images else None,
@@ -4641,6 +4877,18 @@ def build_runtime_profile_context(args, yolo_model, pipeline):
         "prompt_classes": list(pipeline.get("prompt_classes", [])),
         "object_backend": str(pipeline.get("object_backend", "legacy")),
         "runtime_template_path": pipeline.get("runtime_template_path"),
+        "ablation_mode": str(getattr(args, "ablation", ABLATION_BASELINE)),
+        "release_parameter_mm": float(
+            getattr(args, "release_parameter_mm", RELEASE_PARAMETER_MM)
+        ),
+        "apply_place_grasp_offset_xy": bool(
+            getattr(args, "apply_place_grasp_offset_xy", True)
+        ),
+        "geometry_source": (
+            "raw_point_cloud"
+            if bool(getattr(args, "shape_fitting_ablation", False))
+            else "fitted_template"
+        ),
     }
 
 
@@ -4692,6 +4940,11 @@ def collect_runtime_profile_metrics(
         "merged_object_valid": bool(getattr(merged_object, "valid", False)),
         "merged_object_points": int(getattr(merged_object, "merged_point_count", 0)),
         "merged_object_label": getattr(merged_object, "label", None),
+        "geometry_source": (
+            "raw_point_cloud"
+            if pipeline.get("ablation_mode") == ABLATION_SHAPE_FITTING
+            else "fitted_template"
+        ),
         "shape_fit_valid": bool(getattr(shape_fitting_state, "valid", False)),
         "shape_fit_initialized": bool(getattr(shape_fitting_state, "initialized", False)),
         "shape_fit_reason": getattr(shape_fitting_state, "reason", None),
@@ -4960,24 +5213,43 @@ def main():
     config = load_yaml_config(args.config)
     # YAML에 들어 있는 기본값을 커맨드라인 인자에 반영한다.
     args = apply_config_defaults(args, config)
+    print(
+        "[INFO] Ablation mode: "
+        f"{args.ablation} "
+        f"(geometry={'raw_point_cloud' if args.shape_fitting_ablation else 'fitted_template'}, "
+        f"grasp_detection={args.grasp_detection_mode}, "
+        f"release_parameter_mm={args.release_parameter_mm:.1f}, "
+        f"place_grasp_offset_xy={args.apply_place_grasp_offset_xy})"
+    )
 
     runtime_template_path = None
     sam3d_bootstrap = None
     if args.object_backend == "sam3d":
         validate_main_runtime(require_rtde=bool(args.enable_follow))
         validate_hands23_runtime_assets(args.config)
-        print("[INFO] SAM3D bootstrap preflight starting before RTDE connection ...")
-        sam3d_bootstrap = bootstrap_runtime_template(
-            args.config,
-            capture_python=sys.executable,
-        )
-        args.config = sam3d_bootstrap.effective_config_path
-        config = load_yaml_config(args.config)
-        runtime_template_path = sam3d_bootstrap.template_path
-        print(
-            "[INFO] SAM3D runtime template ready: "
-            f"{runtime_template_path} artifacts={sam3d_bootstrap.artifact_dir}"
-        )
+        if args.shape_fitting_ablation:
+            from perception.sam3d_backend import resolve_sam3d_effective_config
+
+            effective = resolve_sam3d_effective_config(args.config)
+            args.config = effective.config_path
+            config = load_yaml_config(args.config)
+            print(
+                "[INFO] Shape-fitting ablation active: using validated FastSAM bboxes "
+                "without SAM3D bootstrap, template generation, ICP, or regeneration."
+            )
+        else:
+            print("[INFO] SAM3D bootstrap preflight starting before RTDE connection ...")
+            sam3d_bootstrap = bootstrap_runtime_template(
+                args.config,
+                capture_python=sys.executable,
+            )
+            args.config = sam3d_bootstrap.effective_config_path
+            config = load_yaml_config(args.config)
+            runtime_template_path = sam3d_bootstrap.template_path
+            print(
+                "[INFO] SAM3D runtime template ready: "
+                f"{runtime_template_path} artifacts={sam3d_bootstrap.artifact_dir}"
+            )
 
     # 듀얼 카메라 모드에서는 개별 시리얼 인자를 사용하지 않으므로 경고만 출력한다.
     if args.serial is not None:
@@ -4997,19 +5269,29 @@ def main():
     # 남지 않도록 런타임 리소스를 하나의 시작 트랜잭션으로 묶는다.
     try:
         if args.object_backend == "sam3d":
+            readiness_strategy = READINESS_SILHOUETTE
+            if args.shape_fitting_ablation:
+                readiness_strategy = READINESS_RAW_CLOUD
+            elif args.silhouette_scaling_ablation:
+                readiness_strategy = READINESS_SHAPE_FIT
             sam3d_live_runtime = Sam3DLiveRuntime(
                 pipeline,
                 args.config,
+                readiness_strategy=readiness_strategy,
+                regeneration_enabled=not args.shape_fitting_ablation,
             )
             sam3d_live_runtime.start()
             pipeline["sam3d_live_runtime"] = sam3d_live_runtime
-            print("[INFO] Hands23 sidecar ready; fixed FastSAM bboxes active for initialization.")
+            print(
+                "[INFO] Hands23 sidecar ready; fixed FastSAM bboxes active for "
+                f"initialization strategy={readiness_strategy}."
+            )
         # tactile manager가 생성된 경우 별도 수집 루프를 시작한다.
         if tactile_manager is not None:
             tactile_manager.start()
         # 듀얼 카메라 스트리밍을 시작한다.
         sensor_hub.start()
-    except Exception:
+    except BaseException:
         if tactile_manager is not None:
             tactile_manager.close()
         if sam3d_live_runtime is not None:
@@ -5120,6 +5402,13 @@ def main():
     video_recorder_web_ui_enabled = get_video_recorder_web_ui_enabled(config)
     # 영상 recorder와 함께 촉각 로그를 남길지 YAML 설정에서 가져온다.
     video_recorder_tactile_logging = get_video_recorder_tactile_logging_config(config)
+    if args.ablation == ABLATION_TACTILE_SENSING:
+        video_recorder_tactile_logging = {
+            "enabled": False,
+            "csv_enabled": False,
+            "rerun_enabled": False,
+            "rerun_live": False,
+        }
     # --record-video 옵션이 켜진 경우 녹화 서비스를 시작한다.
     if args.record_video:
         # 녹화 장치나 서버 초기화 실패가 전체 perception loop를 죽이지 않도록 보호한다.
@@ -5322,29 +5611,45 @@ def main():
                 )
             # 병합된 object point cloud에 형상 fitting/tracking을 수행한다.
             with runtime_profiler.stage("shape_fit"):
-                # reset/regeneration이 이 frame 초반에 반영될 수 있으므로
-                # tracker 호출 직전의 runtime phase로 scale freeze를 결정한다.
-                freeze_silhouette_scale = bool(
-                    sam3d_live_runtime is not None
-                    and sam3d_live_runtime.silhouette_scale_frozen
-                )
-                silhouette_observations = build_silhouette_observations(snapshot, pipeline)
-                shape_fitting_state = pipeline["shape_fitting_tracker"].process(
-                    merged_object,
-                    silhouette_observations=silhouette_observations,
-                    freeze_silhouette_scale=freeze_silhouette_scale,
-                )
-                if sam3d_live_runtime is not None:
-                    sam3d_live_runtime.capture_regeneration_frame(snapshot)
-                    if sam3d_live_runtime.after_shape_fit(shape_fitting_state):
-                        print(
-                            "[INFO] Initial SAM3D fitting ready; switching from fixed "
-                            "prompts to Hands23 dynamic bboxes."
-                        )
-                        sam3d_gate_blocked = True
-                # fitting 결과를 metadata recorder에 업데이트한다.
+                if args.shape_fitting_ablation:
+                    shape_fitting_state = build_raw_point_cloud_geometry_state(merged_object)
+                    initialization_ready = bool(
+                        sam3d_live_runtime is not None
+                        and sam3d_live_runtime.after_raw_cloud(merged_object)
+                    )
+                else:
+                    # reset/regeneration이 이 frame 초반에 반영될 수 있으므로
+                    # tracker 호출 직전의 runtime phase로 scale freeze를 결정한다.
+                    freeze_silhouette_scale = bool(
+                        sam3d_live_runtime is not None
+                        and sam3d_live_runtime.silhouette_scale_frozen
+                    )
+                    silhouette_observations = (
+                        []
+                        if args.silhouette_scaling_ablation
+                        else build_silhouette_observations(snapshot, pipeline)
+                    )
+                    shape_fitting_state = pipeline["shape_fitting_tracker"].process(
+                        merged_object,
+                        silhouette_observations=silhouette_observations,
+                        freeze_silhouette_scale=freeze_silhouette_scale,
+                    )
+                    initialization_ready = bool(
+                        sam3d_live_runtime is not None
+                        and sam3d_live_runtime.after_shape_fit(shape_fitting_state)
+                    )
+                    if sam3d_live_runtime is not None:
+                        sam3d_live_runtime.capture_regeneration_frame(snapshot)
+
+                if initialization_ready:
+                    print(
+                        "[INFO] Initial geometry ready; switching from fixed prompts "
+                        "to Hands23 dynamic bboxes."
+                    )
+                    sam3d_gate_blocked = True
+                # active geometry 결과를 metadata recorder에 업데이트한다.
                 metadata_recorder.update_geometry(shape_fitting_state, now_perf=loop_perf)
-            # fitted template centroid를 기준으로 active hand를 고른다.
+            # active geometry centroid를 기준으로 active hand를 고른다.
             with runtime_profiler.stage("hand_select"):
                 object_center_base = (
                     shape_fitting_state.centroid_base
@@ -5386,17 +5691,21 @@ def main():
             #     )
             # object-hand fusion과 grasp target 계산을 같은 profiler stage로 묶는다.
             with runtime_profiler.stage("fusion_grasp"):
-                # shape fitting 결과가 있으면 merged object에 fitted geometry를 반영한다.
-                fitted_merged_object = build_fitted_merged_object(merged_object, shape_fitting_state)
+                # ablation에서는 raw cloud를, baseline에서는 fitted template을 사용한다.
+                active_merged_object = (
+                    merged_object
+                    if args.shape_fitting_ablation
+                    else build_fitted_merged_object(merged_object, shape_fitting_state)
+                )
                 # object와 hand 상태를 융합해 hand 접근, latch, filtering 상태를 계산한다.
                 fusion_state = pipeline["fusion"].process_states(
-                    fitted_merged_object,
+                    active_merged_object,
                     selected_hand,
                     now_timestamp=current_time,
                 )
                 # 융합된 상태를 바탕으로 로봇이 잡을 목표 grasp point를 계산한다.
                 grasp_target = pipeline["grasp_planner"].process_states(
-                    fitted_merged_object,
+                    active_merged_object,
                     selected_hand,
                     fusion_state,
                 )
@@ -5407,7 +5716,7 @@ def main():
                 # filtering된 centroid가 있으면 우선 사용하고, 없으면 fitted object centroid를 사용한다.
                 measured_object_point_base = choose_point(
                     fusion_state.filtered_object_centroid_base,
-                    fitted_merged_object.centroid_base,
+                    active_merged_object.centroid_base,
                 )
                 # planner가 유효한 grasp target을 냈을 때만 grasp point를 사용한다.
                 measured_grasp_point_base = grasp_target.target_position_base if grasp_target.valid else None
@@ -5603,6 +5912,7 @@ def main():
                             "[INFO] frozen_place_z_mm prepared before grasp: "
                             f"grasp_z_med={place_z_result['grasp_z_median_mm']:.1f}, "
                             f"template_bottom_z_med={place_z_result['template_bottom_z_median_mm']:.1f}, "
+                            f"release_parameter={place_z_result['release_parameter_mm']:.1f}, "
                             f"raw_place_z={place_z_result['raw_place_z_mm']:.1f}, "
                             f"place_z={place_z_result['place_z_mm']:.1f}"
                         )
@@ -5664,7 +5974,7 @@ def main():
                 annotated = render_cam0_perception_debug(
                     snapshot,
                     pipeline,
-                    fitted_merged_object,
+                    active_merged_object,
                     selected_hand,
                     fusion_state,
                     object_point_base,
@@ -5678,7 +5988,7 @@ def main():
                     snapshot,
                     pipeline,
                     pipeline["object_worker_cam1"],
-                    fitted_merged_object,
+                    active_merged_object,
                     selected_hand,
                     fusion_state,
                     grasp_point_base,
@@ -5742,7 +6052,12 @@ def main():
                     shared_state.toggle_follow()
             # g 키는 HOME에서 새 SAM3D template을 안전하게 생성한다.
             elif key == ord("g"):
-                if sam3d_live_runtime is None:
+                if args.shape_fitting_ablation:
+                    print(
+                        "[WARN] SAM3D template regeneration is disabled by "
+                        "--ablation shape-fitting."
+                    )
+                elif sam3d_live_runtime is None:
                     print("[WARN] SAM3D regeneration is only available with --object-backend sam3d.")
                 elif sam3d_live_runtime.regeneration_state in {"capturing", "generating", "fitting"}:
                     print(

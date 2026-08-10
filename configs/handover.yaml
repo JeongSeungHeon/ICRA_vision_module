@@ -197,6 +197,8 @@ perception:
       warmup_frames: 5
     hands23_bbox:
       enabled: true
+      # Shape-fitting ablation에서 fixed bbox를 유지할 유효 raw cloud 연속 frame 수입니다.
+      raw_cloud_ready_frames: 4
       require_cuda: true
       min_size_test: 640
       hand_threshold: 0.7
@@ -388,7 +390,7 @@ perception:
       scale_mode: axis_xyz
       # fixed FastSAM bbox에서 실제 silhouette 평가가 연속 성공해야 하는 횟수입니다.
       # 이 횟수 이후 scale을 동결하고 Hands23 dynamic bbox로 전환합니다.
-      initial_silhouette_scaling_frames: 4
+      initial_silhouette_scaling_frames: 6
       artifact_root: output/sam3d
       z_rotation:
         enabled: true
@@ -583,7 +585,7 @@ grasp:
     # fallback lock에 motion trigger 상태를 요구할지 정합니다.
     require_motion_triggered: true
     # hand-relative fallback lock/active 여부를 콘솔에 출력합니다.
-    debug_log: true
+    debug_log: false
     # lock_frames progress가 바뀔 때만 출력합니다.
     log_lock_progress: false
     # fallback active 로그를 몇 frame마다 출력할지 정합니다. 1이면 매 fallback frame 출력입니다.
@@ -612,10 +614,12 @@ grasp:
 robot:
   return_sequence:
     # 놓을 물체 중심의 robot base-frame XY 목표입니다. 단위는 mm입니다.
-    place_object_xy_mm: [600.0, 0.0]
+    place_object_xy_mm: [400.0, 0.0]
+    # false이면 grasp offset을 적용하지 않고 위 좌표를 최종 TCP XY로 직접 사용합니다.
+    apply_grasp_offset_xy: false
     # true이면 PLACE 도착 후 gripper open 전에 아래 방향으로 한 번 더 이동합니다.
     pre_release_descend_enabled: true
-    # gripper open 전 추가 하강 거리입니다. 기본 코드 상수 RELEASE_PARAMETER_MM와 같은 10 mm입니다.
+    # gripper open 전 추가로 하강할 고정 거리이며 place Z의 release parameter와는 별개입니다.
     pre_release_descend_m: 0.02
     # gripper release 후 x backoff 전에 robot base +Z 방향으로 올릴 거리입니다.
     post_release_z_offset_m: -0.03

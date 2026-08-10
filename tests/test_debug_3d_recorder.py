@@ -122,6 +122,7 @@ def _append(
     hand_debug_cam1=None,
     shape_fitting_state=None,
     tactile_snapshot=None,
+    geometry_source="fitted_template",
 ):
     selected_hand = SimpleNamespace(
         valid=not missing,
@@ -147,6 +148,7 @@ def _append(
         grasp_point_base=None if missing else (0.2, 0.3, 0.4),
         eef_pose_base=None if missing else (0.5, 0.6, 0.7, 0.0, 0.1, 0.2),
         measurement_source="measured",
+        geometry_source=geometry_source,
         hand_selector_debug=SimpleNamespace(
             selection_reason="no_valid_candidate" if missing else "select_best_available",
             cam0_reject_reason="hand_not_detected" if missing else "",
@@ -347,11 +349,28 @@ class Debug3DRecorderTests(unittest.TestCase):
                 np.asarray([0.5, 0.6, 0.7, 0.0, 0.1, 0.2], dtype=np.float32),
             )
             self.assertEqual(str(data["record_clock_text"][0]), "REC 00:01.1")
+            self.assertEqual(str(data["geometry_source"][0]), "fitted_template")
             self.assertAlmostEqual(float(data["record_elapsed_s"][0]), 1.2, places=6)
             self.assertNotIn("cam0_color_image", data)
             self.assertNotIn("cam0_depth_image_m", data)
             self.assertEqual(data["template_axes_base"].shape, (2, 3, 3))
             np.testing.assert_allclose(data["template_axes_base"][0], np.eye(3, dtype=np.float32))
+
+    def test_raw_geometry_source_round_trip(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = Debug3DRecorder(output_dir=Path(temp_dir))
+            _append(
+                recorder,
+                0,
+                np.zeros((2, 3), dtype=np.float32),
+                np.zeros((2, 3), dtype=np.float32),
+                geometry_source="raw_point_cloud",
+            )
+
+            data = load_debug_3d_npz(recorder.save())
+
+            self.assertEqual(int(data["schema_version"]), 8)
+            self.assertEqual(str(data["geometry_source"][0]), "raw_point_cloud")
 
     def test_template_axes_can_be_disabled(self):
         with tempfile.TemporaryDirectory() as temp_dir:

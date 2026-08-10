@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -89,6 +90,27 @@ class Hands23IPCTest(unittest.TestCase):
             with self.assertRaisesRegex(Hands23IPCError, "non-socket"):
                 client._prepare_socket_path()
             self.assertEqual(path.read_text(encoding="utf-8"), "operator data")
+
+    def test_start_terminates_sidecar_when_interrupted_during_startup(self):
+        client = self._client("/tmp/test-hands23-interrupt.sock")
+        process = mock.MagicMock()
+        process.poll.return_value = None
+        connection = mock.MagicMock()
+        connection.connect.side_effect = KeyboardInterrupt
+
+        with (
+            mock.patch("perception.hands23_ipc.validate_hands23_assets"),
+            mock.patch.object(client, "_prepare_socket_path"),
+            mock.patch("perception.hands23_ipc.subprocess.Popen", return_value=process),
+            mock.patch("perception.hands23_ipc.socket.socket", return_value=connection),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                client.start()
+
+        connection.close.assert_called_once()
+        process.terminate.assert_called_once()
+        process.wait.assert_called_once_with(timeout=5.0)
+        self.assertIsNone(client._process)
 
     def test_asset_preflight_rejects_weights_only_repo(self):
         with tempfile.TemporaryDirectory() as directory:

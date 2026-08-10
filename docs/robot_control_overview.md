@@ -129,6 +129,9 @@ SAM3D backend에서는 fixed FastSAM bbox로 실제 silhouette 평가가 연속 
 Place 위치는 물체 초기 위치를 관측해 lock하지 않는다. `robot.return_sequence.place_object_xy_mm`
 설정의 고정된 물체 중심 XY와 grasp offset을 이용해 TCP 목표를 계산하며,
 place Z 샘플이 준비되지 않으면 grasp를 시작하지 않는다.
+`robot.return_sequence.apply_grasp_offset_xy: false` 또는 실행 옵션
+`--disable-place-grasp-offset-xy`를 사용하면 grasp offset을 빼지 않고
+`place_object_xy_mm`을 최종 TCP XY로 직접 사용한다.
 
 ## 5. Target 생성과 prediction
 

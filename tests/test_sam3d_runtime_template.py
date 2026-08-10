@@ -152,6 +152,48 @@ class Sam3DRuntimeTemplateTest(unittest.TestCase):
             self.assertTrue(second.valid, second.reason)
             self.assertEqual(second.template_id, "sam3d_runtime")
 
+    def test_silhouette_ablation_override_keeps_shape_fit_and_marks_reason(self):
+        rng = np.random.default_rng(11)
+        points = rng.uniform(-0.03, 0.03, size=(300, 3)).astype(np.float32)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime_path = root / "runtime.npy"
+            np.save(runtime_path, points)
+            config = {
+                "perception": {
+                    "shape_fitting": {
+                        "enabled": True,
+                        "template_library": {"unused": {"asset_path": str(runtime_path)}},
+                        "cluster": {"dbscan_eps_m": 0.05, "dbscan_min_points": 3},
+                        "scale_init": {"stable_frames": 1},
+                        "icp": {"crop": {"enabled": False}},
+                        "silhouette_constraint": {"enabled": True},
+                    }
+                }
+            }
+            tracker = ShapeFittingTracker(
+                config,
+                config_path=root / "config.yaml",
+                runtime_template_override=self._runtime_override(runtime_path),
+                silhouette_enabled_override=False,
+            )
+            observed = points + np.asarray([0.4, 0.0, 0.4], dtype=np.float32)
+            merged = MergedObjectState(
+                object_detected=True,
+                label="sam3d_object",
+                centroid_base=tuple(np.mean(observed, axis=0)),
+                merged_point_count=len(observed),
+                merged_points_base=[tuple(point) for point in observed],
+                valid=True,
+            )
+
+            state = tracker.process(merged, silhouette_observations=[])
+
+            self.assertTrue(state.valid)
+            self.assertTrue(state.initialized)
+            self.assertFalse(state.silhouette_enabled)
+            self.assertEqual(state.silhouette_reason, "disabled_by_ablation")
+
 
 if __name__ == "__main__":
     unittest.main()
