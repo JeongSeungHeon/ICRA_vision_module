@@ -195,22 +195,22 @@ perception:
       min_temporal_iou: 0.8
       capture_timeout_s: 30.0
       warmup_frames: 5
-    hands23_bbox:
+    hoi_detr_bbox:
       enabled: true
       # Shape-fitting ablation에서 fixed bbox를 유지할 유효 raw cloud 연속 frame 수입니다.
       raw_cloud_ready_frames: 4
       require_cuda: true
-      min_size_test: 640
-      hand_threshold: 0.7
-      first_object_threshold: 0.5
-      second_object_threshold: 0.3
-      hand_relation_threshold: 0.3
-      object_relation_threshold: 0.7
+      device: cuda:0
+      hand_score_threshold: 0.3
+      first_object_score_threshold: 0.3
+      hand_first_relation_threshold: 0.6
+      nms_iou_threshold: 0.5
       padding_ratio: 0.10
       ema_alpha: 0.60
-      hold_timeout_s: 0.50
+      # RTX 4090 positive HOI 프레임 benchmark(p95 약 0.176 s) 기반 값입니다.
+      hold_timeout_s: 0.70
       result_age_timeout_s: 1.00
-      max_input_hz: 10.0
+      max_input_hz: 2.20 # 2.20
     segmentation:
       # YOLOE segmentation weights/model 이름입니다. 실행 인자 --model이 있으면 override됩니다.
       model_name: yoloe-26l-seg.pt
@@ -389,7 +389,7 @@ perception:
       template_id: sam3d_runtime
       scale_mode: axis_xyz
       # fixed FastSAM bbox에서 실제 silhouette 평가가 연속 성공해야 하는 횟수입니다.
-      # 이 횟수 이후 scale을 동결하고 Hands23 dynamic bbox로 전환합니다.
+      # 이 횟수 이후 scale을 동결하고 HOI-DETR dynamic bbox로 전환합니다.
       initial_silhouette_scaling_frames: 6
       artifact_root: output/sam3d
       z_rotation:
@@ -803,13 +803,13 @@ runtime:
     artifact_root: output/sam3d
     fastsam_bbox_file: output/sam3d/fastsam_bbox.yaml
     require_fastsam_bbox_selection: true
-  hands23_sidecar:
-    python_interpreter: /home/ur5/miniforge3/envs/hands23_ros2/bin/python
-    repo_path: external/hands23_detector
-    config_path: external/hands23_detector/faster_rcnn_X_101_32x8d_FPN_3x_Hands23.yaml
-    weights_path: external/hands23_detector/model_weights/model_hands23.pth
-    socket: /tmp/handover_hands23.sock
-    startup_timeout_s: 60.0
+  hoi_detr_sidecar:
+    python_interpreter: /home/ur5/miniforge3/envs/hoi_detr/bin/python
+    repo_path: external/HOI-DETR
+    config_path: external/HOI-DETR/projects/configs/co_dino_vit/co_dino_5scale_vit_large_coco_with_relation_only_all_losses_custom.py
+    weights_path: external/checkpoints/epoch_5.pth
+    socket: /tmp/handover_hoi_detr.sock
+    startup_timeout_s: 120.0
     request_timeout_s: 10.0
 
 safety:

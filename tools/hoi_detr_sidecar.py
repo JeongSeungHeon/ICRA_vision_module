@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Isolated Hands23 predictor served over a local Unix socket."""
+"""Isolated HOI-DETR predictor served over a local Unix socket."""
 
 from __future__ import annotations
 
@@ -17,11 +17,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from perception.hands23_ipc import receive_packet, send_packet
-from perception.hands23_runtime import (
-    Hands23BBoxSelector,
-    Hands23PredictorAdapter,
-    expected_hand_sides_from_config,
+from perception.hoi_detr_ipc import receive_packet, send_packet
+from perception.hoi_detr_runtime import (
+    HOIDETRBBoxSelector,
+    HOIDETRPredictorAdapter,
 )
 
 
@@ -52,6 +51,7 @@ def _bbox_response(header, selected, *, reason: str, inference_ms: float) -> dic
             hand_side=str(selected.hand_side),
             hand_score=float(selected.hand_score),
             object_score=float(selected.object_score),
+            relation_score=float(selected.relation_score),
             contact_state=str(selected.contact_state),
         )
     return response
@@ -61,25 +61,27 @@ def serve(args: argparse.Namespace) -> None:
     with open(args.config, "r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle) or {}
     dynamic_cfg = (
-        config.get("perception", {}).get("object", {}).get("hands23_bbox", {}) or {}
+        config.get("perception", {}).get("object", {}).get("hoi_detr_bbox", {}) or {}
     )
     fastsam_cfg = config.get("perception", {}).get("object", {}).get("fastsam", {}) or {}
-    predictor = Hands23PredictorAdapter(
+    predictor = HOIDETRPredictorAdapter(
         repo_path=args.repo,
         config_path=args.detector_config,
         weights_path=args.weights,
-        hand_threshold=float(dynamic_cfg.get("hand_threshold", 0.7)),
-        first_object_threshold=float(dynamic_cfg.get("first_object_threshold", 0.5)),
-        second_object_threshold=float(dynamic_cfg.get("second_object_threshold", 0.3)),
-        hand_relation_threshold=float(dynamic_cfg.get("hand_relation_threshold", 0.3)),
-        object_relation_threshold=float(dynamic_cfg.get("object_relation_threshold", 0.7)),
-        min_size_test=int(dynamic_cfg.get("min_size_test", 640)),
+        hand_score_threshold=float(dynamic_cfg.get("hand_score_threshold", 0.3)),
+        first_object_score_threshold=float(
+            dynamic_cfg.get("first_object_score_threshold", 0.3)
+        ),
+        hand_first_relation_threshold=float(
+            dynamic_cfg.get("hand_first_relation_threshold", 0.6)
+        ),
+        nms_iou_threshold=float(dynamic_cfg.get("nms_iou_threshold", 0.5)),
         require_cuda=bool(dynamic_cfg.get("require_cuda", True)),
+        device=str(dynamic_cfg.get("device", "cuda:0")),
     )
     raw_bboxes = fastsam_cfg.get("bboxes", {}) or {}
-    selector = Hands23BBoxSelector(
+    selector = HOIDETRBBoxSelector(
         initial_bboxes={camera_id: raw_bboxes[f"cam{camera_id}"] for camera_id in (0, 1)},
-        expected_hand_sides=expected_hand_sides_from_config(config),
         padding_ratio=float(dynamic_cfg.get("padding_ratio", 0.10)),
         ema_alpha=float(dynamic_cfg.get("ema_alpha", 0.60)),
         min_bbox_size_px=int(fastsam_cfg.get("min_bbox_size_px", 8)),
@@ -89,7 +91,7 @@ def serve(args: argparse.Namespace) -> None:
     socket_path.parent.mkdir(parents=True, exist_ok=True)
     if socket_path.exists():
         raise RuntimeError(
-            f"refusing to replace existing Hands23 socket path: {socket_path}"
+            f"refusing to replace existing HOI-DETR socket path: {socket_path}"
         )
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(socket_path))

@@ -1,4 +1,4 @@
-"""Tests for the standalone Hands23 transport and latest-only client queue."""
+"""Tests for the standalone HOI-DETR transport and latest-only client queue."""
 
 from __future__ import annotations
 
@@ -10,12 +10,12 @@ from unittest import mock
 
 import numpy as np
 
-from perception.hands23_ipc import (
-    Hands23IPCError,
-    Hands23SidecarClient,
+from perception.hoi_detr_ipc import (
+    HOIDETRIPCError,
+    HOIDETRSidecarClient,
     receive_packet,
     send_packet,
-    validate_hands23_assets,
+    validate_hoi_detr_assets,
 )
 
 
@@ -44,15 +44,15 @@ class _MemorySocket:
         return chunk
 
 
-class Hands23IPCTest(unittest.TestCase):
+class HOIDETRIPCTest(unittest.TestCase):
     @staticmethod
     def _client(socket_path):
-        return Hands23SidecarClient(
+        return HOIDETRSidecarClient(
             python_interpreter="/tmp/python",
             sidecar_script="/tmp/sidecar.py",
             config_path="/tmp/config.yaml",
             repo_path="/tmp/repo",
-            detector_config_path="/tmp/detector.yaml",
+            detector_config_path="/tmp/detector.py",
             weights_path="/tmp/weights.pth",
             socket_path=socket_path,
             max_input_hz=0.0,
@@ -67,7 +67,7 @@ class Hands23IPCTest(unittest.TestCase):
         self.assertEqual(received, payload)
 
     def test_submit_replaces_pending_frame_for_same_camera(self):
-        client = self._client("/tmp/test-hands23.sock")
+        client = self._client("/tmp/test-hoi_detr.sock")
         client._process = _AliveProcess()
         client._thread = _AliveThread()
         client.reset(3)
@@ -84,25 +84,25 @@ class Hands23IPCTest(unittest.TestCase):
 
     def test_socket_preflight_never_deletes_a_regular_file(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "hands23.sock"
+            path = Path(directory) / "hoi_detr.sock"
             path.write_text("operator data", encoding="utf-8")
             client = self._client(path)
-            with self.assertRaisesRegex(Hands23IPCError, "non-socket"):
+            with self.assertRaisesRegex(HOIDETRIPCError, "non-socket"):
                 client._prepare_socket_path()
             self.assertEqual(path.read_text(encoding="utf-8"), "operator data")
 
     def test_start_terminates_sidecar_when_interrupted_during_startup(self):
-        client = self._client("/tmp/test-hands23-interrupt.sock")
+        client = self._client("/tmp/test-hoi_detr-interrupt.sock")
         process = mock.MagicMock()
         process.poll.return_value = None
         connection = mock.MagicMock()
         connection.connect.side_effect = KeyboardInterrupt
 
         with (
-            mock.patch("perception.hands23_ipc.validate_hands23_assets"),
+            mock.patch("perception.hoi_detr_ipc.validate_hoi_detr_assets"),
             mock.patch.object(client, "_prepare_socket_path"),
-            mock.patch("perception.hands23_ipc.subprocess.Popen", return_value=process),
-            mock.patch("perception.hands23_ipc.socket.socket", return_value=connection),
+            mock.patch("perception.hoi_detr_ipc.subprocess.Popen", return_value=process),
+            mock.patch("perception.hoi_detr_ipc.socket.socket", return_value=connection),
         ):
             with self.assertRaises(KeyboardInterrupt):
                 client.start()
@@ -115,11 +115,11 @@ class Hands23IPCTest(unittest.TestCase):
     def test_asset_preflight_rejects_weights_only_repo(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            repo = root / "hands23"
+            repo = root / "hoi_detr"
             repo.mkdir()
             sidecar = root / "sidecar.py"
             config = root / "runtime.yaml"
-            detector = repo / "detector.yaml"
+            detector = repo / "detector.py"
             weights = repo / "weights.pth"
             for path in (sidecar, config, detector, weights):
                 path.write_text("fixture", encoding="utf-8")
@@ -132,21 +132,23 @@ class Hands23IPCTest(unittest.TestCase):
                 weights_path=weights,
             )
             with self.assertRaisesRegex(FileNotFoundError, "weights-only"):
-                validate_hands23_assets(**kwargs)
+                validate_hoi_detr_assets(**kwargs)
 
-            marker = repo / "hodetector" / "modeling" / "roi_heads" / "__init__.py"
-            marker.parent.mkdir(parents=True)
-            marker.write_text("", encoding="utf-8")
-            validated = validate_hands23_assets(**kwargs)
-            self.assertEqual(validated["Hands23 source package"], marker)
+            mmdet_marker = repo / "mmdet" / "__init__.py"
+            projects_marker = repo / "projects" / "__init__.py"
+            mmdet_marker.parent.mkdir(parents=True)
+            projects_marker.parent.mkdir(parents=True)
+            mmdet_marker.write_text("", encoding="utf-8")
+            projects_marker.write_text("", encoding="utf-8")
+            validated = validate_hoi_detr_assets(**kwargs)
+            self.assertEqual(validated["HOI-DETR mmdet package"], mmdet_marker)
+            self.assertEqual(validated["HOI-DETR projects package"], projects_marker)
 
-            detector.write_text("_BASE_: ./Base-RCNN-FPN.yaml\n", encoding="utf-8")
-            with self.assertRaisesRegex(FileNotFoundError, "base config"):
-                validate_hands23_assets(**kwargs)
-            base_config = repo / "Base-RCNN-FPN.yaml"
-            base_config.write_text("MODEL: {}\n", encoding="utf-8")
-            validated = validate_hands23_assets(**kwargs)
-            self.assertEqual(validated["Hands23 base config"], base_config)
+            detector_yaml = repo / "detector.yaml"
+            detector_yaml.write_text("MODEL: {}\n", encoding="utf-8")
+            kwargs["detector_config_path"] = detector_yaml
+            with self.assertRaisesRegex(FileNotFoundError, "Python MMDetection config"):
+                validate_hoi_detr_assets(**kwargs)
 
 
 if __name__ == "__main__":

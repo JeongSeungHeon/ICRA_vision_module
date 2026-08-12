@@ -37,7 +37,7 @@ from perception.sam3d_backend import (
     bootstrap_runtime_template,
     build_fastsam_object_workers,
     build_runtime_shape_fitting_tracker,
-    validate_hands23_runtime_assets,
+    validate_hoi_detr_runtime_assets,
     validate_main_runtime,
 )
 from perception.sam3d_live_runtime import (
@@ -4981,16 +4981,16 @@ def collect_runtime_profile_metrics(
         "sam3d_silhouette_scale_frozen": bool(
             getattr(sam3d_debug, "silhouette_scale_frozen", False)
         ),
-        "hands23_healthy": bool(getattr(sam3d_debug, "healthy", True)),
-        "hands23_inference_ms": getattr(sam3d_debug, "last_inference_ms", None),
-        "hands23_roundtrip_ms": getattr(sam3d_debug, "last_roundtrip_ms", None),
-        "hands23_error": getattr(sam3d_debug, "last_error", None),
-        "hands23_cam0_bbox_age_s": getattr(getattr(sam3d_debug, "cam0", None), "age_s", None),
-        "hands23_cam1_bbox_age_s": getattr(getattr(sam3d_debug, "cam1", None), "age_s", None),
-        "hands23_cam0_bbox_reason": getattr(getattr(sam3d_debug, "cam0", None), "reason", None),
-        "hands23_cam1_bbox_reason": getattr(getattr(sam3d_debug, "cam1", None), "reason", None),
-        "hands23_cam0_bbox_valid": getattr(getattr(sam3d_debug, "cam0", None), "bbox_xyxy", None) is not None,
-        "hands23_cam1_bbox_valid": getattr(getattr(sam3d_debug, "cam1", None), "bbox_xyxy", None) is not None,
+        "hoi_detr_healthy": bool(getattr(sam3d_debug, "healthy", True)),
+        "hoi_detr_inference_ms": getattr(sam3d_debug, "last_inference_ms", None),
+        "hoi_detr_roundtrip_ms": getattr(sam3d_debug, "last_roundtrip_ms", None),
+        "hoi_detr_error": getattr(sam3d_debug, "last_error", None),
+        "hoi_detr_cam0_bbox_age_s": getattr(getattr(sam3d_debug, "cam0", None), "age_s", None),
+        "hoi_detr_cam1_bbox_age_s": getattr(getattr(sam3d_debug, "cam1", None), "age_s", None),
+        "hoi_detr_cam0_bbox_reason": getattr(getattr(sam3d_debug, "cam0", None), "reason", None),
+        "hoi_detr_cam1_bbox_reason": getattr(getattr(sam3d_debug, "cam1", None), "reason", None),
+        "hoi_detr_cam0_bbox_valid": getattr(getattr(sam3d_debug, "cam0", None), "bbox_xyxy", None) is not None,
+        "hoi_detr_cam1_bbox_valid": getattr(getattr(sam3d_debug, "cam1", None), "bbox_xyxy", None) is not None,
     }
 
 
@@ -5013,7 +5013,7 @@ def discard_runtime_profile(runtime_profiler, *, reason):
 
 
 def draw_sam3d_bbox_overlay(image_bgr, pipeline, camera_id):
-    """Draw the active FastSAM prompt and Hands23 health on one preview."""
+    """Draw the active FastSAM prompt and HOI-DETR health on one preview."""
     runtime = pipeline.get("sam3d_live_runtime")
     if runtime is None:
         return image_bgr
@@ -5036,10 +5036,18 @@ def draw_sam3d_bbox_overlay(image_bgr, pipeline, camera_id):
         if debug.initialization_phase == "fixed_scaling"
         else "frozen"
     )
+    scores_text = (
+        "H/O/R=-"
+        if camera_debug.relation_score is None
+        else (
+            f"H/O/R={camera_debug.hand_score:.2f}/"
+            f"{camera_debug.object_score:.2f}/{camera_debug.relation_score:.2f}"
+        )
+    )
     text = (
         f"SAM3D {debug.initialization_phase} scale={progress_text} "
         f"{camera_debug.mode} age={age_text} "
-        f"hand={camera_debug.hand_side or '-'} reason={camera_debug.reason} "
+        f"hoi={scores_text} reason={camera_debug.reason} "
         f"fastsam={getattr(engine, 'last_error', None) or 'ok'}"
     )
     color = (40, 40, 255) if debug.gate_blocked else (0, 255, 255)
@@ -5226,7 +5234,7 @@ def main():
     sam3d_bootstrap = None
     if args.object_backend == "sam3d":
         validate_main_runtime(require_rtde=bool(args.enable_follow))
-        validate_hands23_runtime_assets(args.config)
+        validate_hoi_detr_runtime_assets(args.config)
         if args.shape_fitting_ablation:
             from perception.sam3d_backend import resolve_sam3d_effective_config
 
@@ -5283,7 +5291,7 @@ def main():
             sam3d_live_runtime.start()
             pipeline["sam3d_live_runtime"] = sam3d_live_runtime
             print(
-                "[INFO] Hands23 sidecar ready; fixed FastSAM bboxes active for "
+                "[INFO] HOI-DETR sidecar ready; fixed FastSAM bboxes active for "
                 f"initialization strategy={readiness_strategy}."
             )
         # tactile manager가 생성된 경우 별도 수집 루프를 시작한다.
@@ -5550,7 +5558,7 @@ def main():
                     shared_state.clear_target(reset_prediction=True, reset_arm=True)
                     print(
                         "[INFO] New SAM3D tracker installed; waiting for fixed-bbox "
-                        "fitting and a fresh Hands23 bbox. Follow remains disabled."
+                        "fitting and a fresh HOI-DETR bbox. Follow remains disabled."
                     )
                 elif regeneration_event == "failed":
                     reset_perception_pipeline_for_system_reset(pipeline)
@@ -5566,7 +5574,7 @@ def main():
 
             sam3d_gate_blocked = False
             if sam3d_live_runtime is not None:
-                with runtime_profiler.stage("hands23_ipc"):
+                with runtime_profiler.stage("hoi_detr_ipc"):
                     sam3d_gate_blocked = sam3d_live_runtime.before_frame(
                         snapshot,
                         task_id=current_task_epoch,
@@ -5644,7 +5652,7 @@ def main():
                 if initialization_ready:
                     print(
                         "[INFO] Initial geometry ready; switching from fixed prompts "
-                        "to Hands23 dynamic bboxes."
+                        "to HOI-DETR dynamic bboxes."
                     )
                     sam3d_gate_blocked = True
                 # active geometry 결과를 metadata recorder에 업데이트한다.

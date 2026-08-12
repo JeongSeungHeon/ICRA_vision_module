@@ -24,7 +24,7 @@ from perception.fastsam_bbox_config import (
     EffectiveBBoxConfig,
     resolve_effective_config,
 )
-from perception.hands23_ipc import validate_hands23_assets
+from perception.hoi_detr_ipc import validate_hoi_detr_assets
 from perception.object_worker import ObjectWorkerCam0, ObjectWorkerCam1
 from perception.sam3d_runtime import validate_template_points
 from perception.shape_fitting_tracker_v2 import ShapeFittingTracker
@@ -85,40 +85,41 @@ def load_config(path: str | Path) -> dict[str, Any]:
     return payload
 
 
-def validate_hands23_runtime_assets(
+def validate_hoi_detr_runtime_assets(
     config_path: str | Path,
     *,
     repo_root: str | Path = REPO_ROOT,
 ) -> dict[str, Path]:
-    """Fail before SAM3D capture when the isolated Hands23 checkout is incomplete."""
+    """Fail before SAM3D capture when the isolated HOI-DETR runtime is incomplete."""
     repo_root = Path(repo_root).expanduser().resolve()
     config = load_config(config_path)
-    runtime_cfg = config.get("runtime", {}).get("hands23_sidecar", {}) or {}
-    return validate_hands23_assets(
+    runtime_cfg = config.get("runtime", {}).get("hoi_detr_sidecar", {}) or {}
+    return validate_hoi_detr_assets(
         python_interpreter=resolve_repo_path(
             runtime_cfg.get(
                 "python_interpreter",
-                "/home/ur5/miniforge3/envs/hands23_ros2/bin/python",
+                "/home/ur5/miniforge3/envs/hoi_detr/bin/python",
             ),
             repo_root=repo_root,
         ),
-        sidecar_script=repo_root / "tools" / "hands23_sidecar.py",
+        sidecar_script=repo_root / "tools" / "hoi_detr_sidecar.py",
         config_path=Path(config_path).expanduser().resolve(),
         repo_path=resolve_repo_path(
-            runtime_cfg.get("repo_path", "external/hands23_detector"),
+            runtime_cfg.get("repo_path", "external/HOI-DETR"),
             repo_root=repo_root,
         ),
         detector_config_path=resolve_repo_path(
             runtime_cfg.get(
                 "config_path",
-                "external/hands23_detector/faster_rcnn_X_101_32x8d_FPN_3x_Hands23.yaml",
+                "external/HOI-DETR/projects/configs/co_dino_vit/"
+                "co_dino_5scale_vit_large_coco_with_relation_only_all_losses_custom.py",
             ),
             repo_root=repo_root,
         ),
         weights_path=resolve_repo_path(
             runtime_cfg.get(
                 "weights_path",
-                "external/hands23_detector/model_weights/model_hands23.pth",
+                "external/checkpoints/epoch_5.pth",
             ),
             repo_root=repo_root,
         ),
@@ -298,6 +299,6 @@ __all__ = [
     "resolve_repo_path",
     "resolve_sam3d_effective_config",
     "runtime_template_override",
-    "validate_hands23_runtime_assets",
+    "validate_hoi_detr_runtime_assets",
     "validate_main_runtime",
 ]

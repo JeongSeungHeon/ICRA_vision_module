@@ -1,4 +1,4 @@
-"""Runtime Hands23/FastSAM state machine for the standalone RTDE loop."""
+"""Runtime HOI-DETR/FastSAM state machine for the standalone RTDE loop."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import time
 from typing import Any
 
 from perception.dynamic_bbox import DynamicFastSAMBBoxState
-from perception.hands23_ipc import Hands23SidecarClient
+from perception.hoi_detr_ipc import HOIDETRSidecarClient
 from perception.sam3d_backend import REPO_ROOT, load_config, resolve_repo_path
 from perception.sam3d_backend import build_runtime_shape_fitting_tracker
 from perception.sam3d_runtime import (
@@ -60,7 +60,7 @@ class Sam3DLiveRuntime:
         readiness_strategy: str = READINESS_SILHOUETTE,
         regeneration_enabled: bool = True,
         repo_root: str | Path = REPO_ROOT,
-        client: Hands23SidecarClient | None = None,
+        client: HOIDETRSidecarClient | None = None,
     ) -> None:
         self.pipeline = pipeline
         self.config_path = str(Path(config_path).expanduser().resolve())
@@ -74,7 +74,7 @@ class Sam3DLiveRuntime:
             )
         self.regeneration_enabled = bool(regeneration_enabled)
         dynamic_cfg = (
-            self.config.get("perception", {}).get("object", {}).get("hands23_bbox", {}) or {}
+            self.config.get("perception", {}).get("object", {}).get("hoi_detr_bbox", {}) or {}
         )
         self.enabled = bool(dynamic_cfg.get("enabled", True))
         sam3d_cfg = (
@@ -109,39 +109,40 @@ class Sam3DLiveRuntime:
         self._regeneration_lock = threading.Lock()
         self._capture_accumulator: StableCaptureAccumulator | None = None
 
-    def _build_client(self, dynamic_cfg: dict[str, Any]) -> Hands23SidecarClient:
-        runtime_cfg = self.config.get("runtime", {}).get("hands23_sidecar", {}) or {}
-        return Hands23SidecarClient(
+    def _build_client(self, dynamic_cfg: dict[str, Any]) -> HOIDETRSidecarClient:
+        runtime_cfg = self.config.get("runtime", {}).get("hoi_detr_sidecar", {}) or {}
+        return HOIDETRSidecarClient(
             python_interpreter=resolve_repo_path(
                 runtime_cfg.get(
                     "python_interpreter",
-                    "/home/ur5/miniforge3/envs/hands23_ros2/bin/python",
+                    "/home/ur5/miniforge3/envs/hoi_detr/bin/python",
                 ),
                 repo_root=self.repo_root,
             ),
-            sidecar_script=self.repo_root / "tools" / "hands23_sidecar.py",
+            sidecar_script=self.repo_root / "tools" / "hoi_detr_sidecar.py",
             config_path=self.config_path,
             repo_path=resolve_repo_path(
-                runtime_cfg.get("repo_path", "external/hands23_detector"),
+                runtime_cfg.get("repo_path", "external/HOI-DETR"),
                 repo_root=self.repo_root,
             ),
             detector_config_path=resolve_repo_path(
                 runtime_cfg.get(
                     "config_path",
-                    "external/hands23_detector/faster_rcnn_X_101_32x8d_FPN_3x_Hands23.yaml",
+                    "external/HOI-DETR/projects/configs/co_dino_vit/"
+                    "co_dino_5scale_vit_large_coco_with_relation_only_all_losses_custom.py",
                 ),
                 repo_root=self.repo_root,
             ),
             weights_path=resolve_repo_path(
                 runtime_cfg.get(
                     "weights_path",
-                    "external/hands23_detector/model_weights/model_hands23.pth",
+                    "external/checkpoints/epoch_5.pth",
                 ),
                 repo_root=self.repo_root,
             ),
-            socket_path=runtime_cfg.get("socket", "/tmp/handover_hands23.sock"),
-            startup_timeout_s=float(runtime_cfg.get("startup_timeout_s", 60.0)),
-            request_timeout_s=float(runtime_cfg.get("request_timeout_s", 10.0)),
+            socket_path=runtime_cfg.get("socket", "/tmp/handover_hoi_detr.sock"),
+            startup_timeout_s=float(runtime_cfg.get("startup_timeout_s", 120.0)),
+            request_timeout_s=float(runtime_cfg.get("request_timeout_s", 30.0)),
             max_input_hz=float(dynamic_cfg.get("max_input_hz", 10.0)),
         )
 
@@ -356,6 +357,7 @@ class Sam3DLiveRuntime:
                 hand_side=result.hand_side,
                 hand_score=result.hand_score,
                 object_score=result.object_score,
+                relation_score=result.relation_score,
                 contact_state=result.contact_state,
                 reason=result.reason,
             )
@@ -394,7 +396,7 @@ class Sam3DLiveRuntime:
             bbox = self.state.bbox_for_camera(camera_id, now_monotonic_s=now_monotonic)
             engine.set_bbox(bbox)
             available = available or bbox is not None
-        if available and self.client.healthy and self._initialization_phase == "waiting_hands23":
+        if available and self.client.healthy and self._initialization_phase == "waiting_hoi_detr":
             self._initialization_phase = "dynamic"
         if (
             self._force_gate
@@ -452,7 +454,7 @@ class Sam3DLiveRuntime:
         if self._shape_ready_count < self.ready_valid_frames:
             return False
         self.state.activate(self.task_id)
-        self._initialization_phase = "waiting_hands23"
+        self._initialization_phase = "waiting_hoi_detr"
         self._gate_blocked = True
         return True
 

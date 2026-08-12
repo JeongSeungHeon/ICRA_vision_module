@@ -1,4 +1,4 @@
-"""Safety contract tests for SAM3D/Hands23 target invalidation."""
+"""Safety contract tests for SAM3D/HOI-DETR target invalidation."""
 
 from __future__ import annotations
 

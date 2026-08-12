@@ -67,7 +67,7 @@ _STUBS = [
         bootstrap_runtime_template=lambda *args, **kwargs: None,
         build_fastsam_object_workers=lambda *args, **kwargs: None,
         build_runtime_shape_fitting_tracker=lambda *args, **kwargs: None,
-        validate_hands23_runtime_assets=lambda *args, **kwargs: None,
+        validate_hoi_detr_runtime_assets=lambda *args, **kwargs: None,
         validate_main_runtime=lambda *args, **kwargs: None,
     ),
     _stub_module(

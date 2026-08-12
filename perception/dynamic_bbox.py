@@ -23,6 +23,7 @@ class DynamicBBoxRecord:
     hand_side: str
     hand_score: float
     object_score: float
+    relation_score: float
     contact_state: str
 
 
@@ -33,11 +34,14 @@ class DynamicBBoxDebug:
     age_s: float | None
     frame_seq: int | None
     hand_side: str
+    hand_score: float | None
+    object_score: float | None
+    relation_score: float | None
     reason: str
 
 
 class DynamicFastSAMBBoxState:
-    """Own accepted Hands23 results and bounded per-camera dropout holds."""
+    """Own accepted HOI-detector results and bounded per-camera dropout holds."""
 
     def __init__(
         self,
@@ -97,6 +101,7 @@ class DynamicFastSAMBBoxState:
         hand_side: str = "",
         hand_score: float = 0.0,
         object_score: float = 0.0,
+        relation_score: float = 0.0,
         contact_state: str = "",
         reason: str = "",
     ) -> bool:
@@ -133,6 +138,7 @@ class DynamicFastSAMBBoxState:
                 hand_side=str(hand_side),
                 hand_score=float(hand_score),
                 object_score=float(object_score),
+                relation_score=float(relation_score),
                 contact_state=str(contact_state),
             )
             self._last_reason[camera_id] = "ok"
@@ -195,6 +201,9 @@ class DynamicFastSAMBBoxState:
                 age_s=age,
                 frame_seq=None if record is None else record.frame_seq,
                 hand_side="" if record is None else record.hand_side,
+                hand_score=None if record is None else record.hand_score,
+                object_score=None if record is None else record.object_score,
+                relation_score=None if record is None else record.relation_score,
                 reason=self._last_reason[camera_id],
             )
 

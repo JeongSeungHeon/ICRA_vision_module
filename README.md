@@ -6,7 +6,7 @@ This repository is currently organized around one active handover pipeline:
 bash run_fitting_final.sh
 ```
 
-The main script defaults to classless Hands23 + FastSAM object tracking and a
+The main script defaults to HOI-DETR + FastSAM object tracking and a
 runtime SAM3D template, followed by dual-camera point-cloud fusion and ICP
 shape fitting. MediaPipe remains responsible for 3D palm pose. A legacy
 YOLOE/static-template backend is retained for explicit rollback.
@@ -60,11 +60,11 @@ pip install -r requirements.txt
 conda env update -n handover_ros2 -f environment/handover_rtde_cuda.yml
 ```
 
-Place the pinned SAM3D and Hands23 checkouts under `external/` as documented
-in `external/README.md`. The main, SAM3D, and Hands23 runtimes intentionally
+Place the pinned SAM3D and HOI-DETR checkouts under `external/` as documented
+in `external/README.md`. The main, SAM3D, and HOI-DETR runtimes intentionally
 use separate conda environments; their interpreter paths are configured in
-`configs/handover.yaml`. The Hands23 environment recipe and its Detectron2
-build helper are under `environment/`.
+`configs/handover.yaml`. The HOI-DETR environment recipe and its MMDetection
+installation helper are under `environment/`.
 
 ## SAM3D startup
 
@@ -89,7 +89,7 @@ bash run_fitting_final.sh
 ```
 
 Startup fails before RTDE connection if the bbox selection, CUDA FastSAM,
-SAM3D server signature, generated template, or Hands23 sidecar is invalid.
+SAM3D server signature, generated template, or HOI-DETR sidecar is invalid.
 Use `--object-backend legacy` only for an explicit YOLOE/static-template
 rollback.
 
@@ -102,7 +102,7 @@ Expected hardware/runtime pieces:
 - Two Intel RealSense cameras
 - UR robot reachable over RTDE
 - Robotiq gripper daemon/socket access if gripper control is enabled
-- Local FastSAM, SAM3D, and Hands23 weights described in `external/README.md`
+- Local FastSAM, SAM3D, and HOI-DETR weights described in `external/README.md`
 - Local YOLOE weights only when using `--object-backend legacy`
 - Open3D for shape fitting
 - Optional FDCT checkpoint at `FDCT/TransCG.tar` if FDCT depth completion is enabled
@@ -116,7 +116,7 @@ Important sections:
 - `cameras`: RealSense serials, resolution, fps, and depth filters
 - `calibration`: cam0-to-base and cam1-to-cam0 transform files
 - `perception.depth_completion.fdct`: optional FDCT depth completion
-- `perception.object`: backend choice, FastSAM/Hands23, legacy YOLOE, and object point-cloud parameters
+- `perception.object`: backend choice, FastSAM/HOI-DETR, legacy YOLOE, and object point-cloud parameters
 - `perception.hand`: MediaPipe hand detection and depth lifting parameters
 - `perception.fusion`: temporal filtering and hand-approach activation
 - `perception.shape_fitting`: template library, clustering, scale init, ICP, and output downsampling
@@ -187,8 +187,8 @@ bash run_fitting_final.sh --ablation silhouette-scaling
 
 - `shape-fitting` skips SAM3D template bootstrap/generation, scale/rotation fitting,
   ICP, silhouette scoring, and template regeneration. FastSAM starts from the
-  configured fixed bboxes and switches to Hands23 dynamic bboxes after
-  `perception.object.hands23_bbox.raw_cloud_ready_frames` consecutive valid raw
+  configured fixed bboxes and switches to HOI-DETR dynamic bboxes after
+  `perception.object.hoi_detr_bbox.raw_cloud_ready_frames` consecutive valid raw
   merged clouds. Grasp and place geometry comes directly from that cloud; the
   SAM3D model server is not required.
 - `tactile-sensing` does not create or start AnySkin. During gripper close,
@@ -198,7 +198,7 @@ bash run_fitting_final.sh --ablation silhouette-scaling
   fixed-descend/open path. Other modes keep the baseline 80 mm release parameter.
 - `silhouette-scaling` keeps SAM3D template generation, 3D scale initialization,
   rotation search, and ICP, but skips mask observation and silhouette candidate
-  reranking. Consecutive valid initialized fits open the Hands23 dynamic-bbox
+  reranking. Consecutive valid initialized fits open the HOI-DETR dynamic-bbox
   gate.
 
 `shape-fitting` and `silhouette-scaling` require `--object-backend sam3d`.
@@ -220,6 +220,21 @@ python robot_control_rtde_fitting_final.py \
   --enable-follow \
   --follow-z \
   --profile-runtime
+```
+
+After installing HOI-DETR, benchmark representative frames from both cameras
+and copy the printed timeout/input-rate recommendations into
+`configs/handover.yaml`:
+
+```bash
+/home/ur5/miniforge3/envs/hoi_detr/bin/python tools/benchmark_hoi_detr.py \
+  --image path/to/cam0.png --image path/to/cam1.png
+```
+
+The model/IPC path can be checked without starting the robot:
+
+```bash
+python tools/smoke_hoi_detr_sidecar.py --image path/to/camera_frame.png
 ```
 
 When profiling is enabled, press `s` to save the current profiling session under `output/runtime_profile/`. Pressing `r` or `d` resets the current unsaved profiling buffer for a new trial; quitting with `q` or `Esc` does not save unsaved profiling data.

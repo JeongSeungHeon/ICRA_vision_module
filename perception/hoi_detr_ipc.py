@@ -1,4 +1,4 @@
-"""Standalone Hands23 sidecar protocol and latest-only asynchronous client."""
+"""Standalone HOI-DETR sidecar protocol and latest-only asynchronous client."""
 
 from __future__ import annotations
 
@@ -15,18 +15,15 @@ import time
 from typing import Any
 
 import numpy as np
-import yaml
-
-
 _HEADER = struct.Struct("!I")
 _MAX_HEADER_BYTES = 1 << 20
 
 
-class Hands23IPCError(RuntimeError):
+class HOIDETRIPCError(RuntimeError):
     pass
 
 
-def validate_hands23_assets(
+def validate_hoi_detr_assets(
     *,
     python_interpreter: str | Path,
     sidecar_script: str | Path,
@@ -35,56 +32,39 @@ def validate_hands23_assets(
     detector_config_path: str | Path,
     weights_path: str | Path,
 ) -> dict[str, Path]:
-    """Validate both Hands23 data files and its importable source checkout."""
+    """Validate the isolated HOI-DETR checkout, config, weights, and Python."""
     paths = {
-        "Hands23 Python": Path(python_interpreter).expanduser().resolve(),
+        "HOI-DETR Python": Path(python_interpreter).expanduser().resolve(),
         "sidecar script": Path(sidecar_script).expanduser().resolve(),
         "runtime config": Path(config_path).expanduser().resolve(),
-        "Hands23 repo": Path(repo_path).expanduser().resolve(),
-        "Hands23 config": Path(detector_config_path).expanduser().resolve(),
-        "Hands23 weights": Path(weights_path).expanduser().resolve(),
+        "HOI-DETR repo": Path(repo_path).expanduser().resolve(),
+        "HOI-DETR config": Path(detector_config_path).expanduser().resolve(),
+        "HOI-DETR weights": Path(weights_path).expanduser().resolve(),
     }
     missing = [f"{label}={path}" for label, path in paths.items() if not path.exists()]
-    package_marker = (
-        paths["Hands23 repo"]
-        / "hodetector"
-        / "modeling"
-        / "roi_heads"
-        / "__init__.py"
+    package_markers = (
+        paths["HOI-DETR repo"] / "mmdet" / "__init__.py",
+        paths["HOI-DETR repo"] / "projects" / "__init__.py",
     )
-    if not package_marker.is_file():
+    if not all(marker.is_file() for marker in package_markers):
         missing.append(
-            "Hands23 source package="
-            f"{package_marker} (repo_path must point to the full Hands23 checkout, "
+            "HOI-DETR source packages="
+            f"{package_markers} (repo_path must point to the full HOI-DETR checkout, "
             "not a weights-only directory)"
         )
-    detector_config = paths["Hands23 config"]
-    if detector_config.is_file():
-        try:
-            detector_payload = yaml.safe_load(
-                detector_config.read_text(encoding="utf-8")
-            ) or {}
-        except (OSError, yaml.YAMLError) as exc:
-            missing.append(f"Hands23 config cannot be parsed={detector_config}: {exc}")
-        else:
-            base_value = (
-                detector_payload.get("_BASE_")
-                if isinstance(detector_payload, dict)
-                else None
-            )
-            if base_value:
-                base_path = (detector_config.parent / str(base_value)).resolve()
-                if not base_path.is_file():
-                    missing.append(f"Hands23 base config={base_path}")
-                else:
-                    paths["Hands23 base config"] = base_path
-    if not paths["Hands23 Python"].is_file():
-        missing.append(f"Hands23 Python is not a file={paths['Hands23 Python']}")
-    elif not os.access(paths["Hands23 Python"], os.X_OK):
-        missing.append(f"Hands23 Python is not executable={paths['Hands23 Python']}")
+    detector_config = paths["HOI-DETR config"]
+    if detector_config.is_file() and detector_config.suffix != ".py":
+        missing.append(f"HOI-DETR config must be a Python MMDetection config={detector_config}")
+    if not paths["HOI-DETR weights"].is_file():
+        missing.append(f"HOI-DETR weights is not a file={paths['HOI-DETR weights']}")
+    if not paths["HOI-DETR Python"].is_file():
+        missing.append(f"HOI-DETR Python is not a file={paths['HOI-DETR Python']}")
+    elif not os.access(paths["HOI-DETR Python"], os.X_OK):
+        missing.append(f"HOI-DETR Python is not executable={paths['HOI-DETR Python']}")
     if missing:
         raise FileNotFoundError(", ".join(missing))
-    paths["Hands23 source package"] = package_marker
+    paths["HOI-DETR mmdet package"] = package_markers[0]
+    paths["HOI-DETR projects package"] = package_markers[1]
     return paths
 
 
@@ -94,7 +74,7 @@ def _recv_exact(connection: socket.socket, size: int) -> bytes:
     while remaining:
         chunk = connection.recv(remaining)
         if not chunk:
-            raise EOFError("Hands23 socket closed")
+            raise EOFError("HOI-DETR socket closed")
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
@@ -105,23 +85,23 @@ def send_packet(connection: socket.socket, header: dict[str, Any], payload: byte
     message["payload_size"] = len(payload)
     encoded = json.dumps(message, separators=(",", ":")).encode("utf-8")
     if len(encoded) > _MAX_HEADER_BYTES:
-        raise Hands23IPCError("Hands23 packet header is too large")
+        raise HOIDETRIPCError("HOI-DETR packet header is too large")
     connection.sendall(_HEADER.pack(len(encoded)) + encoded + payload)
 
 
 def receive_packet(connection: socket.socket) -> tuple[dict[str, Any], bytes]:
     header_size = _HEADER.unpack(_recv_exact(connection, _HEADER.size))[0]
     if header_size <= 0 or header_size > _MAX_HEADER_BYTES:
-        raise Hands23IPCError(f"invalid Hands23 header size: {header_size}")
+        raise HOIDETRIPCError(f"invalid HOI-DETR header size: {header_size}")
     header = json.loads(_recv_exact(connection, header_size).decode("utf-8"))
     payload_size = int(header.pop("payload_size", 0))
     if payload_size < 0:
-        raise Hands23IPCError(f"invalid Hands23 payload size: {payload_size}")
+        raise HOIDETRIPCError(f"invalid HOI-DETR payload size: {payload_size}")
     return header, _recv_exact(connection, payload_size) if payload_size else b""
 
 
 @dataclass(frozen=True)
-class Hands23BBoxResult:
+class HOIDETRBBoxResult:
     task_id: int
     frame_seq: int
     camera_id: int
@@ -131,6 +111,7 @@ class Hands23BBoxResult:
     hand_side: str
     hand_score: float
     object_score: float
+    relation_score: float
     contact_state: str
     reason: str
     inference_ms: float
@@ -147,7 +128,7 @@ class _PendingFrame:
     submitted_monotonic_s: float
 
 
-class Hands23SidecarClient:
+class HOIDETRSidecarClient:
     """Own the isolated predictor process and never queue more than one frame/camera."""
 
     def __init__(
@@ -160,8 +141,8 @@ class Hands23SidecarClient:
         detector_config_path: str | Path,
         weights_path: str | Path,
         socket_path: str | Path,
-        startup_timeout_s: float = 60.0,
-        request_timeout_s: float = 10.0,
+        startup_timeout_s: float = 120.0,
+        request_timeout_s: float = 30.0,
         max_input_hz: float = 10.0,
     ) -> None:
         self.python_interpreter = Path(python_interpreter).expanduser().resolve()
@@ -177,7 +158,7 @@ class Hands23SidecarClient:
 
         self._condition = threading.Condition()
         self._pending: dict[int, _PendingFrame] = {}
-        self._results: list[Hands23BBoxResult] = []
+        self._results: list[HOIDETRBBoxResult] = []
         self._last_submit_at = {0: float("-inf"), 1: float("-inf")}
         self._task_id = 0
         self._stopping = False
@@ -216,7 +197,7 @@ class Hands23SidecarClient:
         if not self.socket_path.exists():
             return
         if not stat.S_ISSOCK(self.socket_path.lstat().st_mode):
-            raise Hands23IPCError(
+            raise HOIDETRIPCError(
                 f"refusing to replace non-socket path: {self.socket_path}"
             )
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -226,14 +207,14 @@ class Hands23SidecarClient:
         except (ConnectionRefusedError, socket.timeout, OSError):
             self.socket_path.unlink()
         else:
-            raise Hands23IPCError(
-                f"a Hands23 sidecar is already listening at {self.socket_path}"
+            raise HOIDETRIPCError(
+                f"a HOI-DETR sidecar is already listening at {self.socket_path}"
             )
         finally:
             probe.close()
 
     def start(self) -> None:
-        validate_hands23_assets(
+        validate_hoi_detr_assets(
             python_interpreter=self.python_interpreter,
             sidecar_script=self.sidecar_script,
             config_path=self.config_path,
@@ -259,8 +240,8 @@ class Hands23SidecarClient:
             while True:
                 if self._process.poll() is not None:
                     return_code = self._process.returncode
-                    raise Hands23IPCError(
-                        f"Hands23 sidecar exited during startup with code {return_code}"
+                    raise HOIDETRIPCError(
+                        f"HOI-DETR sidecar exited during startup with code {return_code}"
                     )
                 try:
                     connection.connect(str(self.socket_path))
@@ -269,18 +250,18 @@ class Hands23SidecarClient:
                 except (FileNotFoundError, ConnectionRefusedError):
                     if time.monotonic() >= deadline:
                         raise TimeoutError(
-                            f"Hands23 sidecar did not become ready within {self.startup_timeout_s:.1f}s"
+                            f"HOI-DETR sidecar did not become ready within {self.startup_timeout_s:.1f}s"
                         )
                     time.sleep(0.05)
             connection.settimeout(self.request_timeout_s)
             ready, _ = receive_packet(connection)
             if ready.get("type") != "ready":
-                raise Hands23IPCError(f"unexpected Hands23 startup response: {ready}")
+                raise HOIDETRIPCError(f"unexpected HOI-DETR startup response: {ready}")
             self._connection = connection
             connection = None
             self._thread = threading.Thread(
                 target=self._run,
-                name="hands23-ipc",
+                name="hoi-detr-ipc",
                 daemon=True,
             )
             self._thread.start()
@@ -326,7 +307,7 @@ class Hands23SidecarClient:
             self._condition.notify()
         return True
 
-    def drain_results(self) -> list[Hands23BBoxResult]:
+    def drain_results(self) -> list[HOIDETRBBoxResult]:
         with self._condition:
             results = list(self._results)
             self._results.clear()
@@ -367,21 +348,22 @@ class Hands23SidecarClient:
                 )
                 response, _ = receive_packet(connection)
                 if response.get("type") != "bbox":
-                    raise Hands23IPCError(f"unexpected Hands23 response: {response}")
+                    raise HOIDETRIPCError(f"unexpected HOI-DETR response: {response}")
                 bbox = tuple(float(value) for value in response.get("bbox_xyxy", ()))
                 if len(bbox) != 4:
                     bbox = (0.0, 0.0, 0.0, 0.0)
-                result = Hands23BBoxResult(
+                result = HOIDETRBBoxResult(
                     task_id=int(response["task_id"]),
                     frame_seq=int(response["frame_seq"]),
                     camera_id=int(response["camera_id"]),
                     capture_time_s=float(response["capture_time_s"]),
                     valid=bool(response.get("valid", False)),
                     bbox_xyxy=bbox,
-                    hand_side=str(response.get("hand_side", "")),
+                    hand_side=str(response.get("hand_side", "unknown")),
                     hand_score=float(response.get("hand_score", 0.0)),
                     object_score=float(response.get("object_score", 0.0)),
-                    contact_state=str(response.get("contact_state", "")),
+                    relation_score=float(response.get("relation_score", 0.0)),
+                    contact_state=str(response.get("contact_state", "unknown")),
                     reason=str(response.get("reason", "")),
                     inference_ms=float(response.get("inference_ms", 0.0)),
                     roundtrip_ms=max(
@@ -432,10 +414,10 @@ class Hands23SidecarClient:
 
 
 __all__ = [
-    "Hands23BBoxResult",
-    "Hands23IPCError",
-    "Hands23SidecarClient",
+    "HOIDETRBBoxResult",
+    "HOIDETRIPCError",
+    "HOIDETRSidecarClient",
     "receive_packet",
     "send_packet",
-    "validate_hands23_assets",
+    "validate_hoi_detr_assets",
 ]

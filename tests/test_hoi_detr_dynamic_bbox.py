@@ -1,8 +1,7 @@
-"""Unit tests for Hands23 output parsing, selection, and bbox lifecycle."""
+"""Unit tests for HOI-DETR output parsing, selection, and bbox lifecycle."""
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 import unittest
 
 import numpy as np
@@ -13,108 +12,55 @@ from perception.dynamic_bbox import (
     WAITING_DYNAMIC,
     DynamicFastSAMBBoxState,
 )
-from perception.hands23_runtime import (
-    Hands23BBoxSelector,
-    Hands23Candidate,
-    Hands23PredictorAdapter,
-    expected_hand_sides_from_config,
+from perception.hoi_detr_runtime import (
+    HOIDETRBBoxSelector,
+    HOIDETRCandidate,
+    HOIDETRPredictorAdapter,
 )
-
-
-class _FakeTensor:
-    def __init__(self, values):
-        self.values = np.asarray(values)
-
-    def detach(self):
-        return self
-
-    def cpu(self):
-        return self
-
-    def numpy(self):
-        return self.values
-
-
-class _FakeBoxes:
-    def __init__(self, values):
-        self.tensor = _FakeTensor(values)
-
-
-class _FakeInstances:
-    def __init__(self, fields):
-        self.fields = fields
-
-    def get(self, name):
-        return self.fields[name]
-
 
 def candidate(
     bbox,
     *,
-    side="left",
+    relation_score=0.7,
     object_score=0.8,
     hand_score=0.9,
 ):
-    return Hands23Candidate(
+    return HOIDETRCandidate(
         hand_bbox=(0.0, 0.0, 5.0, 5.0),
         object_bbox=tuple(float(value) for value in bbox),
-        hand_side=side,
         hand_score=hand_score,
         object_score=object_score,
-        contact_state="object_contact",
+        relation_score=relation_score,
     )
 
 
-class Hands23RuntimeTest(unittest.TestCase):
-    def test_parser_returns_only_associated_first_objects(self):
-        boxes = [
-            [0, 0, 10, 10],    # left hand
-            [20, 20, 50, 50],  # first object
-            [60, 0, 75, 15],   # unassociated right hand
+class HOIDETRRuntimeTest(unittest.TestCase):
+    def test_parser_returns_only_thresholded_hand_first_relations(self):
+        detections = [
+            {"box": [0, 0, 10, 10], "score": 0.9, "class_id": 0},
+            {"box": [60, 0, 75, 15], "score": 0.95, "class_id": 0},
+            {"box": [20, 20, 50, 50], "score": 0.8, "class_id": 1},
+            {"box": [70, 20, 95, 50], "score": 0.2, "class_id": 1},
         ]
-        classes = [0, 1, 0]
-        scores = [0.9, 0.8, 0.95]
-        pred_dz = np.zeros((3, 9), dtype=np.float32)
-        pred_dz[:, 4] = -1
-        pred_dz[0, 4] = 1
-        pred_dz[0, 5] = 0
-        pred_dz[0, 8] = 3
-        outputs = {
-            "instances": _FakeInstances(
-                {
-                    "pred_boxes": _FakeBoxes(boxes),
-                    "pred_classes": _FakeTensor(classes),
-                    "scores": _FakeTensor(scores),
-                    "pred_dz": _FakeTensor(pred_dz),
-                }
-            )
-        }
-        adapter = Hands23PredictorAdapter(
+        adapter = HOIDETRPredictorAdapter(
             repo_path="unused",
             config_path="unused",
             weights_path="unused",
-            min_size_test=640,
-            predictor=lambda _image: outputs,
+            hand_score_threshold=0.3,
+            first_object_score_threshold=0.3,
+            hand_first_relation_threshold=0.6,
+            inference_backend=lambda _image: (detections, [[0.9, 0.95], [0.4, 0.99]]),
         )
-        self.assertEqual(adapter.min_size_test, 640)
-        parsed = adapter.candidates_from_outputs(outputs)
+        parsed = adapter.predict(np.zeros((8, 8, 3), dtype=np.uint8))
         self.assertEqual(len(parsed), 1)
         self.assertEqual(parsed[0].object_bbox, (20.0, 20.0, 50.0, 50.0))
-        self.assertEqual(parsed[0].hand_side, "left")
-        self.assertEqual(parsed[0].contact_state, "object_contact")
+        self.assertEqual(parsed[0].hand_side, "unknown")
+        self.assertEqual(parsed[0].contact_state, "unknown")
+        self.assertAlmostEqual(parsed[0].relation_score, 0.9)
 
-    def test_expected_side_then_continuity_then_confidence(self):
-        config = {
-            "perception": {
-                "hand_selection": {
-                    "allowed_active_candidate_ids": ["cam0:left", "cam1:right"]
-                }
-            }
-        }
-        self.assertEqual(expected_hand_sides_from_config(config), {0: "left", 1: "right"})
-        selector = Hands23BBoxSelector(
+    def test_continuity_then_relation_and_detection_confidence(self):
+        selector = HOIDETRBBoxSelector(
             initial_bboxes={0: (10, 10, 30, 30), 1: (10, 10, 30, 30)},
-            expected_hand_sides={0: "left", 1: "right"},
             padding_ratio=0.0,
             ema_alpha=0.6,
             min_bbox_size_px=2,
@@ -122,29 +68,29 @@ class Hands23RuntimeTest(unittest.TestCase):
         selected = selector.select(
             0,
             [
-                candidate((11, 11, 31, 31), side="right", object_score=0.99),
-                candidate((12, 12, 32, 32), side="left", object_score=0.7),
+                candidate((11, 11, 31, 31), relation_score=0.6),
+                candidate((12, 12, 32, 32), relation_score=0.99),
             ],
             width=100,
             height=100,
         )
-        self.assertEqual(selected.hand_side, "left")
-        self.assertEqual(selected.bbox_xyxy, (12.0, 12.0, 32.0, 32.0))
+        self.assertEqual(selected.hand_side, "unknown")
+        self.assertEqual(selected.bbox_xyxy, (11.0, 11.0, 31.0, 31.0))
 
-        # Both candidates now have the expected side; continuity wins before score.
+        # Continuity wins before relation and detection confidence.
         selected = selector.select(
             0,
             [
-                candidate((13, 13, 33, 33), side="left", object_score=0.6),
-                candidate((60, 60, 90, 90), side="left", object_score=0.99),
+                candidate((13, 13, 33, 33), relation_score=0.6, object_score=0.6),
+                candidate((60, 60, 90, 90), relation_score=0.99, object_score=0.99),
             ],
             width=100,
             height=100,
         )
-        np.testing.assert_allclose(selected.bbox_xyxy, (12.6, 12.6, 32.6, 32.6))
+        np.testing.assert_allclose(selected.bbox_xyxy, (12.2, 12.2, 32.2, 32.2))
 
     def test_padding_and_clamping(self):
-        selector = Hands23BBoxSelector(
+        selector = HOIDETRBBoxSelector(
             initial_bboxes={0: (0, 0, 20, 20)},
             padding_ratio=0.10,
             ema_alpha=1.0,

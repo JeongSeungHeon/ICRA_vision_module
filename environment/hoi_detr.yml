@@ -1,0 +1,19 @@
+name: hoi_detr
+channels:
+  - conda-forge
+dependencies:
+  - python=3.7
+  - pip=23.3.2
+  - setuptools<60
+  - wheel
+  - pip:
+      - numpy==1.21.6
+      - scipy==1.7.3
+      - opencv-python==4.8.0.76
+      - pycocotools
+      - pyyaml
+      - timm==0.6.13
+      - fairscale==0.4.6
+      - yapf==0.40.1
+      - tqdm
+      - packaging

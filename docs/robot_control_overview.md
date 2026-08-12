@@ -124,7 +124,7 @@ CLI `--fps`의 기본값이 30이므로 현재는 YAML의 카메라 FPS를
 
 SAM3D backend에서는 fixed FastSAM bbox로 실제 silhouette 평가가 연속 4프레임
 성공할 때까지 로봇 target을 gate한다. 4번째 frame까지 2D scale 보정을
-적용한 뒤 scale을 동결하고 Hands23 dynamic bbox로 전환한다.
+적용한 뒤 scale을 동결하고 HOI-DETR dynamic bbox로 전환한다.
 
 Place 위치는 물체 초기 위치를 관측해 lock하지 않는다. `robot.return_sequence.place_object_xy_mm`
 설정의 고정된 물체 중심 XY와 grasp offset을 이용해 TCP 목표를 계산하며,
