@@ -941,7 +941,7 @@ def log_frame(
 
     template_points = _as_points(data["template_points_base"][idx])
     template_labels = point_coordinate_labels(template_points, "template", point_coordinate_precision) if include_coordinate_labels else None
-    log_points(rr, "/world/template/cloud", template_points, (26, 204, 242), radius=0.0025, labels=template_labels, show_labels=False)
+    log_points(rr, "/world/template/cloud", template_points, (26, 204, 242), radius=0.001, labels=template_labels, show_labels=False)
 
     if selected_hand_only:
         log_selected_hand(

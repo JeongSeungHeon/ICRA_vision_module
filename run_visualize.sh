@@ -1,1 +1,1 @@
-python tools/visualize_handover_3d_debug_rerun.py output/debug_3d/before/cham_suc1.npz
+python tools/visualize_handover_3d_debug_rerun.py /home/sebin/ICRA2026_handover_competition_data/raw_mp4/11_tacile_aloe.npz
